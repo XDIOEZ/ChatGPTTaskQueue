@@ -523,7 +523,7 @@ test("project GPT nested conversation URL owns the same chat queue by conversati
   assert.equal(restored.state.tasks.length, 1);
 });
 
-test("old Queue 0 stale send-warning unlocks automatically and timer sends after countdown", async () => {
+test("old Queue 0 stale send-warning unlocks after stable Voice Mode returns, timer still queues", async () => {
   const { send, tick, stored } = await harness({
     "cq.state.v2": {
       version: 2, legacyUnbound: null,
@@ -543,12 +543,17 @@ test("old Queue 0 stale send-warning unlocks automatically and timer sends after
   });
 
   const init = await send("HELLO");
-  assert.equal(init.state.halted, false);
-  assert.equal(init.state.error, "");
+  assert.equal(init.state.halted, true);
+  assert.equal(init.state.haltReason, "failure");
   assert.equal(init.state.tasks.length, 0);
 
   await tick(1);
-  const ready = (await send("GET")).state;
+  const before = (await send("GET")).state;
+  assert.equal(before.halted, true);
+  assert.equal((await send("CLAIM", { ready: true })).dispatch, null);
+  const ready = (await send("RECOVER_ON_VOICE", voiceProof)).state;
+  assert.equal(ready.halted, false);
+  assert.equal(ready.error, "");
   assert.equal(ready.tasks.length, 1);
   assert.equal(ready.tasks[0].text, "定时继续");
   assert.equal(ready.schedules[0].enabled, true);
@@ -558,7 +563,7 @@ test("old Queue 0 stale send-warning unlocks automatically and timer sends after
   assert.equal(stored["cq.state.v2"].conversations["chat:dialogue-a"].error, "");
 });
 
-test("old failed row is quarantined and does not get resent when timer fires", async () => {
+test("old failed row is quarantined, Voice Mode resumes next timer item without retrying error", async () => {
   const { send, tick } = await harness({
     "cq.state.v2": {
       version: 2, legacyUnbound: null,
@@ -577,7 +582,9 @@ test("old failed row is quarantined and does not get resent when timer fires", a
     },
   });
   await tick(1);
-  const result = (await send("GET")).state;
+  const held = (await send("GET")).state;
+  assert.equal(held.halted, true);
+  const result = (await send("RECOVER_ON_VOICE", voiceProof)).state;
   assert.equal(result.halted, false);
   assert.equal(result.error, "");
   assert.equal(result.tasks.length, 2);
@@ -616,6 +623,143 @@ test("new technical hold requires explicit recovery and does not repeat an uncer
   assert.equal(recovered.state.error, "");
   assert.equal(recovered.state.tasks[0].status, "error");
   assert.equal((await send("CLAIM", { ready: true })).dispatch, null);
+});
+
+test("传输错误后 Voice Mode 自动解除技术暂停，不重发故障任务，只执行后续待办", async () => {
+  const { send, stored } = await harness();
+  await send("ENQUEUE", { text: "之前已经尝试发送的任务" });
+  await send("ENQUEUE", { text: "第二条继续处理" });
+  await send("ENQUEUE", { text: "第三条继续处理" });
+  const first = await send("CLAIM", { ready: true, userCount: 1, assistantCount: 1 });
+  await send("SENT", { id: first.dispatch.id });
+  await send("FAIL", { id: first.dispatch.id, error: "消息传输超时，请重试。" });
+  const blocked = (await send("GET")).state;
+  assert.equal(blocked.halted, true);
+  assert.equal(blocked.haltReason, "failure");
+  assert.equal(blocked.activeTaskId, null);
+  assert.equal(blocked.tasks[0].status, "error");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch, null);
+
+  // No manual recovery required once the *native* Voice Mode button is back.
+  const resumed = await send("RECOVER_ON_VOICE", voiceProof);
+  assert.equal(resumed.state.halted, false);
+  assert.equal(resumed.state.error, "");
+  assert.equal(resumed.state.haltReason, null);
+  assert.equal(resumed.state.tasks[0].status, "error");
+  assert.equal(resumed.state.tasks[1].status, "pending");
+  assert.equal(resumed.state.tasks[2].status, "pending");
+  const claim = await send("CLAIM", { ready: true, userCount: 2, assistantCount: 2 });
+  assert.equal(claim.dispatch.text, "第二条继续处理");
+  assert.equal(stored["cq.state.v2"].conversations["chat:dialogue-a"].tasks[0].status, "error");
+  assert.equal((await send("RECOVER_ON_VOICE", voiceProof)).state.activeTaskId, claim.dispatch.id);
+});
+
+test("上一条 waiting 时插件因即时发送结果未知锁住，语音恢复后跳过旧锁但不重发", async () => {
+  const { send } = await harness();
+  await send("ENQUEUE", { text: "旧的运行任务" });
+  await send("ENQUEUE", { text: "下一条必须继续" });
+  const active = await send("CLAIM", { ready: true });
+  await send("SENT", { id: active.dispatch.id });
+  const interrupted = await send("UNCERTAIN_SEND", { userCount: 1 });
+  assert.equal(interrupted.state.haltReason, "uncertain");
+  assert.equal(interrupted.state.activeTaskId, active.dispatch.id);
+
+  const resumed = await send("RECOVER_ON_VOICE", voiceProof);
+  assert.equal(resumed.state.halted, false);
+  assert.equal(resumed.state.activeTaskId, null);
+  assert.equal(resumed.state.tasks[0].status, "error");
+  assert.match(resumed.state.tasks[0].error, /不会自动重发/);
+  assert.equal(resumed.state.tasks[1].status, "pending");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch.text, "下一条必须继续");
+});
+
+test("定时队列已满前的技术暂停，语音恢复只接力普通待办，定时器独立继续产生", async () => {
+  const { send, tick } = await harness();
+  await send("ENQUEUE", { text: "先前失败" });
+  const failed = await send("CLAIM", { ready: true });
+  await send("FAIL", { id: failed.dispatch.id, error: "消息传输超时" });
+  await send("ADD_SCHEDULE", { text: "循环任务", intervalMinutes: 1, repeatCount: -1 });
+  await tick(1);
+  await tick(1);
+  let state = (await send("GET")).state;
+  assert.equal(state.halted, true);
+  assert.equal(state.tasks.length, 3);
+  assert.equal(state.schedules[0].runCount, 2);
+
+  state = (await send("RECOVER_ON_VOICE", voiceProof)).state;
+  assert.equal(state.halted, false);
+  assert.equal(state.tasks[0].status, "error");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch.text, "循环任务");
+  await tick(1);
+  state = (await send("GET")).state;
+  assert.equal(state.schedules[0].runCount, 3);
+  assert.equal(state.tasks.filter((task) => task.text === "循环任务").length, 3);
+});
+
+test("只有完整稳定的 Voice Mode 证据才能解除技术故障；错误标签页不影响原队列", async () => {
+  const { send } = await harness();
+  await send("ENQUEUE", { text: "待处理第一条" }, 11);
+  await send("ENQUEUE", { text: "待处理第二条" }, 11);
+  const claimed = await send("CLAIM", { ready: true }, 11);
+  await send("FAIL", { id: claimed.dispatch.id, error: "浏览器超时" }, 11);
+  for (const proof of [
+    { ...voiceProof, voiceReady: false },
+    { ...voiceProof, voiceStableMs: 1699 },
+    { ...voiceProof, editorEmpty: false },
+    { ...voiceProof, busy: true },
+  ]) {
+    assert.equal((await send("RECOVER_ON_VOICE", proof, 11)).state.halted, true);
+  }
+  assert.equal((await send("RECOVER_ON_VOICE", voiceProof, 12)).state.halted, false);
+  assert.equal((await send("GET", {}, 11)).state.halted, true);
+  assert.equal((await send("CLAIM", { ready: true }, 11)).dispatch, null);
+  assert.equal((await send("RECOVER_ON_VOICE", voiceProof, 11)).state.halted, false);
+  assert.equal((await send("CLAIM", { ready: true }, 11)).dispatch.text, "待处理第二条");
+});
+
+test("用户主动停止、旧版未绑定暂停，均不能被自动恢复", async () => {
+  const { send } = await harness();
+  await send("ENQUEUE", { text: "用户主动暂停" });
+  await send("STOPPED", { userCount: 1 });
+  const manualStop = await send("RECOVER_ON_VOICE", voiceProof);
+  assert.equal(manualStop.state.halted, true);
+  assert.equal(manualStop.state.haltReason, "user");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch, null);
+
+  const legacy = await harness({
+    "cq.state.v2": { version: 2, legacyUnbound: null, conversations: {
+      "chat:dialogue-a": {
+        key: "chat:dialogue-a", url: A, tabId: 11,
+        halted: true, haltReason: "legacy", activeTaskId: null,
+        tasks: [{ id: "legacy-queue", text: "不能自动恢复", status: "pending" }],
+        schedules: [], error: "等待人工导入确认",
+      },
+    } },
+  });
+  const result = await legacy.send("RECOVER_ON_VOICE", voiceProof);
+  assert.equal(result.state.halted, true);
+  assert.equal(result.state.haltReason, "legacy");
+});
+
+test("旧版存档没有 haltReason，服务器直接报告消息传输超时，也能等待语音按钮后恢复", async () => {
+  const { send } = await harness({
+    "cq.state.v2": { version: 2, legacyUnbound: null, conversations: {
+      "chat:dialogue-a": {
+        key: "chat:dialogue-a", url: A, tabId: 11,
+        halted: true, activeTaskId: null, error: "消息传输超时，请重试。",
+        tasks: [{ id: "following", text: "还未执行的任务", status: "pending" }],
+        schedules: [],
+      },
+    } },
+  });
+  const loaded = await send("HELLO");
+  assert.equal(loaded.state.halted, true);
+  assert.equal(loaded.state.haltReason, "failure");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch, null);
+  const resumed = await send("RECOVER_ON_VOICE", voiceProof);
+  assert.equal(resumed.state.halted, false);
+  assert.equal(resumed.state.error, "");
+  assert.equal((await send("CLAIM", { ready: true })).dispatch.text, "还未执行的任务");
 });
 
 test("an old native Stop remains stopped across reload and countdown expiry", async () => {

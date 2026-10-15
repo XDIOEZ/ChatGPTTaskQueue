@@ -128,16 +128,55 @@ function pendingCount(state) {
 }
 
 function recoverObsoleteHalt(state) {
-  // Versions <=0.4.1 could persist a technical error forever, even after the
-  // queue became empty. A timer would continue enqueuing but CLAIM was always
-  // blocked. Never resurrect an in-flight task or undo a native user Stop.
-  if (state.halted && !state.haltReason && /用户已停止回复|用户停止生成/.test(state.error || "")) {
+  // Classify an old persisted halt. Actual recovery always requires a fresh
+  // stable native Voice Mode signal from the owner tab (RECOVER_ON_VOICE).
+  if (state.halted && !state.haltReason &&
+      /用户已停止回复|用户停止生成|用户已暂停|人工暂停|手动停止|已暂停队列/.test(state.error || "")) {
     state.haltReason = "user";
     return true;
   }
-  if (!state.halted || state.haltReason || state.activeTaskId ||
-      !/发送结果未确认|发送未确认|可能已发送/.test(state.error || "")) return false;
+  // Legacy technical errors may carry arbitrary server/browser error strings
+  // such as '消息传输超时，请重试。', not only our older send-warning wording.
+  if (state.halted && !state.haltReason && String(state.error || "").trim()) {
+    state.haltReason = "failure";
+    return true;
+  }
+  return false;
+}
+
+const VOICE_RECOVERABLE_HALTS = new Set([
+  "failure", "timeout", "uncertain", "steer_unconfirmed",
+]);
+
+function resumeTechnicalHalt(state) {
+  if (!state.halted || !VOICE_RECOVERABLE_HALTS.has(state.haltReason)) return false;
+
+  // A send click may have succeeded despite an error/timeout. Retire any
+  // ambiguous in-flight work instead of restoring it to 'pending'. Never
+  // re-send that same prompt when normal queue dispatch resumes.
+  const active = state.tasks.find((task) => task.id === state.activeTaskId);
+  if (active) {
+    if (!["error", "interrupted"].includes(active.status)) {
+      active.status = "error";
+      active.error ||= "本轮发送状态不确定，已跳过，不会自动重发。";
+    }
+    state.activeTaskId = null;
+  }
+  const steering = state.tasks.find((task) => task.id === state.steeringTaskId);
+  if (steering) {
+    if (steering.status === "steering_wait") {
+      steering.status = "error";
+      steering.error ||= "提前发送状态不确定，已跳过，不会自动重发。";
+    } else if (steering.status === "steering") {
+      // Even an unclicked reservation is no longer replayed on recovery;
+      // we cannot prove it was not sent after a script reload.
+      steering.status = "error";
+      steering.error ||= "提前发送中断，已跳过，不会自动重发。";
+    }
+    state.steeringTaskId = null;
+  }
   state.halted = false;
+  state.haltReason = null;
   state.haltAtUserCount = null;
   state.error = "";
   return true;
@@ -326,6 +365,17 @@ async function handle(message, sender) {
       // The minute alarm below is still the fallback for hidden/closed tabs.
       if (existing && dueSchedules(state)) changed = true;
       break;
+
+    case "RECOVER_ON_VOICE": {
+      // The page owns the Voice Mode readiness observation. Verify the same
+      // evidence as FINISHED and the exact tab/chat binding before resuming.
+      if (!targetMatches(state, sender, url) ||
+          message.voiceReady !== true || message.editorEmpty !== true ||
+          message.busy !== false || !Number.isFinite(message.voiceStableMs) ||
+          message.voiceStableMs < 1700) break;
+      changed = resumeTechnicalHalt(state) || changed;
+      break;
+    }
 
     case "ENQUEUE": {
       const text = requireText(message.text);

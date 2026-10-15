@@ -561,6 +561,8 @@
     const active = state.tasks.find((item) => item.id === state.activeTaskId);
     const hasWork = shouldEnqueueEnter();
     const needsReview = state.halted && state.haltReason !== "user";
+    const autoRecovering = needsReview &&
+      ["failure", "timeout", "uncertain", "steer_unconfirmed"].includes(state.haltReason);
     const recoverable = needsReview && state.tasks.find((task) => task.status === "error");
     const nearestSchedule = state.schedules.filter((schedule) => schedule.enabled)
       .sort((a, b) => a.nextRunAt - b.nextRunAt)[0];
@@ -589,7 +591,9 @@
         </div>
         ${queueExpanded ? `
           ${needsReview || notification ? `<div class="cq-notice" role="status">
-            <span>${needsReview ? "上次发送状态未确认，已保护性暂停。" : escapeHtml(notification)}</span>
+            <span>${needsReview
+              ? autoRecovering ? "上轮发生技术错误，语音按钮恢复后将自动跳过并继续。" : "队列已暂停，等待人工确认。"
+              : escapeHtml(notification)}</span>
             ${recoverable ? `<button type="button" data-action="skip-failed" data-id="${recoverable.id}" title="人工核对后跳过，不会重发">核对后跳过</button>` :
               needsReview && !state.activeTaskId ? `<button type="button" data-action="ack-recovery" title="确认上一条已经处理或无需重发后恢复">核对后继续</button>` : ""}
           </div>` : ''}
@@ -1157,6 +1161,24 @@
       const active = state.tasks.find((item) => item.id === state.activeTaskId);
 
       if (state.halted) {
+        // ChatGPT can return to its normal Voice Mode button after a transport
+        // error even though an old plugin failure/timeout has locked the queue.
+        // Automatically retire only that uncertain attempt and continue the
+        // remaining pending work. Never override a user's native Stop.
+        if (voiceReady && ["failure", "timeout", "uncertain", "steer_unconfirmed"]
+          .includes(state.haltReason)) {
+          await rpc("RECOVER_ON_VOICE", {
+            voiceReady: true,
+            voiceStableMs: clock() - voiceReadySince,
+            editorEmpty: Boolean(getEditor() && !normalize(editorText(getEditor()))),
+            busy: snapshot.busy,
+          });
+          if (!state.halted) {
+            notification = "";
+            render();
+          }
+          return;
+        }
         // A native user message after Stop means the conversation is resumed.
         // Do not claim anything until this new reply settles.
         if (Number.isInteger(state.haltAtUserCount) &&

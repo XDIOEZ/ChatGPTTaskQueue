@@ -4,7 +4,7 @@ Manifest V3 独立浏览器插件。直接把队列嵌入 ChatGPT 原生输入�
 
 这是一个独立的第三方工具，与 OpenAI、ChatGPT、Microsoft 无官方关联。插件只在 `chatgpt.com`（及兼容的 `chat.openai.com`）页面运行，任务和对话队列保存在用户自己的浏览器 `chrome.storage.local` 中，不会上传到 GitHub 或第三方服务。网页结构变化时，自动发送功能可能需要更新。
 
-## 核心规则（v0.6.1）
+## 核心规则（v0.6.2）
 
 **同一条消息只使用 ChatGPT 右下角的 Voice Mode 波形按钮确认完成。**
 
@@ -14,6 +14,13 @@ Manifest V3 独立浏览器插件。直接把队列嵌入 ChatGPT 原生输入�
 4. 语音波形按钮不等于旁边的麦克风/听写按钮（`Start dictation`）；后者**绝不能触发接力**。
 
 这个判断依赖 ChatGPT 当前网页 DOM。插件不使用回复正文检测完成，因此图片回复、被虚拟化的消息也能继续；但网页更新、语音模式不可用或未被识别时，会继续等待而非盲目重发。**如果按钮在实际处理完成前错误出现，可能提前推进**，因此仍保留 1.7 秒稳定检测和输入框/停止按钮保护。
+
+### ChatGPT 出错后自动接力（v0.6.2）
+
+- ChatGPT 显示「消息传输超时，请重试」等错误后，如果插件因技术异常记录了 `failure`、`timeout`、`uncertain` 或 `steer_unconfirmed` 暂停，**原生 Voice Mode 波形按钮重新出现并稳定至少 1.7 秒后，会自动解除这一技术暂停**。
+- 技术故障中已经尝试发送、但可能未成功的那条消息会保留为「需要检查」的错误记录；**绝不会重新发送该条**。后面的普通待办和定时入队任务按队列顺序继续执行。
+- **用户自己点击「停止生成」不会被自动解除暂停**，未绑定的旧版导入暂停同样保留。
+- 输入框有草稿、显示停止生成按钮、语音按钮没有恢复或识别到的只是听写麦克风时，不进行自动恢复。已存储的旧式技术错误也会在检测到语音按钮后恢复。
 
 ## 定时器只负责入队
 
@@ -45,7 +52,7 @@ Manifest V3 独立浏览器插件。直接把队列嵌入 ChatGPT 原生输入�
 ## 安装或更新
 
 1. Edge 打开 `edge://extensions`（Chrome 打开 `chrome://extensions`），开启开发者模式。
-2. 在 GitHub 的 **Releases** 下载 `ChatGPTTaskQueue-v0.6.1.zip` 并解压；也可以通过仓库右上角的 **Code → Download ZIP** 下载源码并解压。
+2. 在 GitHub 的 **Releases** 下载最新版本 ZIP 并解压；也可以通过仓库右上角的 **Code → Download ZIP** 下载源码并解压。
 3. 选择「加载解压缩的扩展」，指定包含 `manifest.json` 的文件夹（不是 ZIP 文件本身）。
 4. 已安装旧版则点击扩展的 **刷新**，然后刷新 ChatGPT 网页。
 5. 为防止第一次测试时误发送，建议新建对话，用简短提示词测试 3–5 轮。
@@ -60,7 +67,7 @@ node --check content.js
 node --check background.js
 ```
 
-`tests/composer-smoke.html` 可以直接在 Chrome / Edge 本地打开，确认输入框上的布局和快捷键；`message-dom.test.cjs` 和 `voice-button.test.cjs` 验证没有消息气泡/正文时仍凭语音按钮推进队列，另外测试覆盖定时循环、跨对话隔离、引导、红点以及异常停止。
+`tests/composer-smoke.html` 可以直接在 Chrome / Edge 本地打开，确认输入框上的布局和快捷键；`message-dom.test.cjs` 和 `voice-button.test.cjs` 验证没有消息气泡/正文时仍凭语音按钮推进队列。`error-recovery-dom.test.cjs` 模拟 ChatGPT 出现传输错误并恢复语音按钮后的自动接力，另外测试覆盖定时循环、跨对话隔离、引导、红点及用户主动停止。
 
 **自动化测试不等于真实 ChatGPT 登录页验收**，网页实际 DOM 可能更新。浏览器后台标签可能被节能机制延迟调度。
 
