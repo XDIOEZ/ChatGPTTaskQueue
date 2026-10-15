@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ChatGPT 队列 · 本地 DOM 冒烟测试</title>
+  <link rel="stylesheet" href="../panel.css">
+  <style>
+    body { margin: 0; font: 14px system-ui; background: #f5f5f5; }
+    main { margin: auto; padding: 24px; max-width: 800px; min-height: 60vh; }
+    #conversation { max-width: 650px; margin: 15vh auto 0; }
+    #conversation > div { margin: 22px; padding: 14px; border-radius: 13px; background: #fff; }
+    #composer-parent { max-width: 680px; padding: 8px; margin: 0 auto; }
+    #composer-form { border: 1px solid #ddd; border-radius: 14px; background: #fff; padding: 12px; }
+    #prompt-textarea { width: 90%; min-height: 50px; resize: none; border: 0; outline: 0; }
+    #send-button { padding: 8px 15px; border-radius: 10px; background: #ddd; }
+    #smoke-result { font-size: 11px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div id="conversation">
+      <div data-message-author-role="user"><div data-message-content>上一条问题</div></div>
+      <div data-message-author-role="assistant"><div data-message-content>上一条回复</div></div>
+    </div>
+  </main>
+  <div id="composer-parent">
+    <form id="composer-form">
+      <textarea id="prompt-textarea" aria-label="ChatGPT 输入框"></textarea>
+      <button type="button" data-testid="send-button" id="send-button">发送</button>
+    </form>
+  </div>
+  <div id="smoke-result">LOADING</div>
+  <script>
+    const fake = {
+      state: { key: 'draft:1', url: 'https://chatgpt.com/', tabId: 1,
+        halted: false, activeTaskId: null, steeringTaskId: null, autoOpenTab: false,
+        error: '', tasks: [], schedules: [] },
+      sent: [],
+    };
+    const extension = {
+      runtime: {
+        onMessage: { addListener() {} },
+        async sendMessage(message) {
+          if (message.type === 'ENQUEUE') {
+            fake.state.tasks.push({ id: String(fake.state.tasks.length + 1), text: message.text,
+              status: 'pending', createdAt: Date.now() });
+          }
+          if (message.type === 'ADD_SCHEDULE') {
+            fake.state.schedules.push({
+              id: 'smoke-schedule', text: message.text,
+              intervalMinutes: Number(message.intervalMinutes),
+              repeatCount: Number(message.repeatCount), runCount: 0,
+              enabled: true, nextRunAt: Date.now() + Number(message.intervalMinutes) * 60_000,
+            });
+          }
+          if (message.type === 'EDIT_SCHEDULE') {
+            const schedule = fake.state.schedules.find((item) => item.id === message.id);
+            if (schedule) Object.assign(schedule, {
+              text: message.text, intervalMinutes: Number(message.intervalMinutes),
+              repeatCount: Number(message.repeatCount), runCount: 0,
+            });
+          }
+          if (message.type === 'SKIP_FAILED') {
+            fake.state.tasks = fake.state.tasks.filter((task) => task.id !== message.id);
+            fake.state.error = '';
+            fake.state.halted = false;
+            fake.state.haltReason = null;
+          }
+          if (message.type === 'ACK_RECOVERY') {
+            fake.state.error = '';
+            fake.state.halted = false;
+            fake.state.haltReason = null;
+          }
+          let dispatch = null;
+          if (message.type === 'STEER_CLAIM') {
+            const task = fake.state.tasks.find((item) => item.id === message.id);
+            if (!task || task.status !== 'pending' || fake.state.steeringTaskId) {
+              return { ok: false, error: '队列任务不能引导' };
+            }
+            task.status = 'steering';
+            task.steerBaselineUserCount = message.userCount;
+            task.steerBaselineUserId = message.lastUserId;
+            fake.state.steeringTaskId = task.id;
+            dispatch = { id: task.id, text: task.text };
+          }
+          if (message.type === 'STEER_CLICKED') {
+            const task = fake.state.tasks.find((item) => item.id === message.id);
+            if (task?.status === 'steering') {
+              task.status = 'steering_wait';
+              task.steerClickedAt = Date.now();
+            }
+          }
+          if (message.type === 'STEER_CANCEL') {
+            const task = fake.state.tasks.find((item) => item.id === message.id);
+            if (task?.status === 'steering') {
+              task.status = 'pending';
+              fake.state.steeringTaskId = null;
+            }
+          }
+          if (message.type === 'STEER_CONFIRM') {
+            const task = fake.state.tasks.find((item) => item.id === message.id);
+            if (task?.status === 'steering_wait') {
+              fake.state.tasks = fake.state.tasks.filter((item) => item.id !== message.id);
+              fake.state.steeringTaskId = null;
+            }
+          }
+          if (message.type === 'STEER_UNCONFIRMED') {
+            const task = fake.state.tasks.find((item) => item.id === message.id);
+            if (task?.status === 'steering_wait') task.status = 'error';
+            fake.state.steeringTaskId = null;
+            fake.state.halted = true;
+          }
+          return { ok: true, state: fake.state, sessionKey: 'draft:1', dispatch };
+        },
+      },
+      storage: { onChanged: { addListener() {} } },
+    };
+    window.chrome.runtime = extension.runtime;
+    window.chrome.storage = extension.storage;
+    document.getElementById('send-button').addEventListener('click', () => {
+      const editor = document.getElementById('prompt-textarea');
+      const message = document.createElement('div');
+      message.setAttribute('data-message-author-role', 'user');
+      message.innerHTML = '<div data-message-content></div>';
+      message.firstElementChild.textContent = editor.value;
+      fake.sent.push(editor.value);
+      document.getElementById('conversation').append(message);
+      editor.value = '';
+    });
+    // Simulate ChatGPT's native Enter handler. If the extension intercepted
+    // the event in capture phase, this native handler never sees the keydown.
+    document.getElementById('prompt-textarea').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey &&
+          !event.metaKey && !event.defaultPrevented) {
+        document.getElementById('send-button').click();
+      }
+    });
+  </script>
+  <script>window.__cqSteerTestMode = false;</script>
+  <script src="../content.js"></script>
+  <script>
+    setTimeout(async () => {
+      const input = document.getElementById('prompt-textarea');
+      const onTop = document.getElementById('composer-form').previousElementSibling?.id === 'cq-extension-root';
+      const bar = document.getElementById('cq-extension-root').getBoundingClientRect();
+      const form = document.getElementById('composer-form').getBoundingClientRect();
+      const visuallyAbove = bar.bottom <= form.top + 1 && Math.abs(bar.left - form.left) <= 2;
+      const noManualStartPause = !document.querySelector('#cq-extension-root [data-action="start"], #cq-extension-root [data-action="pause"]');
+      input.value = '空队列应该直接发送';
+      const nativeKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      input.dispatchEvent(nativeKey);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const nativeSent = fake.sent.length === 1 && fake.sent[0] === '空队列应该直接发送';
+      const nativeQueueEmpty = fake.state.tasks.length === 0;
+
+      input.value = '第一条手动入队';
+      document.querySelector('[data-action="queue-composer"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const seeded = fake.state.tasks.length === 1 && fake.state.tasks[0].text === '第一条手动入队';
+      const seededCleared = input.value === '';
+
+      input.value = '第二条排队任务';
+      const queuedKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      const preventedQueue = !input.dispatchEvent(queuedKey);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const cleared = input.value === '';
+      const queued = fake.state.tasks.length === 2 && fake.state.tasks[1].text === '第二条排队任务';
+      const queueDidNotNativeSend = fake.sent.length === 1;
+
+      input.value = '直接发送';
+      const immediateKey = new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true });
+      const preventedImmediate = !input.dispatchEvent(immediateKey);
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const immediate = fake.sent.length === 2 && fake.sent[1] === '直接发送';
+
+      input.value = '换行而非排队';
+      const newlineKey = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true,
+        bubbles: true, cancelable: true });
+      const didNotBlockNewline = input.dispatchEvent(newlineKey);
+
+      const sendButton = document.getElementById('send-button');
+      const stopButton = document.createElement('button');
+      stopButton.type = 'button';
+      stopButton.dataset.testid = 'stop-button';
+      stopButton.textContent = '停止生成';
+      document.getElementById('composer-form').append(stopButton);
+      sendButton.style.display = 'none';
+      input.value = '不能中途引导';
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true,
+        bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const unsupportedPreserved = input.value === '不能中途引导' && fake.sent.length === 2;
+      stopButton.remove();
+      sendButton.style.display = '';
+
+      document.querySelector('[data-action="toggle-scheduler"]').click();
+      const scheduleInput = document.getElementById('cq-schedule-draft');
+      const intervalInput = document.getElementById('cq-minutes');
+      const repeatInput = document.getElementById('cq-repeats');
+      const repeatDefaultInfinite = repeatInput?.value === '-1';
+      scheduleInput.value = '只运行一次';
+      scheduleInput.dispatchEvent(new Event('input', { bubbles: true }));
+      intervalInput.value = '1';
+      intervalInput.dispatchEvent(new Event('input', { bubbles: true }));
+      repeatInput.value = '0';
+      repeatInput.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-action="save-schedule"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const repeatSingleSaved = fake.state.schedules.length === 1 &&
+        fake.state.schedules[0].repeatCount === 0;
+      const repeatSingleVisible = document.getElementById('cq-extension-root')
+        .textContent.includes('单次入队');
+
+      document.querySelector('[data-action="edit-schedule"]').click();
+      const editRepeat = document.getElementById('cq-repeats');
+      const editKeepsValue = editRepeat?.value === '0';
+      editRepeat.value = '2';
+      editRepeat.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-action="save-schedule"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const repeatFiniteSaved = fake.state.schedules[0].repeatCount === 2;
+      const repeatFiniteVisible = document.getElementById('cq-extension-root')
+        .textContent.includes('额外循环 2 次');
+
+      // Old send failures no longer fill the queue with persistent red text.
+      const errorText = '发送结果未确认，可能已发送；请人工检查，插件不会自动重发';
+      fake.state.tasks.unshift({ id: 'failed-once', text: '此前可能已经发送的任务',
+        status: 'error', error: errorText });
+      fake.state.error = errorText;
+      fake.state.halted = true;
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="toggle-queue"]').click();
+      const noRedBanner = document.querySelectorAll('#cq-extension-root .cq-alert').length === 0;
+      const neutralNoticeOnce = document.querySelectorAll('#cq-extension-root .cq-notice').length === 1;
+      const oldErrorTextHidden = !document.getElementById('cq-extension-root').textContent.includes(errorText);
+      const recoveryVisible = Boolean(document.querySelector('[data-action="skip-failed"]'));
+      window.confirm = () => true;
+      document.querySelector('[data-action="skip-failed"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const recoveredWithoutResend = fake.sent.length === 2 && !fake.state.halted &&
+        fake.state.tasks.every((task) => task.id !== 'failed-once');
+
+      // When an old failure has no error row, provide a neutral recovery action
+      // rather than a permanent red warning with no way to continue.
+      fake.state.halted = true;
+      fake.state.haltReason = 'failure';
+      fake.state.error = errorText;
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="toggle-queue"]').click();
+      const oneClickRecovery = Boolean(document.querySelector('[data-action="ack-recovery"]'));
+      document.querySelector('[data-action="ack-recovery"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      const recoveredEmptyError = !fake.state.halted && fake.state.error === '';
+
+      // A due timer may wait for a user's unsent draft. The plugin must never
+      // overwrite the draft or send it accidentally; the UI states why it waits.
+      input.value = '用户正在写一条新消息';
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const draftNoticeShown = document.querySelector('#cq-extension-root .cq-compose-wait')?.hidden === false;
+      const draftPreserved = input.value === '用户正在写一条新消息' && fake.sent.length === 2;
+      input.value = '';
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const draftNoticeCleared = document.querySelector('#cq-extension-root .cq-compose-wait')?.hidden === true;
+
+      fake.state.halted = true;
+      fake.state.haltReason = 'user';
+      fake.state.error = '用户已停止回复';
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="toggle-queue"]').click();
+      const manualStopIsQuiet = document.querySelector('#cq-extension-root .cq-notice') === null &&
+        document.querySelector('#cq-extension-root .cq-toolbar').textContent.includes('用户已暂停');
+
+      // With NO queue, native Enter still becomes queue mode if ChatGPT is
+      // currently generating a response. The previous implementation sent it.
+      fake.state.halted = false;
+      fake.state.haltReason = null;
+      fake.state.error = '';
+      fake.state.tasks = [];
+      const generatingStop = document.createElement('button');
+      generatingStop.type = 'button';
+      generatingStop.dataset.testid = 'stop-button';
+      generatingStop.setAttribute('aria-label', 'Stop generating');
+      generatingStop.textContent = '停止生成';
+      document.getElementById('composer-form').append(generatingStop);
+      input.value = '正在回答时下一条应该排队';
+      const generatingEnter = new KeyboardEvent('keydown', {
+        key: 'Enter', bubbles: true, cancelable: true,
+      });
+      const blockedNativeDuringGeneration = !input.dispatchEvent(generatingEnter);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const queuedDuringGeneration = fake.state.tasks.length === 1 &&
+        fake.state.tasks[0].text === '正在回答时下一条应该排队' && fake.sent.length === 2;
+      generatingStop.remove();
+
+      // A tool can remain running while ChatGPT temporarily hides its native
+      // Stop button. Enter must still enqueue from the tool-waiting state.
+      fake.state.tasks = [];
+      const toolPlaceholder = document.createElement('div');
+      toolPlaceholder.setAttribute('data-message-author-role', 'assistant');
+      toolPlaceholder.innerHTML = '<div data-message-content>Waiting for a tool result.</div>';
+      document.getElementById('conversation').append(toolPlaceholder);
+      input.value = '工具执行中也要排队';
+      const toolEnter = new KeyboardEvent('keydown', {
+        key: 'Enter', bubbles: true, cancelable: true,
+      });
+      const blockedWhileToolRuns = !input.dispatchEvent(toolEnter);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const queuedWhileToolRuns = fake.state.tasks.length === 1 &&
+        fake.state.tasks[0].text === '工具执行中也要排队' && fake.sent.length === 2;
+      toolPlaceholder.remove();
+
+      let steerButtonVisible = true;
+      let steerSentOnce = true;
+      let steerRemovedFromQueue = true;
+      let steerNoDuplicate = true;
+      let unsupportedSteerRestored = true;
+      let unsupportedSteerClean = true;
+      let steerPreservesDraft = true;
+      // The production extension rejects file:// as an intentional security
+      // measure. A separate Chrome test uses an isolated *test-only* copy of
+      // content.js that enables this synthetic composer URL.
+      if (window.__cqSteerTestMode) {
+      // Click 引导 on the second queue item. It should use the native Send
+      // without waiting for (or changing) the first item's position.
+      fake.state.tasks = [
+        { id: 'ordinary-first', text: '留在队列的第一条', status: 'pending' },
+        { id: 'send-ahead', text: '需要提前引导的第二条', status: 'pending' },
+      ];
+      input.value = '';
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="toggle-queue"]').click();
+      steerButtonVisible = Boolean(document.querySelector('[data-action="steer-task"][data-id="send-ahead"]'));
+      document.querySelector('[data-action="steer-task"][data-id="send-ahead"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      steerSentOnce = fake.sent.length === 3 && fake.sent[2] === '需要提前引导的第二条';
+      steerRemovedFromQueue = fake.state.tasks.length === 1 &&
+        fake.state.tasks[0].id === 'ordinary-first' && fake.state.steeringTaskId === null;
+      steerNoDuplicate = !fake.state.tasks.some((item) => item.id === 'send-ahead');
+
+      // ChatGPT may show ONLY Stop while answering, so the selected item must
+      // go back into the queue and the injected composer text must be cleared.
+      fake.state.tasks = [
+        { id: 'ordinary-first', text: '留在队列的第一条', status: 'pending' },
+        { id: 'unsupported-steer', text: '暂时不支持的引导', status: 'pending' },
+      ];
+      const unsupportedStop = document.createElement('button');
+      unsupportedStop.type = 'button';
+      unsupportedStop.dataset.testid = 'stop-button';
+      unsupportedStop.setAttribute('aria-label', 'Stop generating');
+      document.getElementById('composer-form').append(unsupportedStop);
+      sendButton.style.display = 'none';
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="toggle-queue"]').click();
+      document.querySelector('[data-action="steer-task"][data-id="unsupported-steer"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 3700));
+      unsupportedSteerRestored = fake.state.tasks.length === 2 &&
+        fake.state.tasks[1].status === 'pending' && fake.state.steeringTaskId === null;
+      unsupportedSteerClean = input.value === '' && fake.sent.length === 3;
+      sendButton.style.display = '';
+      unsupportedStop.remove();
+
+      input.value = '用户的草稿不能被引导覆盖';
+      document.querySelector('[data-action="steer-task"][data-id="unsupported-steer"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      steerPreservesDraft = input.value === '用户的草稿不能被引导覆盖' &&
+        fake.state.tasks[1].status === 'pending' && fake.sent.length === 3;
+      }
+
+      const ok = onTop && visuallyAbove && noManualStartPause && nativeSent && nativeQueueEmpty && seeded && seededCleared &&
+        preventedQueue && queued && cleared && queueDidNotNativeSend && preventedImmediate && immediate &&
+        didNotBlockNewline && unsupportedPreserved && repeatDefaultInfinite &&
+        repeatSingleSaved && repeatSingleVisible && editKeepsValue && repeatFiniteSaved && repeatFiniteVisible &&
+        noRedBanner && neutralNoticeOnce && oldErrorTextHidden && recoveryVisible && recoveredWithoutResend &&
+        oneClickRecovery && recoveredEmptyError && draftNoticeShown && draftPreserved &&
+        draftNoticeCleared && manualStopIsQuiet &&
+        blockedNativeDuringGeneration && queuedDuringGeneration &&
+        blockedWhileToolRuns && queuedWhileToolRuns && steerButtonVisible &&
+        steerSentOnce && steerRemovedFromQueue && steerNoDuplicate &&
+        unsupportedSteerRestored && unsupportedSteerClean && steerPreservesDraft;
+      document.getElementById('smoke-result').textContent = ok ? 'SMOKE_PASS' : 'SMOKE_FAIL';
+      document.body.dataset.smoke = JSON.stringify({ ok, onTop, visuallyAbove, noManualStartPause, nativeSent, nativeQueueEmpty,
+        seeded, seededCleared, preventedQueue, queued, cleared, queueDidNotNativeSend,
+        preventedImmediate, immediate, didNotBlockNewline, unsupportedPreserved,
+        repeatDefaultInfinite, repeatSingleSaved, repeatSingleVisible, editKeepsValue,
+        repeatFiniteSaved, repeatFiniteVisible,
+        noRedBanner, neutralNoticeOnce, oldErrorTextHidden, recoveryVisible, recoveredWithoutResend,
+        oneClickRecovery, recoveredEmptyError, draftNoticeShown, draftPreserved,
+        draftNoticeCleared, manualStopIsQuiet,
+        blockedNativeDuringGeneration, queuedDuringGeneration,
+        blockedWhileToolRuns, queuedWhileToolRuns, steerButtonVisible,
+        steerSentOnce, steerRemovedFromQueue, steerNoDuplicate,
+        unsupportedSteerRestored, unsupportedSteerClean, steerPreservesDraft,
+        debugSteerSent: fake.sent, debugSteerTasks: fake.state.tasks.map((task) => ({
+          id: task.id, status: task.status,
+        })), debugSteerLock: fake.state.steeringTaskId,
+        debugDraft: input.value,
+        debugNotice: document.querySelector('.cq-notice')?.textContent });
+    }, 900);
+  </script>
+</body>
+</html>
