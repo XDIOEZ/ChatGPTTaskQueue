@@ -3911,11 +3911,14 @@
     return [];
   }
 
-  function nativeImageRemoveButton(preview, form) {
+  function nativeImageRemoveButton(preview, form, previews) {
     // A global "Remove" or "Clear" search could delete unrelated user content.
     // Stop before reaching the form: only a thumbnail's local card may qualify.
     for (let node = preview, depth = 0; node && node !== form && depth < 5;
          node = node.parentElement, depth++) {
+      if (previews.some((other) => other !== preview && node.contains(other))) {
+        return null; // Do not guess which image an action in a shared group removes.
+      }
       const buttons = [...node.querySelectorAll('button, [role="button"]')]
         .filter((button) => isVisible(button) && !root.contains(button) &&
           button !== controls().send);
@@ -3954,8 +3957,8 @@
           files.some((file, index) => captured.files[index] !== file) ||
           nativeAttachmentCount(editor) !== files.length - i ||
           nativeUploadBusy(editor)) return false;
-      const preview = nativeAttachmentPreviews(editor)[0];
-      const remove = preview && nativeImageRemoveButton(preview, form);
+      const previews = nativeAttachmentPreviews(editor);
+      const remove = previews[0] && nativeImageRemoveButton(previews[0], form, previews);
       if (!remove) break;
       const before = nativeAttachmentCount(editor);
       remove.click();

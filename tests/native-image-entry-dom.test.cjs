@@ -278,6 +278,34 @@ setTimeout(async () => {
     await waitUntil(() => enqueued.length === previous+4);
     flags.unknownActionPreserved = enqueued.length === previous+4 &&
       !!form.querySelector('.native-thumbnail-card') && sent === 0;
+
+    // An unrelated thumbnail in a shared wrapper must not be removed just
+    // because the first thumbnail has no own removal action.
+    form.querySelectorAll('.native-thumbnail-card').forEach(card => card.remove());
+    editor.value = "共享附件容器不能误删另一张图";
+    choose([make("keep-first.png"),make("keep-second.png")]);
+    form.querySelectorAll('[data-testid="file-chip"]').forEach(chip => chip.remove());
+    const group = document.createElement("div");
+    group.className = "shared-thumbnail-group";
+    for (let i = 0; i < 2; i++) {
+      const card = document.createElement("div");
+      const image = document.createElement("img");
+      image.src = "data:image/png;base64," + png;
+      card.append(image);
+      if (i === 1) {
+        const remove = document.createElement("button");
+        remove.title = "移除图片";
+        remove.onclick = () => card.remove();
+        card.append(remove);
+      }
+      group.append(card);
+    }
+    form.append(group);
+    flags.groupEnterBlocked = press();
+    await waitUntil(() => enqueued.length === previous+5);
+    flags.sharedGroupProtected = enqueued.length === previous+5 &&
+      enqueued.at(-1).images.length === 2 &&
+      group.querySelectorAll("img").length === 2 && sent === 0;
   } catch (error) {
     flags.error = error.stack || error.message;
   }
@@ -298,7 +326,8 @@ setTimeout(async () => {
     "nativeSaveWasDeferred","changedNativeDraftPreserved",
     "thumbnailEnterBlocked","thumbnailRemovedAfterQueue",
     "iconEnterBlocked","iconThumbnailRemoved",
-    "unknownEnterBlocked","unknownActionPreserved"]
+    "unknownEnterBlocked","unknownActionPreserved",
+    "groupEnterBlocked","sharedGroupProtected"]
     .every((key) => flags[key] === true);
   document.body.dataset.check = JSON.stringify(flags);
 }, 300);
