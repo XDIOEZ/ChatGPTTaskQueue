@@ -2,10 +2,10 @@
   "manifest_version": 3,
   "name": "ChatGPT 自动对话队列",
   "short_name": "对话队列",
-  "version": "0.6.2",
-  "description": "修复 ChatGPT 传输错误导致的永久暂停：语音按钮恢复后自动跳过错误任务并继续队列。",
+  "version": "0.47.0",
+  "description": "管理中心新增跨筛选快速跳转面板，可搜索备注、项目及对话标识，支持键盘定位与未保存草稿保护。",
   "minimum_chrome_version": "120",
-  "permissions": ["storage", "alarms"],
+  "permissions": ["storage", "alarms", "scripting"],
   "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
   "background": {
     "service_worker": "background.js"
@@ -19,6 +19,7 @@
     }
   ],
   "action": {
-    "default_title": "显示 ChatGPT 自动对话队列"
+    "default_title": "管理 ChatGPT 自动对话队列",
+    "default_popup": "dashboard.html"
   }
 }

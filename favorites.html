@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>提示词收藏夹 · ChatGPT 队列</title>
+  <link rel="stylesheet" href="favorites.css">
+  <script src="favorites.js" defer></script>
+</head>
+<body>
+  <div class="page">
+    <header class="page-header">
+      <div>
+        <span class="eyebrow">CHATGPT TASK QUEUE / LIBRARY</span>
+        <h1><span aria-hidden="true">★</span> 提示词收藏夹</h1>
+        <p>收藏常用提示词和图文任务，在任意 ChatGPT 对话中一键重新入队。</p>
+      </div>
+      <button id="open-dashboard" type="button" class="secondary">返回队列监控 ↗</button>
+    </header>
+
+    <main>
+      <div class="overview">
+        <div class="overview-number"><strong id="favorite-count">0</strong><span> / 100 条收藏</span></div>
+        <span id="pinned-count" class="overview-pinned">☆ 置顶 0</span>
+        <span class="overview-hint">仅存储在当前浏览器中 · 不同步到云端</span>
+      </div>
+
+      <section class="composer" aria-label="新增文字收藏">
+        <div class="section-heading"><h2>新增收藏</h2><span>图片任务请在 ChatGPT 队列中点击 ☆ 收藏</span></div>
+        <form id="add-favorite-form">
+          <label for="new-title">名称 <span>可选，默认用提示词开头</span></label>
+          <input id="new-title" type="text" maxlength="80" placeholder="例如：游戏设计迭代 / 代码审查">
+          <label for="new-category">分类 <span>可选，输入名称即可创建分类</span></label>
+          <input id="new-category" type="text" maxlength="24" list="favorite-categories"
+            placeholder="例如：代码、剧情、角色、灵感">
+          <datalist id="favorite-categories"></datalist>
+          <label for="new-text">提示词内容</label>
+          <textarea id="new-text" rows="4" maxlength="12000" required placeholder="输入以后想重复使用的提示词…"></textarea>
+          <label class="template-mode-label" for="new-template-enabled">
+            <input id="new-template-enabled" type="checkbox">
+            启用变量模板（例如 {{项目名}}、{{任务目标}}）
+          </label>
+          <p class="template-mode-hint">只有主动启用才会替换变量；旧收藏及普通代码中的双花括号保持原样。开启后，在对话内点「填写入队」可填写变量、预览最终内容。使用 <code>\{{名称}}</code> 可以输出字面占位符。</p>
+          <div class="composer-footer"><span>最多 12,000 字符 · 支持多行</span><button id="add-favorite" type="submit" class="primary">＋ 保存到收藏夹</button></div>
+        </form>
+      </section>
+
+      <section class="library" aria-label="已有收藏">
+        <div class="section-heading"><h2>我的收藏</h2><span id="result-count">—</span></div>
+        <div class="library-controls">
+          <label class="search" for="search-favorites"><span aria-hidden="true">⌕</span>
+            <input id="search-favorites" type="search" placeholder="搜索名称、分类、正文或图片文件名" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="sort" for="filter-category">分类
+            <select id="filter-category"><option value="">全部分类</option></select>
+          </label>
+          <button id="pinned-only" type="button" class="filter-button" aria-pressed="false"
+            title="只看置顶收藏">☆ 仅置顶</button>
+          <label class="sort" for="sort-favorites">排序
+            <select id="sort-favorites">
+              <option value="newest">最近收藏</option>
+              <option value="recent">最近使用</option>
+              <option value="popular">使用最多</option>
+              <option value="oldest">最早收藏</option>
+              <option value="name">名称 A–Z</option>
+            </select>
+          </label>
+        </div>
+        <div id="favorites-list" class="favorite-list" aria-live="off">
+          <div class="empty">正在读取本地收藏…</div>
+        </div>
+      </section>
+      <section class="backup" aria-label="收藏夹备份与迁移">
+        <div class="section-heading">
+          <h2>备份与迁移</h2>
+          <span>完整保留提示词、分类、置顶和图片原件</span>
+        </div>
+        <div class="backup-actions">
+          <button id="export-favorites" type="button" class="secondary">↓ 导出完整收藏备份</button>
+          <label class="secondary backup-file-label" for="import-favorites">
+            ↑ 导入收藏备份
+          </label>
+          <input id="import-favorites" type="file" accept=".json,application/json" hidden>
+        </div>
+        <p id="backup-status" role="status" aria-live="polite" hidden></p>
+        <p class="backup-hint">导入只添加不存在的收藏，自动跳过文字和原图相同的模板；不会覆盖原收藏、修改队列或自动发送。备份是未加密 JSON，包含完整提示词与图片，请妥善保管。单个文件最大 60 MB。</p>
+      </section>
+    </main>
+    <footer>从 ChatGPT 页面内的队列面板打开「收藏」，点击「入队」即可在当前对话复用。删除收藏不会删除已经入队的任务。</footer>
+    <div id="feedback" role="status" aria-live="polite" hidden></div>
+  </div>
+</body>
+</html>

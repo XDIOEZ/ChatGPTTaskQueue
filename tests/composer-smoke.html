@@ -147,11 +147,25 @@
       const form = document.getElementById('composer-form').getBoundingClientRect();
       const visuallyAbove = bar.bottom <= form.top + 1 && Math.abs(bar.left - form.left) <= 2;
       const noManualStartPause = !document.querySelector('#cq-extension-root [data-action="start"], #cq-extension-root [data-action="pause"]');
-      input.value = '空队列应该直接发送';
+      // The native Send arrow is present, but plain Enter must NEVER reach
+      // the site's native handler, even when the extension queue is empty.
+      input.value = '空队列也应该入队';
       const nativeKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
-      input.dispatchEvent(nativeKey);
+      const preventedEmptyEnter = !input.dispatchEvent(nativeKey);
       await new Promise((resolve) => setTimeout(resolve, 200));
-      const nativeSent = fake.sent.length === 1 && fake.sent[0] === '空队列应该直接发送';
+      const emptyEnterQueued = fake.state.tasks.length === 1 &&
+        fake.state.tasks[0].text === '空队列也应该入队' &&
+        input.value === '' && fake.sent.length === 0;
+      fake.state.tasks = []; // Simulate the queued task having completed.
+
+      input.value = '空队列使用 Ctrl+Enter 发送';
+      const nativeCtrl = new KeyboardEvent('keydown', {
+        key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true,
+      });
+      const preventedNativeCtrl = !input.dispatchEvent(nativeCtrl);
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const nativeSent = fake.sent.length === 1 &&
+        fake.sent[0] === '空队列使用 Ctrl+Enter 发送';
       const nativeQueueEmpty = fake.state.tasks.length === 0;
 
       input.value = '第一条手动入队';
@@ -367,7 +381,9 @@
         fake.state.tasks[1].status === 'pending' && fake.sent.length === 3;
       }
 
-      const ok = onTop && visuallyAbove && noManualStartPause && nativeSent && nativeQueueEmpty && seeded && seededCleared &&
+      const ok = onTop && visuallyAbove && noManualStartPause &&
+        preventedEmptyEnter && emptyEnterQueued && preventedNativeCtrl &&
+        nativeSent && nativeQueueEmpty && seeded && seededCleared &&
         preventedQueue && queued && cleared && queueDidNotNativeSend && preventedImmediate && immediate &&
         didNotBlockNewline && unsupportedPreserved && repeatDefaultInfinite &&
         repeatSingleSaved && repeatSingleVisible && editKeepsValue && repeatFiniteSaved && repeatFiniteVisible &&
@@ -379,7 +395,8 @@
         steerSentOnce && steerRemovedFromQueue && steerNoDuplicate &&
         unsupportedSteerRestored && unsupportedSteerClean && steerPreservesDraft;
       document.getElementById('smoke-result').textContent = ok ? 'SMOKE_PASS' : 'SMOKE_FAIL';
-      document.body.dataset.smoke = JSON.stringify({ ok, onTop, visuallyAbove, noManualStartPause, nativeSent, nativeQueueEmpty,
+      document.body.dataset.smoke = JSON.stringify({ ok, onTop, visuallyAbove, noManualStartPause,
+        preventedEmptyEnter, emptyEnterQueued, preventedNativeCtrl, nativeSent, nativeQueueEmpty,
         seeded, seededCleared, preventedQueue, queued, cleared, queueDidNotNativeSend,
         preventedImmediate, immediate, didNotBlockNewline, unsupportedPreserved,
         repeatDefaultInfinite, repeatSingleSaved, repeatSingleVisible, editKeepsValue,

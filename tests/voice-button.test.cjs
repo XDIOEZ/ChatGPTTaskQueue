@@ -39,6 +39,7 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
           bound: boundHere,
           state: () => state,
           forceHeartbeat: heartbeat,
+          forcePulse() { lastPagePulseAt = 0; reportPagePulse(conversationSnapshot()); },
           heartbeatBusy: () => heartbeatInProgress,
           lastClaim: () => lastClaimAttempt,
           debugBusy: () => ({composerActionInProgress,workInProgress,heartbeatInProgress}),
@@ -63,7 +64,8 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
     <div id="result">LOADING</div>
     <script>
       const app = { tasks: [], finished: [], sent: [], activeId: null, runCount: 0,
-        chats: [], queuePending: false, events: [], scheduledWhileActive: 0 };
+        chats: [], queuePending: false, events: [], pagePulses: [],
+        scheduledWhileActive: 0 };
       const editor = document.getElementById('prompt-textarea');
       const send = document.getElementById('send');
       const voice = document.getElementById('voice');
@@ -121,6 +123,7 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
       window.chrome = {
         runtime: { onMessage:{addListener(){}}, async sendMessage(msg) {
           app.events.push(msg.type);
+          if(msg.type==='PAGE_PULSE') app.pagePulses.push(msg);
           let dispatch = null;
           if (msg.type==='CLAIM' && !session.activeTaskId && msg.ready) {
             const task = session.tasks.find(t=>t.status==='pending');
@@ -175,7 +178,12 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
         flags.voiceIdle=h.ready(h.snapshot()) && h.idle(h.snapshot(),h.ready(h.snapshot()));
         stop.style.display='';
         flags.stopPrevents=h.ready(h.snapshot())===false;
+        h.forcePulse();
+        flags.pulseBusy=app.pagePulses.at(-1)?.generating===true &&
+          Object.keys(app.pagePulses.at(-1)).sort().join(",")==="generating,type";
         stop.style.display='none';
+        h.forcePulse();
+        flags.pulseIdle=app.pagePulses.at(-1)?.generating===false;
         const newTool=document.createElement('div');
         newTool.setAttribute('data-message-author-role','assistant');
         newTool.innerHTML='<div data-message-content>Waiting for a tool result.</div>';

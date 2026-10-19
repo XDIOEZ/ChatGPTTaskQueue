@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ChatGPT 队列总览</title>
+  <link rel="stylesheet" href="dashboard.css">
+  <script src="dashboard.js" defer></script>
+</head>
+<body>
+  <main id="dashboard">
+    <header class="header">
+      <div class="header-copy">
+        <span class="eyebrow">CHATGPT TASK QUEUE</span>
+        <h1>对话队列总览</h1>
+        <p>汇总队列任务、近期事件与页面心跳</p>
+      </div>
+      <div class="header-right">
+        <span id="version" class="version">—</span>
+        <button id="focus-mode" type="button" class="focus-mode-button"
+          aria-pressed="false" title="收起次要筛选控件，把更多空间留给对话监控">
+          专注
+        </button>
+        <button id="open-full-view" type="button" class="full-view-button"
+          title="在 Edge 新标签页打开宽屏管理中心" aria-label="打开独立大屏管理页">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 5h6v6M11 13l8-8M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg>
+          <span>大屏</span>
+        </button>
+        <button id="refresh" type="button" title="立即刷新所有对话状态" aria-label="立即刷新">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14-5L4 8M4 3v5h5M4 13a8 8 0 0 0 14 5l2-2m0 5v-5h-5"/></svg>
+        </button>
+      </div>
+    </header>
+    <section class="stats" aria-label="所有对话汇总，点击统计可筛选对话">
+      <button type="button" class="stat stat-shortcut" data-stat-filter="busy"
+        aria-pressed="false" title="查看所有有工作或启用自动规则的对话；再次点击显示全部">
+        <span>有任务对话</span><strong id="stat-chats">—</strong>
+      </button>
+      <button type="button" class="stat stat-shortcut" data-stat-filter="pending"
+        aria-pressed="false" title="数字为待发送任务条数；点击查看含待发送任务的对话">
+        <span>待发送</span><strong id="stat-pending">—</strong>
+      </button>
+      <button type="button" class="stat stat-shortcut" data-stat-filter="active"
+        aria-pressed="false" title="数字为执行中的任务条数；点击查看有执行中任务的对话">
+        <span>执行中</span><strong id="stat-active">—</strong>
+      </button>
+      <button type="button" class="stat stat-shortcut" data-stat-filter="review"
+        aria-pressed="false" title="数字为需核对的任务条数；点击查看需人工核对的对话">
+        <span>需核对</span><strong id="stat-review">—</strong>
+      </button>
+    </section>
+    <section id="attention" class="attention-bar" aria-label="需要关注的对话" hidden>
+      <div id="attention-review" class="attention-item attention-review" hidden>
+        <span class="attention-symbol" aria-hidden="true">!</span>
+        <div class="attention-copy">
+          <strong id="attention-review-count">0 个对话需要人工核对</strong>
+          <small id="attention-review-hint">来自队列存档，必须进入原对话核实</small>
+        </div>
+        <button type="button" id="focus-review" class="attention-focus"
+          aria-pressed="false" hidden
+          title="仅显示标记为★重点且确实需要人工核对的对话">★ 仅重点</button>
+        <button type="button" id="jump-review" title="逐条定位需核对的对话；必要时清除筛选并展开分组">定位下一项</button>
+      </div>
+      <div id="attention-signal" class="attention-item attention-signal" hidden>
+        <span class="attention-symbol" aria-hidden="true">?</span>
+        <div class="attention-copy">
+          <strong id="attention-signal-count">0 个执行中对话的心跳待确认</strong>
+          <small>仅代表页面信号缺失，不代表任务失败</small>
+        </div>
+        <button type="button" id="jump-signal" title="逐条定位执行中但页面心跳缺失的对话">查看对话</button>
+      </div>
+    </section>
+    <div class="controls">
+      <div class="search-project-row">
+        <label class="search-wrap" for="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="7"/><path d="m16 16 5 5"/></svg>
+          <input id="search" type="search" placeholder="搜索标题、备注或标识…（/）" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="project-filter-wrap" for="project-filter">
+          <span>项目</span>
+          <select id="project-filter" aria-label="按本地项目筛选对话">
+            <option value="all">全部项目</option>
+            <option value="none">未分组</option>
+          </select>
+        </label>
+      </div>
+      <div id="focus-tools" class="focus-tools" hidden>
+        <span id="focus-filter-summary" class="focus-filter-summary" role="status">当前：全部对话</span>
+        <button id="focus-reset" type="button" hidden
+          title="清空当前关键词、状态和仅重点筛选；保留排序设置">清除筛选</button>
+        <button id="focus-advanced-toggle" type="button" aria-expanded="false"
+          aria-controls="filters sort-line">显示筛选</button>
+      </div>
+      <nav id="filters" aria-label="按状态筛选">
+        <button type="button" data-filter="all" aria-pressed="true">全部</button>
+        <button type="button" data-filter="changed" aria-pressed="false">刚变化</button>
+        <button type="button" data-filter="busy" aria-pressed="false">有工作</button>
+        <button type="button" data-filter="review" aria-pressed="false">需核对</button>
+        <button type="button" data-filter="paused" aria-pressed="false">已暂停</button>
+        <button type="button" data-filter="nosignal" aria-pressed="false">无心跳</button>
+        <button type="button" data-filter="offline" aria-pressed="false">离线</button>
+      </nav>
+      <div id="sort-line" class="sort-line">
+        <label for="sort-order">排列方式
+          <select id="sort-order" aria-label="对话显示排序">
+            <option value="priority">异常和执行中优先</option>
+            <option value="recent">最近队列动作优先</option>
+            <option value="pending">待发送数量优先</option>
+            <option value="name">按对话标题排序</option>
+          </select>
+        </label>
+        <div class="view-controls" role="group" aria-label="监控列表视图">
+          <button id="favorites-only" type="button" aria-pressed="false"
+            title="只显示标记为重点的对话">★ 仅重点</button>
+          <button id="group-toggle" type="button" aria-pressed="false"
+            title="按队列状态分组，分组可单独折叠">状态分组</button>
+          <button id="project-group-toggle" type="button" aria-pressed="false"
+            title="按照对话的本地项目标签分组；与状态分组二选一">项目分组</button>
+          <button id="layout-toggle" type="button" aria-pressed="false"
+            title="切换为单行监控列表（可展开详情）">列表视图</button>
+          <button id="density-toggle" type="button" aria-pressed="false"
+            title="减少卡片间距，在屏幕上显示更多对话">紧凑视图</button>
+        </div>
+        <span>队列状态来自本地存档；页面心跳仅作运行参考</span>
+      </div>
+      <section id="project-health" class="project-health" aria-label="各项目队列状态概览" hidden>
+        <button type="button" id="project-health-toggle" class="project-health-toggle"
+          aria-controls="project-health-cards" aria-expanded="false"
+          title="查看各项目的任务数量与需要核对的对话">
+          <span class="project-health-heading">项目概览</span>
+          <span id="project-health-summary" class="project-health-summary">等待项目状态…</span>
+          <span class="project-health-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div id="project-health-cards" class="project-health-cards"
+          aria-label="按项目快速筛选和定位异常对话" hidden></div>
+      </section>
+      <div class="results-line">
+        <span id="result-count">—</span>
+        <div class="results-tools">
+          <button type="button" id="cleanup-idle" hidden
+            title="永久清理已关闭、没有任务或自动规则的本地旧记录；不删除 ChatGPT 官方对话">
+            清理无任务旧记录
+          </button>
+          <span id="updated-at">等待数据…</span>
+        </div>
+      </div>
+    </div>
+    <nav id="scan-nav" class="scan-nav" aria-label="依照当前筛选和排序逐条巡检对话">
+      <div class="scan-context">
+        <span class="scan-caption">巡检</span>
+        <output id="scan-progress" aria-live="polite">未选择 · 0 个对话</output>
+        <span id="scan-current" class="scan-current" title=""></span>
+      </div>
+      <div class="scan-controls">
+        <button type="button" id="quick-jump-open" class="quick-jump-open"
+          title="跨项目查找任意对话（快捷键 G）"
+          aria-label="快速跳转到任意对话，快捷键 G">跳转 G</button>
+        <button type="button" id="scan-prev" title="查看上一条（快捷键 K）"
+          aria-label="巡检上一个对话，快捷键 K" disabled>↑</button>
+        <button type="button" id="scan-next" title="查看下一条（快捷键 J）"
+          aria-label="巡检下一个对话，快捷键 J" disabled>↓</button>
+        <button type="button" id="scan-exit" title="清除当前巡检高亮" hidden>结束</button>
+      </div>
+    </nav>
+    <section id="sessions" class="sessions" aria-live="off" aria-label="对话运行状态列表">
+      <div class="empty">正在读取本地队列状态…</div>
+    </section>
+    <div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div>
+    <footer class="footer">
+      <button type="button" id="open-favorites" title="管理可跨对话复用的文字与图片收藏">
+        ★ 提示词收藏夹
+      </button>
+      <button type="button" id="toggle-current-panel" title="切换当前 ChatGPT 标签页上方的队列面板">
+        切换当前页队列面板
+      </button>
+      <span><span class="pulse-dot" aria-hidden="true"></span>快照约 2.5 秒 · 页面每 8 秒回报 · 不自动重发</span>
+    </footer>
+  </main>
+  <dialog id="quick-jump-dialog" class="quick-jump-dialog"
+    aria-labelledby="quick-jump-title" aria-describedby="quick-jump-description">
+    <div class="quick-jump-head">
+      <div>
+        <h2 id="quick-jump-title">快速跳转</h2>
+        <p id="quick-jump-description">跨项目搜索对话并定位，不会打开聊天或操作队列</p>
+      </div>
+      <button type="button" id="quick-jump-close" class="quick-jump-close"
+        aria-label="关闭快速跳转">×</button>
+    </div>
+    <label for="quick-jump-query" class="quick-jump-search-label">查找对话</label>
+    <input id="quick-jump-query" class="quick-jump-query" type="search"
+      role="combobox" aria-autocomplete="list" aria-controls="quick-jump-results"
+      aria-expanded="true" autocomplete="off" spellcheck="false" maxlength="80"
+      placeholder="输入备注、标题、项目或对话标识…">
+    <p id="quick-jump-count" class="quick-jump-count" aria-live="polite"></p>
+    <div id="quick-jump-results" class="quick-jump-results" role="listbox"
+      aria-label="匹配的对话"></div>
+    <p class="quick-jump-help">↑ / ↓ 选择 · Enter 定位 · Esc 关闭 · 不自动发送任务</p>
+  </dialog>
+</body>
+</html>
