@@ -116,12 +116,14 @@ setTimeout(async () => {
       root.querySelector('[data-action="toggle-diagnostics"]')
         ?.getAttribute("aria-expanded") === "false" &&
       !root.querySelector("#cq-diagnostics-content") &&
-      root.querySelector(".cq-diagnostics")?.textContent.includes("图文备份");
-    root.querySelector('[data-action="toggle-diagnostics"]').click();
+      root.querySelector(".cq-diagnostics")?.textContent.includes("图文备份") &&
+      root.querySelector('#cq-settings-page-diagnostics')?.hidden === true;
+    root.querySelector('[data-action="show-settings-page"][data-page="diagnostics"]').click();
     flags.diagnosticsOpened =
       root.querySelector('[data-action="toggle-diagnostics"]')
         ?.getAttribute("aria-expanded") === "true" &&
-      !!root.querySelector("#cq-diagnostics-content");
+      !!root.querySelector("#cq-diagnostics-content") &&
+      root.querySelector('#cq-settings-page-diagnostics')?.hidden === false;
     flags.historyVisible = root.querySelectorAll(".cq-history-entry").length === 2 &&
       root.querySelector(".cq-diagnostics")?.textContent.includes("不保存提示词或图片正文");
     flags.backupWarningVisible = root.querySelector(".cq-diagnostics")?.textContent

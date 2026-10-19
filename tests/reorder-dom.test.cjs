@@ -181,6 +181,8 @@ setTimeout(async () => {
       currentOrder().join(",") === "c,a,b";
     document.querySelector('[data-action="filter-tasks"][data-filter="all"]').click();
 
+    document.querySelector('[data-action="toggle-settings"]').click();
+    document.querySelector('[data-action="show-settings-page"][data-page="general"]').click();
     document.querySelector('[data-action="toggle-queue-composer"]').click();
     const imageLabel = document.querySelector('.cq-image-add[role="button"]');
     const picker = document.querySelector("#cq-queue-images");

@@ -108,6 +108,8 @@ setTimeout(async () => {
   const flags = {};
   try {
     const root = document.querySelector("#cq-extension-root");
+    root.querySelector('[data-action="toggle-settings"]').click();
+    root.querySelector('[data-action="show-settings-page"][data-page="general"]').click();
     root.querySelector('[data-action="toggle-queue-composer"]').click();
     const prompt = root.querySelector("#cq-queue-draft");
     prompt.value = "分析截图";

@@ -9,6 +9,7 @@ const { webcrypto, createHash } = require("node:crypto");
 const { TextEncoder } = require("node:util");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+const handoffSource = fs.readFileSync(path.join(__dirname, "..", "handoff.js"), "utf8");
 const A = "https://chatgpt.com/c/dialogue-a";
 const B = "https://chatgpt.com/c/dialogue-b";
 const voiceProof = {
@@ -16,6 +17,12 @@ const voiceProof = {
   lastRole: "assistant", busy: false, toolPending: false,
   assistantAdvanced: true, assistantTextLength: 24, stableMs: 2200,
 };
+function handoffReply(request, body) {
+  const start = request.match(/\[\[CHATGPT_TASKQUEUE_HANDOFF_START:[0-9a-f-]+\]\]/i)?.[0];
+  const end = request.match(/\[\[CHATGPT_TASKQUEUE_HANDOFF_END:[0-9a-f-]+\]\]/i)?.[0];
+  assert.ok(start && end, "本轮总结必须使用匹配的专属校验标记");
+  return `${start}\n${body}\n${end}`;
+}
 const testImage = {
   name: "示例.png", type: "image/png",
   dataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lSkAAAAASUVORK5CYII=",
@@ -122,10 +129,12 @@ async function harness(initialStorage = {}, options = {}) {
     scripting: {
       async executeScript({target,func}) {
         updateProbes.push({tabId:target.tabId,func:func?.name});
+        if (func?.name === "installDeferredTabSpinner") return [{result:null}];
         if (failProbes.has(target.tabId)) throw new Error("cannot inspect tab");
         const probe = tabSafety.get(target.tabId);
         const result = typeof probe === "function"
-          ? probe(updateProbes.filter((item) => item.tabId === target.tabId).length)
+          ? probe(updateProbes.filter((item) => item.tabId === target.tabId &&
+              item.func === "inspectUpdateRefreshSafety").length)
           : probe;
         return [{ result: result || {safe:true,voiceReady:true,reason:"idle"} }];
       },
@@ -138,8 +147,11 @@ async function harness(initialStorage = {}, options = {}) {
     atob, TextEncoder, setTimeout: (callback) => { callback(); },
     // Browser IndexedDB is covered by its own DOM regression test; this
     // in-memory equivalent isolates the queue state machine in unit tests.
-    importScripts(script) {
-      assert.equal(script, "image-store.js");
+    importScripts(...scripts) {
+      for (const script of scripts) {
+        if (script === "handoff.js") vm.runInNewContext(handoffSource, sandbox);
+        else assert.equal(script, "image-store.js");
+      }
     },
     cqImageStore: {
       async save(items) { items.forEach((item) => storedImages.set(item.id, item)); },
@@ -211,6 +223,82 @@ async function harness(initialStorage = {}, options = {}) {
     simulateExtensionUpdate, retryVersionRefresh, tabSafety, updateProbes, failProbes,
   };
 }
+
+test("未查看的已完成回复跨队列续发、页面刷新和后台重启保持标记，查看后清除", async () => {
+  const env = await harness();
+  const first = await env.send("ENQUEUE", {text:"第一条"});
+  const second = await env.send("ENQUEUE", {text:"第二条"});
+  assert.equal(first.state.unreadCompleted,false);
+  assert.equal(second.state.tasks.length,2);
+  const claimed = await env.send("CLAIM", {ready:true,userCount:0});
+  await env.send("SENT", {id:claimed.dispatch.id});
+  env.advance(4);
+  const finished = await env.send("FINISHED", {
+    id:claimed.dispatch.id,...voiceProof,viewed:false,
+  });
+  assert.equal(finished.ok,true);
+  assert.equal(finished.state.tasks.length,1,"队列尚未全部完成");
+  assert.equal(finished.state.unreadCompleted,true,"第一条结束就应标记待查看");
+  const next = await env.send("CLAIM", {ready:true,userCount:1});
+  assert.ok(next.dispatch);
+  assert.equal(next.state.unreadCompleted,true,"自动领取下一条不能清除上一条未读");
+  const persisted = await harness(env.stored);
+  assert.equal((await persisted.send("GET")).state.unreadCompleted,true,
+    "重新打开页面/后台重启后仍可恢复绿色勾");
+  const ack = await persisted.send("ACK_COMPLETION_VIEWED");
+  assert.equal(ack.state.unreadCompleted,false);
+  assert.equal((await persisted.send("GET")).state.unreadCompleted,false);
+  assert.equal((await persisted.send("GET",{},12)).state.unreadCompleted,false,
+    "查看 A 对话不能给 B 对话添加标记");
+});
+
+test("普通回复待查看记录属于原对话：不抢跑队列，不接受别的标签代确认", async () => {
+  const env = await harness();
+  const noReply = await env.send("REPLY_COMPLETED",{viewed:true});
+  assert.equal(noReply.state.unreadCompleted,false);
+  const manual = await env.send("REPLY_COMPLETED",{viewed:false},12);
+  assert.equal(manual.state.unreadCompleted,true);
+  assert.equal((await env.send("GET")).state.unreadCompleted,false);
+  await env.send("ACK_COMPLETION_VIEWED",{},11,B);
+  assert.equal((await env.send("GET",{},12)).state.unreadCompleted,true,
+    "伪造 B 地址的 A 标签不能清除 B 的待查看");
+  await env.send("ACK_COMPLETION_VIEWED",{},12);
+  assert.equal((await env.send("GET",{},12)).state.unreadCompleted,false);
+
+  const queued = await env.send("ENQUEUE",{text:"正在等待回复"},11);
+  const claimed = await env.send("CLAIM",{ready:true,userCount:0},11);
+  await env.send("SENT",{id:claimed.dispatch.id},11);
+  const early = await env.send("REPLY_COMPLETED",{viewed:false},11);
+  assert.equal(early.state.unreadCompleted,false,
+    "队列任务必须等待经过语音按钮的正式 FINISHED");
+  assert.equal(queued.state.tasks.length,1);
+});
+
+test("管理页清理不会删除已完成但用户尚未查看的关闭对话", async () => {
+  const env = await harness();
+  await env.send("REPLY_COMPLETED",{viewed:false},12);
+  env.closeTab(12);
+  const dashboard = await env.sendDashboard("DASHBOARD_GET");
+  assert.equal(dashboard.ok,true);
+  assert.equal(dashboard.dashboard.sessions.some((s) => s.key === "chat:dialogue-b"),true);
+  const cleaned = await env.sendDashboard("DASHBOARD_CLEANUP_IDLE",{confirm:true});
+  assert.equal(cleaned.ok,true);
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:dialogue-b"].unreadCompleted,true);
+});
+
+test("升级时仍在运行的旧脚本没有 viewed 字段，完成提醒不会被丢掉", async () => {
+  const env = await harness();
+  await env.send("ENQUEUE",{text:"升级过程中完成的队列任务"});
+  const claimed = await env.send("CLAIM",{ready:true,userCount:0});
+  await env.send("SENT",{id:claimed.dispatch.id});
+  env.advance(4);
+  const finished = await env.send("FINISHED",{
+    id:claimed.dispatch.id,...voiceProof,
+  });
+  assert.equal(finished.state.unreadCompleted,true);
+  assert.equal(finished.state.tasks.length,0);
+  assert.equal((await env.send("ACK_COMPLETION_VIEWED")).state.unreadCompleted,false);
+});
 
 test("变量收藏：必须主动启用模板，旧版双花括号提示词保持字面入队", async () => {
   const env=await harness();
@@ -1533,7 +1621,10 @@ test("升级安全检查必须连续两次通过；两次检查之间开始生�
     : {safe:false,voiceReady:false,reason:"generating"});
   await env.simulateExtensionUpdate();
   assert.deepEqual(env.tabReloads,[12,13]);
-  assert.equal(env.updateProbes.filter((item)=>item.tabId===11).length,2);
+  assert.equal(env.updateProbes.filter((item)=>item.tabId===11 &&
+    item.func==="inspectUpdateRefreshSafety").length,2);
+  assert.ok(env.updateProbes.some((item)=>item.tabId===11 &&
+    item.func==="installDeferredTabSpinner"),"生成中的旧标签应补装临时状态指示器");
   env.tabSafety.set(11,{safe:true,voiceReady:true,reason:"idle"});
   await env.retryVersionRefresh();
   assert.deepEqual(env.tabReloads,[12,13,11]);
@@ -4766,4 +4857,704 @@ test("领取任务后语音按钮临时消失，未点击发送应安全回队�
   const restored=await send("CLAIM",{ready:true,userCount:2,assistantCount:2});
   assert.equal(restored.dispatch.text,"语音按钮反复切换");
   assert.equal(restored.state.schedules[0].runCount,1);
+});
+
+test("上下文接力：原生项目内生成总结、同标签新建对话并原子迁移图文队列与定时规则", async () => {
+  const env = await harness();
+  const project = "g-p-example-handoff";
+  const sourceUrl = `https://chatgpt.com/g/${project}/c/old-session`;
+  const projectUrl = `https://chatgpt.com/g/${project}/project`;
+  const nextUrl = `https://chatgpt.com/g/${project}/c/next-session`;
+  env.navigate(11,sourceUrl);
+  assert.equal((await env.send("SET_HANDOFF", {
+    enabled:true,intervalMinutes:60,
+  },11,sourceUrl)).ok,true);
+  const pending = await env.send("ENQUEUE",{
+    text:"继续修复游戏背包界面",images:[testImage],
+  },11,sourceUrl);
+  const pendingTask = pending.state.tasks[0];
+  const rule = await env.send("ADD_SCHEDULE",{
+    text:"下一次自动巡检",intervalMinutes:180,images:[testImage],
+  },11,sourceUrl);
+  assert.equal(rule.ok,true);
+  env.advance(3601);
+  const due = await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  assert.equal(due.state.handoff.phase,"due");
+  const claim = await env.send("CLAIM",{ready:true,userCount:2},11,sourceUrl);
+  assert.equal(claim.ok,true);
+  assert.match(claim.dispatch.text,/CHATGPT_TASKQUEUE_HANDOFF_START/);
+  assert.equal(claim.state.tasks[1].id,pendingTask.id);
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const summary = handoffReply(claim.dispatch.text,
+    "项目进度与目标：继续游戏开发，保留所有队列任务、图片、自动规则和原有设置。".repeat(12));
+  const finished = await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,handoffSummary:summary,
+    handoffLastUserText:"网页把上一条用户消息虚拟化了，无法读回完整原文",
+  },11,sourceUrl);
+  assert.equal(finished.ok,true);
+  assert.equal(finished.state.handoff.phase,"opening");
+  assert.equal(finished.state.tasks.length,1,"总结完成不能清除剩余队列");
+  assert.equal((await env.send("HANDOFF_NAVIGATE",{},11,sourceUrl)).ok,true);
+
+  env.navigate(11,projectUrl);
+  const attached = await env.send("HELLO",{},11,projectUrl);
+  assert.equal(attached.ok,true);
+  assert.equal(attached.state.tasks[0].kind,"handoff_intro");
+  const introductory = await env.send("CLAIM",{ready:true,userCount:0},11,projectUrl);
+  assert.match(introductory.dispatch.text,/项目进度与目标/);
+  await env.send("SENT",{id:introductory.dispatch.id},11,projectUrl);
+  env.navigate(11,nextUrl);
+  const adopted = await env.send("HELLO",{
+    lastUserText:introductory.dispatch.text,
+  },11,nextUrl);
+  assert.equal(adopted.ok,true);
+  assert.equal(adopted.sessionKey,"chat:next-session");
+  assert.equal(adopted.state.tasks[0].kind,"handoff_intro");
+  env.advance(3);
+  const transferred = await env.send("FINISHED",{
+    id:introductory.dispatch.id,...voiceProof,
+  },11,nextUrl);
+  assert.equal(transferred.ok,true);
+  assert.equal(transferred.state.tasks.length,1);
+  assert.equal(transferred.state.tasks[0].id,pendingTask.id);
+  assert.equal(transferred.state.tasks[0].images[0].id,pendingTask.images[0].id);
+  assert.equal(transferred.state.schedules.length,1);
+  assert.equal(transferred.state.handoff.enabled,true);
+  assert.equal(transferred.state.handoff.phase,"idle");
+  const old = env.stored["cq.state.v2"].conversations["chat:old-session"];
+  assert.equal(old.tasks.length,0);
+  assert.equal(old.schedules.length,0);
+  assert.equal(old.handoff.phase,"completed");
+  assert.equal(env.storedImages.has(pendingTask.images[0].id),true);
+  assert.equal(env.tabUpdates.some((item)=>item.url===projectUrl),false,
+    "后台不能偷偷创建或导航其他标签");
+});
+
+test("上下文接力：带项目名称的聊天地址应进入官方规范项目入口，旧版中途接力也能继续", async () => {
+  const env = await harness();
+  const project = "g-p-6ad25b09f7988191b8c35b36d03e3d70";
+  const sourceUrl = `https://chatgpt.com/g/${project}-homepc/c/old-alias`;
+  const canonicalStart = `https://chatgpt.com/g/${project}/project`;
+  const nextUrl = `https://chatgpt.com/g/${project}/c/new-alias`;
+  env.navigate(11, sourceUrl);
+  await env.send("ENQUEUE", {text:"迁移后执行的图文任务", images:[testImage]}, 11, sourceUrl);
+  await env.send("HANDOFF_NOW", {}, 11, sourceUrl);
+  const claim = await env.send("CLAIM", {ready:true,userCount:2}, 11, sourceUrl);
+  assert.equal(claim.state.tasks[0].kind,"handoff_summary");
+  await env.send("SENT", {id:claim.dispatch.id}, 11, sourceUrl);
+  env.advance(3);
+  const finished = await env.send("FINISHED", {
+    id:claim.dispatch.id,...voiceProof,
+    handoffSummary:handoffReply(claim.dispatch.text,"该对话在 HomePC 原生项目内继续开发。".repeat(20)),
+  }, 11, sourceUrl);
+  assert.equal(finished.state.handoff.phase,"opening");
+  assert.equal(finished.state.handoff.projectId,project);
+  assert.equal(finished.state.handoff.projectUrl,canonicalStart);
+
+  // Simulate an already-staged v0.49.4 handoff across an extension upgrade.
+  const oldHandoff = env.stored["cq.state.v2"].conversations["chat:old-alias"].handoff;
+  oldHandoff.projectId = `${project}-homepc`;
+  oldHandoff.projectUrl = `https://chatgpt.com/g/${project}-homepc/project`;
+  const navigate = await env.send("HANDOFF_NAVIGATE", {}, 11, sourceUrl);
+  assert.equal(navigate.ok,true);
+  assert.equal(navigate.state.handoff.phase,"navigating");
+  assert.equal(navigate.state.handoff.projectId,project);
+  assert.equal(navigate.state.handoff.projectUrl,canonicalStart);
+
+  env.navigate(11, canonicalStart);
+  const mounted = await env.send("HELLO",{},11,canonicalStart);
+  assert.equal(mounted.state.tasks[0].kind,"handoff_intro");
+  const intro = await env.send("CLAIM",{ready:true,userCount:0},11,canonicalStart);
+  assert.equal(intro.state.tasks[0].kind,"handoff_intro");
+  await env.send("SENT",{id:intro.dispatch.id},11,canonicalStart);
+  env.navigate(11,nextUrl);
+  const adopted = await env.send("HELLO",{lastUserText:intro.dispatch.text},11,nextUrl);
+  assert.equal(adopted.sessionKey,"chat:new-alias");
+  env.advance(3);
+  const transferred = await env.send("FINISHED",{
+    id:intro.dispatch.id,...voiceProof,
+  },11,nextUrl);
+  assert.equal(transferred.ok,true);
+  assert.equal(transferred.state.tasks.length,1);
+  assert.equal(transferred.state.tasks[0].text,"迁移后执行的图文任务");
+  assert.equal(transferred.state.tasks[0].images.length,1);
+  const source = env.stored["cq.state.v2"].conversations["chat:old-alias"];
+  assert.equal(source.handoff.phase,"completed");
+  assert.equal(source.tasks.length,0);
+});
+
+test("立即接力：关闭定时开关也能触发，等待进行中的回复，重复点击不重复总结", async () => {
+  const env = await harness();
+  const projectUrl = "https://chatgpt.com/g/g-p-on-demand/c/source";
+  env.navigate(11, projectUrl);
+  await env.send("ENQUEUE", {text:"本轮正在处理"}, 11, projectUrl);
+  await env.send("ENQUEUE", {text:"留待下一个项目聊天的任务"}, 11, projectUrl);
+  const first = await env.send("CLAIM", {ready:true,userCount:0}, 11, projectUrl);
+  assert.equal(first.dispatch.text,"本轮正在处理");
+  await env.send("SENT", {id:first.dispatch.id}, 11, projectUrl);
+
+  const manual = await env.send("HANDOFF_NOW", {}, 11, projectUrl);
+  assert.equal(manual.ok,true);
+  assert.equal(manual.state.handoff.enabled,false,"不要求打开定时开关");
+  assert.equal(manual.state.handoff.phase,"due");
+  assert.equal(manual.state.activeTaskId,first.dispatch.id,"正在运行的任务不被打断");
+  const duplicate = await env.send("HANDOFF_NOW", {}, 11, projectUrl);
+  assert.equal(duplicate.ok,true);
+  assert.equal(duplicate.state.history.filter((event)=>event.type==="handoff_manual").length,1);
+  assert.equal((await env.send("CLAIM",{ready:true},11,projectUrl)).dispatch,null);
+
+  env.advance(3);
+  await env.send("FINISHED",{id:first.dispatch.id,...voiceProof},11,projectUrl);
+  const summary=await env.send("CLAIM",{ready:true},11,projectUrl);
+  assert.equal(summary.ok,true);
+  assert.match(summary.dispatch.text,/CHATGPT_TASKQUEUE_HANDOFF_START/);
+  assert.equal(summary.state.tasks.filter((item)=>item.kind==="handoff_summary").length,1);
+  assert.equal(summary.state.tasks.at(-1).text,"留待下一个项目聊天的任务");
+  assert.equal((await env.send("HANDOFF_NOW",{},11,projectUrl)).ok,false,
+    "生成总结期间不能重复立即接力");
+});
+
+test("对话时长：首次可靠观察持久化、能读取首条消息时间时更新、跨对话隔离", async () => {
+  const env=await harness();
+  const empty=await env.send("HELLO",{},11,A);
+  assert.equal(empty.state.firstSeenAt,null);
+  assert.equal(Object.hasOwn(env.stored["cq.state.v2"].conversations,"chat:dialogue-a"),false,
+    "只打开空对话不应该创建持久记录");
+
+  const first=await env.send("HELLO",{userCount:1},11,A);
+  const firstSeenAt=first.state.firstSeenAt;
+  assert.ok(firstSeenAt > Date.UTC(2022,0,1));
+  env.advance(7250);
+  assert.equal((await env.send("HELLO",{userCount:2},11,A)).state.firstSeenAt,
+    firstSeenAt,"同对话刷新不能重置计时");
+  const historical=firstSeenAt - 8 * 60 * 60_000;
+  const recorded=await env.send("OBSERVE_FIRST_MESSAGE_AT",{firstMessageAt:historical},11,A);
+  assert.equal(recorded.ok,true);
+  assert.equal(recorded.state.firstMessageAt,historical);
+  assert.equal((await env.send("OBSERVE_FIRST_MESSAGE_AT",{
+    firstMessageAt:firstSeenAt - 60_000,
+  },11,A)).state.firstMessageAt,historical,"新一点的消息时间不能覆盖首条记录");
+  const invalid=await env.send("OBSERVE_FIRST_MESSAGE_AT",{firstMessageAt:0},11,A);
+  assert.equal(invalid.ok,false);
+  assert.match(invalid.error,/消息时间无效/);
+  const forged=await env.send("OBSERVE_FIRST_MESSAGE_AT",{
+    firstMessageAt:historical,
+  },12,A);
+  assert.equal(forged.ok,false,"不能串对话更改时间");
+  assert.equal((await env.send("HELLO",{userCount:1},12,B)).state.firstMessageAt,null);
+  assert.equal((await env.send("GET",{},11,A)).state.firstMessageAt,historical,
+    "真实首条消息时间需要跨页面重载保留");
+
+  await env.send("ENQUEUE",{text:"旧历史记录"},12,B);
+  const oldTime=env.stored["cq.state.v2"].conversations["chat:dialogue-b"].firstSeenAt;
+  assert.ok(oldTime > firstSeenAt);
+});
+
+test("对话时长：旧会话可用最早的插件日志恢复已记录时间", async () => {
+  const env=await harness();
+  await env.send("ENQUEUE",{text:"两小时前的操作"},11,A);
+  const old=env.stored["cq.state.v2"].conversations["chat:dialogue-a"];
+  const recordedAt=old.history[0].at;
+  assert.equal(old.firstSeenAt,null);
+  env.advance(7200);
+  const restored=await env.send("HELLO",{userCount:1},11,A);
+  assert.equal(restored.state.firstSeenAt,recordedAt);
+  assert.equal(restored.state.firstMessageAt,null,
+    "只能确认插件使用记录，不能冒充 ChatGPT 原始创建时间");
+});
+
+test("手动接力：零队列也会生成总结、同项目开启新对话并继承设置", async () => {
+  const env=await harness();
+  const project="g-p-empty-manual";
+  const sourceUrl=`https://chatgpt.com/g/${project}/c/empty-source`;
+  const projectUrl=`https://chatgpt.com/g/${project}/project`;
+  const targetUrl=`https://chatgpt.com/g/${project}/c/context-continued`;
+  env.navigate(11,sourceUrl);
+  const start=await env.send("HANDOFF_NOW",{},11,sourceUrl);
+  assert.equal(start.ok,true);
+  assert.equal(start.state.tasks.length,0,"不依赖待发送队列");
+  assert.equal(start.state.handoff.phase,"due");
+  assert.equal(start.state.handoff.manualRequested,true);
+  assert.equal(start.state.handoff.enabled,false,"不自动开启定时接力");
+  assert.equal((await env.send("HANDOFF_NOW",{},11,sourceUrl)).state.handoff.phase,"due");
+  assert.equal(start.state.history.filter((entry)=>entry.type==="handoff_manual").length,1,
+    "多次触发只记一次手动接力");
+  const tick=await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  assert.equal(tick.state.handoff.phase,"due","后台轮询不能取消空队列手动接力");
+
+  const summary=await env.send("CLAIM",{ready:true,userCount:4},11,sourceUrl);
+  assert.equal(summary.ok,true);
+  assert.equal(summary.dispatch?.id,summary.state.activeTaskId);
+  assert.match(summary.dispatch.text,/CHATGPT_TASKQUEUE_HANDOFF_START/);
+  assert.equal(summary.state.tasks.length,1,"只有临时总结任务");
+  assert.equal(summary.state.tasks[0].kind,"handoff_summary");
+  await env.send("SENT",{id:summary.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const context=handoffReply(summary.dispatch.text,
+    "已完成了此前的开发讨论，没有待发送队列；继续保留目标、技术决策和未解决的问题，等待用户指令。".repeat(12));
+  const finished=await env.send("FINISHED",{
+    id:summary.dispatch.id,...voiceProof,
+    handoffLastUserText:summary.dispatch.text,handoffSummary:context,userCount:5,
+  },11,sourceUrl);
+  assert.equal(finished.ok,true);
+  assert.equal(finished.state.handoff.phase,"opening");
+  assert.equal(finished.state.tasks.length,0,"总结完成也要继续跳转");
+  assert.equal((await env.send("HANDOFF_NAVIGATE",{userCount:5},11,sourceUrl)).ok,true);
+
+  env.navigate(11,projectUrl);
+  const started=await env.send("HELLO",{},11,projectUrl);
+  assert.equal(started.state.tasks[0].kind,"handoff_intro");
+  const intro=await env.send("CLAIM",{ready:true},11,projectUrl);
+  assert.match(intro.dispatch.text,/如果队列为空，请等待用户/);
+  await env.send("SENT",{id:intro.dispatch.id},11,projectUrl);
+  env.navigate(11,targetUrl);
+  await env.send("HELLO",{lastUserText:intro.dispatch.text},11,targetUrl);
+  env.advance(3);
+  const transferred=await env.send("FINISHED",{id:intro.dispatch.id,...voiceProof},11,targetUrl);
+  assert.equal(transferred.ok,true);
+  assert.equal(transferred.state.tasks.length,0);
+  assert.equal(transferred.state.schedules.length,0);
+  assert.equal(transferred.state.handoff.enabled,false);
+  assert.equal(transferred.state.handoff.phase,"idle");
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:empty-source"].handoff.phase,"completed");
+  assert.equal((await env.send("CLAIM",{ready:true},11,targetUrl)).dispatch,null,
+    "进入新对话后不会重复发送总结");
+});
+
+test("手动接力：队列最后一条完成后仍能接力，且手动总结不受自动冷却限制", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-drained-manual/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"这条任务先完成"},11,url);
+  const active=await env.send("CLAIM",{ready:true},11,url);
+  await env.send("SENT",{id:active.dispatch.id},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  env.advance(3);
+  const done=await env.send("FINISHED",{id:active.dispatch.id,...voiceProof},11,url);
+  assert.equal(done.state.tasks.length,0);
+  assert.equal(done.state.handoff.phase,"due");
+  await env.send("SAVE_SEND_COOLDOWN",{seconds:600},11,url);
+  assert.equal((await env.send("SCHEDULE_PULSE",{},11,url)).state.handoff.phase,"due");
+  const summary=await env.send("CLAIM",{ready:true},11,url);
+  assert.equal(summary.ok,true);
+  assert.equal(summary.state.handoff.phase,"summarizing");
+  assert.equal(summary.state.tasks[0].kind,"handoff_summary",
+    "手动总结不等待自动任务的十分钟冷却");
+});
+
+test("手动接力：已开启定时但没有队列任务时，定时巡检不会取消手动请求", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-manual-timer/c/empty";
+  env.navigate(11,url);
+  await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,url);
+  const started=await env.send("HANDOFF_NOW",{},11,url);
+  assert.equal(started.ok,true);
+  assert.equal(started.state.handoff.manualRequested,true);
+  env.advance(3601);
+  const pulse=await env.send("SCHEDULE_PULSE",{},11,url);
+  assert.equal(pulse.state.handoff.phase,"due","定时器不能把手动接力重置成空闲");
+  const summary=await env.send("CLAIM",{ready:true},11,url);
+  assert.equal(summary.state.handoff.phase,"summarizing");
+  assert.equal(summary.state.tasks[0].kind,"handoff_summary");
+});
+
+test("手动接力：空队列总结不合法时保留当前对话，取消后可重试", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-empty-failure/c/source";
+  env.navigate(11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const summary=await env.send("CLAIM",{ready:true},11,url);
+  await env.send("SENT",{id:summary.dispatch.id},11,url);
+  env.advance(3);
+  const failed=await env.send("FINISHED",{
+    id:summary.dispatch.id,...voiceProof,
+    handoffLastUserText:summary.dispatch.text,handoffSummary:"错误内容",
+  },11,url);
+  assert.equal(failed.state.handoff.phase,"failed");
+  assert.equal(failed.state.tasks[0].status,"error");
+  assert.equal((await env.send("CLAIM",{ready:true},11,url)).dispatch,null);
+  assert.equal((await env.send("CANCEL_HANDOFF",{},11,url)).ok,true);
+  const retried=await env.send("HANDOFF_NOW",{},11,url);
+  assert.equal(retried.ok,true);
+  assert.equal(retried.state.tasks.length,0);
+  assert.equal(retried.state.handoff.phase,"due");
+});
+
+test("立即接力：项目错误及暂停状态仍阻止启动", async () => {
+  const env=await harness();
+  const projectUrl="https://chatgpt.com/g/g-p-on-demand/c/source-safe";
+  assert.equal((await env.send("HANDOFF_NOW")).ok,false,"普通聊天不能触发");
+  env.navigate(11,projectUrl);
+  assert.equal((await env.send("HANDOFF_NOW",{},11,projectUrl)).ok,true,
+    "项目中的空队列可以手动接力");
+  assert.equal((await env.send("CANCEL_HANDOFF",{},11,projectUrl)).ok,true);
+  await env.send("ENQUEUE",{text:"重要的任务"},11,projectUrl);
+  await env.send("SET_QUEUE_PAUSED",{paused:true},11,projectUrl);
+  const paused=await env.send("HANDOFF_NOW",{},11,projectUrl);
+  assert.equal(paused.ok,false,"用户暂停不能被接力绕过");
+  assert.match(paused.error,/暂停/);
+  assert.equal(paused.state,undefined);
+  await env.send("SET_QUEUE_PAUSED",{paused:false},11,projectUrl);
+  const trigger=await env.send("HANDOFF_NOW",{},11,projectUrl);
+  assert.equal(trigger.ok,true);
+  assert.equal(trigger.state.handoff.phase,"due");
+  assert.equal((await env.send("SET_HANDOFF",{
+    enabled:true,intervalMinutes:60,
+  },11,projectUrl)).ok,false,"正在接力时不能修改或取消计时状态");
+  const cancelled=await env.send("CANCEL_HANDOFF",{},11,projectUrl);
+  assert.equal(cancelled.ok,true);
+  assert.equal(cancelled.state.tasks.length,1);
+  assert.equal(cancelled.state.tasks[0].text,"重要的任务");
+});
+
+test("立即接力：默认关闭定时功能时，仍能完成同项目接力并保留关闭状态", async () => {
+  const env=await harness();
+  const project="g-p-manual-complete";
+  const sourceUrl=`https://chatgpt.com/g/${project}/c/old`;
+  const newChatUrl=`https://chatgpt.com/g/${project}/project`;
+  const destinationUrl=`https://chatgpt.com/g/${project}/c/new`;
+  env.navigate(11,sourceUrl);
+  const source=await env.send("ENQUEUE",{text:"下个对话再继续这项工作"},11,sourceUrl);
+  const pendingId=source.state.tasks[0].id;
+  await env.send("HANDOFF_NOW",{},11,sourceUrl);
+  const summary=await env.send("CLAIM",{ready:true},11,sourceUrl);
+  await env.send("SENT",{id:summary.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const text=handoffReply(summary.dispatch.text,
+    "当前任务尚未开始，下一轮必须先接收总结，再继续排队工作。".repeat(16));
+  assert.equal((await env.send("FINISHED",{
+    id:summary.dispatch.id,...voiceProof,
+    handoffLastUserText:summary.dispatch.text,handoffSummary:text,
+  },11,sourceUrl)).state.handoff.phase,"opening");
+  await env.send("HANDOFF_NAVIGATE",{},11,sourceUrl);
+  env.navigate(11,newChatUrl);
+  await env.send("HELLO",{},11,newChatUrl);
+  const intro=await env.send("CLAIM",{ready:true},11,newChatUrl);
+  await env.send("SENT",{id:intro.dispatch.id},11,newChatUrl);
+  env.navigate(11,destinationUrl);
+  await env.send("HELLO",{lastUserText:intro.dispatch.text},11,destinationUrl);
+  env.advance(3);
+  const result=await env.send("FINISHED",{id:intro.dispatch.id,...voiceProof},11,destinationUrl);
+  assert.equal(result.ok,true);
+  assert.equal(result.state.tasks[0].id,pendingId);
+  assert.equal(result.state.handoff.enabled,false);
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:old"].tasks.length,0);
+});
+
+test("上下文接力：旧助手回复即便含合法总结标记，也不能冒充本轮交接结果", async () => {
+  const env=await harness();
+  const sourceUrl="https://chatgpt.com/g/g-p-stale-summary/c/source";
+  env.navigate(11,sourceUrl);
+  await env.send("ENQUEUE",{text:"绝不能误转移的任务"},11,sourceUrl);
+  await env.send("HANDOFF_NOW",{},11,sourceUrl);
+  const claim=await env.send("CLAIM",{ready:true},11,sourceUrl);
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const markers=`[[CHATGPT_TASKQUEUE_HANDOFF_START]]${"这是另一轮旧回复留下的文本。".repeat(24)}[[CHATGPT_TASKQUEUE_HANDOFF_END]]`;
+  const finished=await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,
+    handoffSummary:markers,handoffLastUserText:claim.dispatch.text,
+  },11,sourceUrl);
+  assert.equal(finished.ok,true);
+  assert.equal(finished.state.handoff.phase,"failed");
+  assert.equal(finished.state.tasks.some((task)=>task.text==="绝不能误转移的任务"),true);
+  assert.equal(finished.state.tasks.some((task)=>task.status==="pending"),true);
+});
+
+test("上下文接力：另一轮专属校验标记不能冒充本轮总结，失败后原队列保留", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-nonce-guard/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"必须保留的下一条任务"},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const claim=await env.send("CLAIM",{ready:true},11,url);
+  await env.send("SENT",{id:claim.dispatch.id},11,url);
+  env.advance(3);
+  const authentic=handoffReply(claim.dispatch.text,"另一个模型回复片段不能冒充当前任务。".repeat(15));
+  const wrongNonce=authentic.replace(/:[0-9a-f-]{36}\]\]/gi,
+    ":00000000-0000-0000-0000-000000000000]]");
+  const failed=await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,
+    handoffSummary:wrongNonce,handoffLastUserText:claim.dispatch.text,
+  },11,url);
+  assert.equal(failed.state.handoff.phase,"failed");
+  assert.match(failed.state.handoff.error,/本次专属/);
+  assert.equal(failed.state.tasks.some(t=>t.text==="必须保留的下一条任务"),true);
+  assert.equal(failed.state.tasks.some(t=>t.status==="pending"),true);
+  assert.equal((await env.send("CLAIM",{ready:true},11,url)).dispatch,null);
+});
+
+test("上下文接力：总结生成后出现新用户消息，拒绝导航且不会丢失原任务", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-message-race/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"保留后续队列"},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const claim=await env.send("CLAIM",{ready:true,userCount:10},11,url);
+  await env.send("SENT",{id:claim.dispatch.id},11,url);
+  env.advance(3);
+  const done=await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,userCount:11,
+    handoffSummary:handoffReply(claim.dispatch.text,"此记录来自本轮真实总结。".repeat(24)),
+    handoffLastUserText:"网页没有正确提供最近的用户气泡",
+  },11,url);
+  assert.equal(done.state.handoff.phase,"opening");
+  const rejected=await env.send("HANDOFF_NAVIGATE",{userCount:12},11,url);
+  assert.equal(rejected.state.handoff.phase,"failed");
+  assert.match(rejected.state.handoff.error,/新的用户消息/);
+  assert.equal(rejected.state.tasks[0].text,"保留后续队列");
+});
+
+test("接力失败取消时可要求暂停原队列，防止误入队的重复消息被自动发送", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-recovery-pause/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"疑似重复的用户消息"},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const claim=await env.send("CLAIM",{ready:true},11,url);
+  await env.send("SENT",{id:claim.dispatch.id},11,url);
+  env.advance(3);
+  const failed=await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,
+    handoffSummary:"未完成的接力总结",handoffLastUserText:claim.dispatch.text,
+  },11,url);
+  assert.equal(failed.state.handoff.phase,"failed");
+  const recovered=await env.send("CANCEL_HANDOFF",{reviewed:true,pauseAfter:true},11,url);
+  assert.equal(recovered.state.handoff.phase,"idle");
+  assert.equal(recovered.state.queuePaused,true);
+  assert.equal(recovered.state.tasks.map(t=>t.text).join("|"),"疑似重复的用户消息");
+  assert.equal((await env.send("CLAIM",{ready:true},11,url)).dispatch,null);
+});
+
+test("上下文接力：没有待办或不是原生项目就不自动迁移，总结缺失时原队列仍保留", async () => {
+  const env=await harness();
+  const sourceUrl="https://chatgpt.com/g/g-p-safe-project/c/old-safe";
+  const outside=await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60});
+  assert.equal(outside.ok,false);
+  assert.match(outside.error,/原生项目/);
+  env.navigate(11,sourceUrl);
+  await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,sourceUrl);
+  env.advance(3601);
+  const empty=await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  assert.equal(empty.state.handoff.phase,"idle");
+  await env.send("ENQUEUE",{text:"不能丢失的待办"},11,sourceUrl);
+  const due=await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  assert.equal(due.state.handoff.phase,"due");
+  const claim=await env.send("CLAIM",{ready:true},11,sourceUrl);
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const invalid=await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,handoffSummary:"不完整的总结",
+    handoffLastUserText:claim.dispatch.text,
+  },11,sourceUrl);
+  assert.equal(invalid.state.handoff.phase,"failed");
+  assert.equal(invalid.state.tasks.some((task)=>task.text==="不能丢失的待办"),true);
+  assert.equal((await env.send("CLAIM",{ready:true},11,sourceUrl)).dispatch,null);
+  const cancelled=await env.send("CANCEL_HANDOFF",{},11,sourceUrl);
+  assert.equal(cancelled.ok,true);
+  assert.equal(cancelled.state.handoff.enabled,true,
+    "取消本次交接不应悄悄修改用户原来的定时设置");
+  assert.equal((await env.send("CLAIM",{ready:true},11,sourceUrl)).dispatch.text,
+    "不能丢失的待办");
+});
+
+test("上下文接力：项目 ID 不一致时拒绝挂载交接并保留旧队列", async () => {
+  const env=await harness();
+  const sourceUrl="https://chatgpt.com/g/g-p-correct-project/c/source";
+  const wrongUrl="https://chatgpt.com/g/g-p-other-project/project";
+  env.navigate(11,sourceUrl);
+  await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,sourceUrl);
+  await env.send("ENQUEUE",{text:"需要留在原项目的待办"},11,sourceUrl);
+  env.advance(3601);
+  await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  const claim=await env.send("CLAIM",{ready:true},11,sourceUrl);
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const summary=handoffReply(claim.dispatch.text,"只在正确项目中传输。".repeat(40));
+  await env.send("FINISHED",{id:claim.dispatch.id,...voiceProof,handoffSummary:summary,
+    handoffLastUserText:claim.dispatch.text},11,sourceUrl);
+  await env.send("HANDOFF_NAVIGATE",{},11,sourceUrl);
+  env.navigate(11,wrongUrl);
+  const wrong=await env.send("HELLO",{},11,wrongUrl);
+  assert.equal(wrong.state.tasks.length,0,"不能把错误项目当成新对话");
+  const old=env.stored["cq.state.v2"].conversations["chat:source"];
+  assert.equal(old.handoff.phase,"navigating");
+  assert.equal(old.tasks[0].text,"需要留在原项目的待办");
+  assert.equal(old.tasks.length,1);
+});
+
+test("上下文接力：新对话开场发送不确定时，须人工确认才可恢复旧队列", async () => {
+  const env=await harness();
+  const sourceUrl="https://chatgpt.com/g/g-p-recovery-test/c/old-recovery";
+  const projectUrl="https://chatgpt.com/g/g-p-recovery-test/project";
+  env.navigate(11,sourceUrl);
+  await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,sourceUrl);
+  await env.send("ENQUEUE",{text:"保留的正式任务"},11,sourceUrl);
+  env.advance(3601);
+  await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  const claim=await env.send("CLAIM",{ready:true},11,sourceUrl);
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  await env.send("FINISHED",{
+    id:claim.dispatch.id,...voiceProof,
+    handoffSummary:handoffReply(claim.dispatch.text,
+      "这是要转移到新项目聊天的完整进度摘要。".repeat(22)),
+    handoffLastUserText:claim.dispatch.text,
+  },11,sourceUrl);
+  await env.send("HANDOFF_NAVIGATE",{},11,sourceUrl);
+  env.navigate(11,projectUrl);
+  await env.send("HELLO",{},11,projectUrl);
+  const intro=await env.send("CLAIM",{ready:true},11,projectUrl);
+  await env.send("SENT",{id:intro.dispatch.id},11,projectUrl);
+  await env.send("FAIL",{id:intro.dispatch.id,error:"交接回复传输失败"},11,projectUrl);
+  env.navigate(11,sourceUrl);
+  const blocked=await env.send("CANCEL_HANDOFF",{},11,sourceUrl);
+  assert.equal(blocked.ok,false);
+  assert.match(blocked.error,/人工核对/);
+  const cancelled=await env.send("CANCEL_HANDOFF",{reviewed:true},11,sourceUrl);
+  assert.equal(cancelled.ok,true);
+  assert.equal(cancelled.state.tasks.length,1);
+  assert.equal(cancelled.state.tasks[0].text,"保留的正式任务");
+  assert.equal(cancelled.state.handoff.enabled,true,
+    "对发送结果不确定的交接进行人工取消，也应保留原定时开关");
+  assert.equal((await env.send("CLAIM",{ready:true},11,sourceUrl)).dispatch.text,
+    "保留的正式任务");
+});
+
+test("接力取消：等待总结时直接撤销，未发送的总结解除锁且不丢失原任务", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-cancel-during-claim/c/source";
+  env.navigate(11,url);
+  await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,url);
+  await env.send("ENQUEUE",{text:"原有重要任务"},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const summary=await env.send("CLAIM",{ready:true},11,url);
+  assert.equal(summary.state.tasks[0].kind,"handoff_summary");
+  const cancelled=await env.send("CANCEL_HANDOFF",{},11,url);
+  assert.equal(cancelled.ok,true);
+  assert.equal(cancelled.state.handoff.cancelRequested,true);
+  assert.equal(cancelled.state.activeTaskId,summary.dispatch.id,
+    "原生发送状态未确认时，取消不能直接丢弃活动任务锁");
+  const released=await env.send("RELEASE_CLAIM",{id:summary.dispatch.id},11,url);
+  assert.equal(released.state.handoff.phase,"idle");
+  assert.equal(released.state.handoff.enabled,true);
+  assert.equal(released.state.activeTaskId,null);
+  assert.equal(released.state.tasks.map((item)=>item.text).join(","),"原有重要任务");
+  assert.equal((await env.send("CLAIM",{ready:true},11,url)).dispatch.text,"原有重要任务");
+});
+
+test("接力取消：已发送总结仍需自然完成，随后丢弃专用总结且不跳转", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-cancel-waiting/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"继续保留的原任务"},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  const claim=await env.send("CLAIM",{ready:true},11,url);
+  await env.send("SENT",{id:claim.dispatch.id},11,url);
+  const cancelled=await env.send("CANCEL_HANDOFF",{},11,url);
+  assert.equal(cancelled.state.handoff.cancelRequested,true);
+  assert.equal(cancelled.state.activeTaskId,claim.dispatch.id);
+  env.advance(5);
+  const incomplete=await env.send("FINISHED",{
+    id:claim.dispatch.id,voiceReady:false,editorEmpty:true,busy:false,
+    handoffReady:true,handoffNativeIdle:true,handoffResponseConfirmed:true,
+    handoffIdleStableMs:1000,handoffReplyStableMs:2500,
+  },11,url);
+  assert.equal(incomplete.ok,false);
+  assert.equal((await env.send("GET",{},11,url)).state.handoff.phase,"summarizing");
+  const done=await env.send("FINISHED",{
+    id:claim.dispatch.id,voiceReady:false,editorEmpty:true,busy:false,
+    handoffReady:true,handoffNativeIdle:true,handoffResponseConfirmed:true,
+    handoffIdleStableMs:5200,handoffReplyStableMs:3000,
+    handoffSummary:"即使缺少标记，取消请求也不应再试图解析总结",
+  },11,url);
+  assert.equal(done.ok,true);
+  assert.equal(done.state.handoff.phase,"idle");
+  assert.equal(done.state.activeTaskId,null);
+  assert.equal(done.state.tasks.map((item)=>item.text).join(","),"继续保留的原任务");
+  assert.equal((await env.send("HANDOFF_NAVIGATE",{},11,url)).ok,false,
+    "已取消的接力不能继续导航");
+});
+
+test("接力完成：无语音按钮时严格的原生结束证据可验证总结和新聊天，普通队列仍拒绝", async () => {
+  const env=await harness();
+  const project="g-p-native-finish";
+  const sourceUrl=`https://chatgpt.com/g/${project}/c/source`;
+  const startUrl=`https://chatgpt.com/g/${project}/project`;
+  const destinationUrl=`https://chatgpt.com/g/${project}/c/destination`;
+  const nativeProof={
+    voiceReady:false, editorEmpty:true,busy:false,
+    handoffReady:true,handoffNativeIdle:true,handoffResponseConfirmed:true,
+    handoffIdleStableMs:5100,handoffReplyStableMs:3000,
+  };
+  env.navigate(11,sourceUrl);
+  await env.send("ENQUEUE",{text:"接力后继续的原任务"},11,sourceUrl);
+  await env.send("HANDOFF_NOW",{},11,sourceUrl);
+  const claimed=await env.send("CLAIM",{ready:true,assistantCount:8,lastAssistantId:"old-a"},11,sourceUrl);
+  await env.send("SENT",{id:claimed.dispatch.id},11,sourceUrl);
+  env.advance(5);
+  const normal=handoffReply(claimed.dispatch.text,
+    "本次总结完整有效，且由原生停止控件与新回复完成工具栏联合确认。".repeat(12));
+  const spaced=normal.replace(/\[\[CHATGPT_TASKQUEUE_HANDOFF_(START|END):([0-9a-f-]+)\]\]/g,
+    (_whole,type,nonce) => `[[ CHATGPT_TASKQUEUE_HANDOFF_${type} : ${nonce} ]]`);
+  const summary=await env.send("FINISHED",{
+    id:claimed.dispatch.id,...nativeProof,handoffSummary:spaced,
+  },11,sourceUrl);
+  assert.equal(summary.ok,true);
+  assert.equal(summary.state.handoff.phase,"opening");
+  assert.equal(summary.state.tasks.length,1);
+  await env.send("HANDOFF_NAVIGATE",{},11,sourceUrl);
+  env.navigate(11,startUrl);
+  await env.send("HELLO",{},11,startUrl);
+  const intro=await env.send("CLAIM",{ready:true},11,startUrl);
+  await env.send("SENT",{id:intro.dispatch.id},11,startUrl);
+  env.navigate(11,destinationUrl);
+  await env.send("HELLO",{lastUserText:intro.dispatch.text},11,destinationUrl);
+  env.advance(5);
+  const received=await env.send("FINISHED",{
+    id:intro.dispatch.id,...nativeProof,
+  },11,destinationUrl);
+  assert.equal(received.ok,true);
+  assert.equal(received.state.handoff.phase,"idle");
+  assert.equal(received.state.tasks[0].text,"接力后继续的原任务");
+  // A plain queued reply must never be completed using this fallback.
+  const normalTask=await env.send("CLAIM",{ready:true},11,destinationUrl);
+  await env.send("SENT",{id:normalTask.dispatch.id},11,destinationUrl);
+  env.advance(5);
+  const denied=await env.send("FINISHED",{
+    id:normalTask.dispatch.id,...nativeProof,
+  },11,destinationUrl);
+  assert.equal(denied.ok,false);
+  assert.equal((await env.send("GET",{},11,destinationUrl)).state.activeTaskId,
+    normalTask.dispatch.id);
+});
+
+test("接力等待前一条普通任务：接力已到期时可用严格结束证据释放旧任务", async () => {
+  const env=await harness();
+  const url="https://chatgpt.com/g/g-p-finish-before-handoff/c/source";
+  env.navigate(11,url);
+  await env.send("ENQUEUE",{text:"第一轮工作"},11,url);
+  await env.send("ENQUEUE",{text:"下一轮工作"},11,url);
+  const first=await env.send("CLAIM",{ready:true,assistantCount:3,lastAssistantId:"a3"},11,url);
+  await env.send("SENT",{id:first.dispatch.id},11,url);
+  await env.send("HANDOFF_NOW",{},11,url);
+  env.advance(5);
+  const proof={
+    id:first.dispatch.id,voiceReady:false,editorEmpty:true,busy:false,
+    handoffReady:true,handoffNativeIdle:true,handoffResponseConfirmed:true,
+    handoffIdleStableMs:5300,handoffReplyStableMs:3200,
+  };
+  const premature=await env.send("FINISHED",{
+    ...proof,handoffReplyStableMs:800,
+  },11,url);
+  assert.equal(premature.ok,false);
+  const completed=await env.send("FINISHED",proof,11,url);
+  assert.equal(completed.ok,true);
+  assert.equal(completed.state.handoff.phase,"due");
+  assert.equal(completed.state.tasks.length,1);
+  assert.equal(completed.state.tasks[0].text,"下一轮工作");
+  const summary=await env.send("CLAIM",{ready:true},11,url);
+  assert.equal(summary.state.tasks[0].kind,"handoff_summary",
+    "原任务自然结束后优先生成接力总结，不抢发后面的任务");
 });

@@ -86,7 +86,7 @@ setTimeout(async () => {
     const main = root.querySelector(".cq-inline");
     const top = root.querySelector(".cq-toolbar");
     const footer = root.querySelector(".cq-footer-toolbar");
-    const footerActions = ["queue-composer", "toggle-queue-composer",
+    const footerActions = ["queue-composer",
       "toggle-scheduler", "toggle-settings", "toggle-queue"];
     flags.statusOnlyAtTop = top.querySelector(".cq-queue-label strong")?.textContent === "Queue" &&
       top.querySelector(".cq-queue-label span")?.textContent === "0" &&
@@ -94,6 +94,7 @@ setTimeout(async () => {
     flags.actionsAtBottom = main.lastElementChild === footer &&
       footerActions.every((action) =>
         !!footer.querySelector('button[data-action="' + action + '"]')) &&
+      !footer.querySelector('[data-action="toggle-queue-composer"]') &&
       !root.querySelector(".cq-toolbar .cq-tool") &&
       !!footer.querySelector(".cq-shortcuts .cq-enter-action");
     flags.footerBelowContent = footer.getBoundingClientRect().top >=
@@ -110,6 +111,23 @@ setTimeout(async () => {
       !root.querySelector(".cq-status-paused") &&
       root.querySelector('[data-action="toggle-queue-paused"]')?.getAttribute("aria-pressed") === "false";
     root.querySelector('[data-action="toggle-settings"]').click();
+    const pageVisible = (page) => {
+      const element = root.querySelector('#cq-settings-page-' + page);
+      return Boolean(element && !element.hidden && getComputedStyle(element).display !== 'none');
+    };
+    const selectPage = (page) => root.querySelector(
+      '[data-action="show-settings-page"][data-page="' + page + '"]').click();
+    flags.settingsTabbed = root.querySelectorAll('.cq-settings-tabs [role="tab"]').length === 4 &&
+      !!root.querySelector('.cq-settings-tabs[role="tablist"]') &&
+      pageVisible('cooldown') && !pageVisible('general') &&
+      !pageVisible('background') && !pageVisible('diagnostics') &&
+      root.querySelector('[data-page="cooldown"]').getAttribute('aria-selected') === 'true';
+    selectPage('general');
+    flags.generalOnly = pageVisible('general') && !pageVisible('cooldown') &&
+      !pageVisible('background') && !pageVisible('diagnostics');
+    flags.queueImageEditorUnderSettings = pageVisible('general') &&
+      !!root.querySelector('#cq-settings-page-general [data-action="toggle-queue-composer"]') &&
+      !footer.querySelector('[data-action="toggle-queue-composer"]');
     flags.open = !!root.querySelector("#cq-max-pending") &&
       root.querySelector("#cq-max-pending").value === "100";
     flags.defaultValuesInitially = root.querySelector("#cq-default-minutes")?.value === "30" &&
@@ -123,6 +141,17 @@ setTimeout(async () => {
     const defaultRepeats = root.querySelector("#cq-default-repeats");
     defaultRepeats.value = "2";
     defaultRepeats.dispatchEvent(new Event("input", { bubbles: true }));
+    selectPage('background');
+    flags.settingsDraftAcrossTabs = pageVisible('background') && !pageVisible('general') &&
+      root.querySelector('[data-settings-dirty="general"]')?.hidden === false &&
+      root.querySelector('#cq-max-pending')?.value === '2' &&
+      root.querySelector('.cq-draft-hint[data-draft-hint="settings"]')?.hidden === false;
+    root.querySelector('[data-page="background"]').focus();
+    root.querySelector('[data-page="background"]').dispatchEvent(new KeyboardEvent('keydown', {
+      key:'ArrowLeft',bubbles:true,cancelable:true,
+    }));
+    flags.settingsKeyboard = pageVisible('general') &&
+      document.activeElement?.dataset.page === 'general';
     root.querySelector('[data-action="save-settings"]').click();
     await delay(50);
     flags.saved = requests.some((request) =>
@@ -132,6 +161,8 @@ setTimeout(async () => {
       settings.defaultRepeatCount === 2 &&
       root.querySelector("#cq-default-minutes")?.value === "12" &&
       root.querySelector("#cq-default-repeats")?.value === "2";
+    selectPage('background');
+    flags.backgroundOnly = pageVisible('background') && !pageVisible('general');
     flags.defaultProtected = !!root.querySelector("#cq-protect-background")?.checked;
     flags.browserGuidance = root.textContent.includes("chatgpt.com") &&
       root.textContent.includes("始终保持这些网站处于活动状态");
@@ -145,10 +176,25 @@ setTimeout(async () => {
     flags.reenabledProtection = settings.protectBackground === true &&
       requests.some((request) => request.type === "PROTECT_BACKGROUND" && request.enabled === true) &&
       root.querySelector("#cq-protect-background")?.checked === true;
+    selectPage('diagnostics');
+    flags.diagnosticsOnly = pageVisible('diagnostics') && !pageVisible('background') &&
+      !!root.querySelector('#cq-diagnostics-content') &&
+      root.querySelector('[data-action="toggle-diagnostics"]')?.getAttribute('aria-expanded') === 'true';
 
     root.querySelector('[data-action="toggle-scheduler"]').click();
     flags.panelSwitched = !root.querySelector("#cq-max-pending") &&
       !!root.querySelector("#cq-schedule-mode");
+    const advancedToggle = root.querySelector('[data-action="toggle-auto-advanced"]');
+    const advancedPanel = root.querySelector("#cq-auto-advanced");
+    flags.autoAdvancedDefaultCollapsed = advancedToggle?.getAttribute("aria-expanded") === "false" &&
+      advancedToggle === root.querySelector(".cq-scheduler-tabs")?.lastElementChild &&
+      advancedPanel?.hidden === true && getComputedStyle(advancedPanel).display === "none";
+    advancedToggle.click();
+    flags.autoAdvancedOpens = root.querySelector('[data-action="toggle-auto-advanced"]')
+      ?.getAttribute("aria-expanded") === "true" &&
+      root.querySelector("#cq-auto-advanced")?.hidden === false &&
+      root.querySelector("#cq-count-rate-enabled")?.getClientRects().length > 0 &&
+      !!root.querySelector("#cq-handoff-enabled") && !!root.querySelector("#cq-auto-open");
     flags.localRateControls = root.querySelector("#cq-count-rate-enabled")?.checked === false &&
       root.querySelector("#cq-count-rate-minutes")?.value === "10" &&
       root.querySelector("#cq-count-rate-max")?.value === "3" &&
@@ -171,6 +217,16 @@ setTimeout(async () => {
     flags.rateStatusVisible = root.querySelector(".cq-count-rate-status")
       ?.textContent.includes("0/2") &&
       root.querySelector("#cq-count-rate-minutes")?.value === "8";
+    root.querySelector('[data-action="toggle-auto-advanced"]').focus();
+    root.querySelector('[data-action="toggle-auto-advanced"]').click();
+    flags.autoAdvancedCloses = root.querySelector("#cq-auto-advanced")?.hidden === true &&
+      root.querySelector('[data-action="toggle-auto-advanced"]')
+        ?.getAttribute("aria-expanded") === "false" &&
+      document.activeElement?.dataset.action === "toggle-auto-advanced";
+    root.querySelector('[data-action="toggle-auto-advanced"]').click();
+    flags.autoAdvancedPreservesSettings = root.querySelector("#cq-count-rate-enabled")?.checked &&
+      root.querySelector("#cq-count-rate-minutes")?.value === "8" &&
+      root.querySelector("#cq-count-rate-max")?.value === "2";
     flags.newTaskUsesDefaults = root.querySelector("#cq-minutes")?.value === "12" &&
       root.querySelector("#cq-repeats")?.value === "2";
     const mode = root.querySelector("#cq-schedule-mode");
@@ -252,9 +308,13 @@ setTimeout(async () => {
     flags.ok = ["statusOnlyAtTop", "actionsAtBottom", "footerBelowContent",
       "pauseAvailable", "pauseActive", "pauseReenabled",
       "collapsedActions", "reopenFromFooter", "crashReviewNotice",
-      "crashReviewKeepsPending", "open", "saved",
-      "defaultValuesInitially", "defaultValuesSaved", "newTaskUsesDefaults",
-      "reopeningCreationUsesDefaults", "editPreservesOwnCount",
+      "crashReviewKeepsPending", "open", "saved", "settingsTabbed", "generalOnly",
+        "settingsDraftAcrossTabs", "settingsKeyboard", "backgroundOnly", "diagnosticsOnly",
+        "queueImageEditorUnderSettings",
+       "defaultValuesInitially", "defaultValuesSaved", "newTaskUsesDefaults",
+       "reopeningCreationUsesDefaults", "editPreservesOwnCount",
+       "autoAdvancedDefaultCollapsed", "autoAdvancedOpens", "autoAdvancedCloses",
+       "autoAdvancedPreservesSettings",
       "localRateControls", "savedConversationRate", "rateStatusVisible",
       "rateOnListView", "rateOnCreateView", "quotaCountdown",
       "defaultProtected", "browserGuidance",

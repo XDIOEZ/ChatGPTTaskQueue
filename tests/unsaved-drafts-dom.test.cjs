@@ -87,6 +87,10 @@ window.chrome={
 };
 const q=selector=>document.querySelector("#cq-extension-root "+selector);
 const click=action=>{
+  if(action==="toggle-queue-composer") {
+    if(!q('[data-action="toggle-queue-composer"]')) click("toggle-settings");
+    q('[data-action="show-settings-page"][data-page="general"]').click();
+  }
   const button=q('[data-action="'+action+'"]');
   if(!button) throw new Error("missing action "+action);
   button.click();

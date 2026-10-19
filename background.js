@@ -1,6 +1,6 @@
 /* global chrome */
 "use strict";
-importScripts("image-store.js");
+importScripts("image-store.js", "handoff.js");
 
 // One serialized service worker owns every conversation's queue. The storage
 // envelope is shared, but task dispatch and scheduler state are per-chat.
@@ -47,11 +47,13 @@ const DASHBOARD_EVENT_TYPES = new Set([
   "steer_claim", "steer_clicked", "steer_cancel", "steer_confirm",
   "steer_uncertain", "state_inconsistent", "tab_revived",
   "tab_reopened", "tab_owner_rebound", "tab_reopen_failed",
-  "user_stopped", "user_resumed", "auto_recovered", "failed_skipped",
+    "user_stopped", "user_resumed", "auto_recovered", "failed_skipped",
   "review_confirmed", "schedule_added", "schedule_edited",
   "schedule_deleted", "schedule_toggled", "queue_paused",
   "queue_resumed", "rate_limit_updated", "backup_restored",
-  "send_cooldown_updated",
+    "send_cooldown_updated", "handoff_due", "handoff_manual", "handoff_setting",
+    "handoff_summary", "handoff_new_chat", "handoff_completed",
+    "handoff_received", "handoff_failed", "handoff_cancelled",
 ]);
 const UPDATE_REFRESH_STABLE_MS = 1800;
 // Keep the configurable cap bounded: chrome.storage.local has a shared quota.
@@ -120,6 +122,9 @@ function blankSession(key, url = null, tabId = null) {
     steeringTaskId: null,
     autoOpenTab: false,
     error: "",
+    // A completed response remains unreviewed until this conversation is
+    // actually brought to the foreground. Survives refreshes and MV3 restarts.
+    unreadCompleted: false,
     tasks: [],
     schedules: [],
     countRateLimit: {
@@ -130,6 +135,9 @@ function blankSession(key, url = null, tabId = null) {
     countRateTimes: [],
     history: [],
     recentSubmissions: [],
+    firstSeenAt: null,
+    firstMessageAt: null,
+    handoff: CQHandoff.defaults(),
   };
 }
 
@@ -746,7 +754,7 @@ function hasConversationWork(state) {
 }
 
 function canPruneIdleSession(key, state, tabs) {
-  return !hasConversationWork(state) &&
+  return state.unreadCompleted !== true && !hasConversationWork(state) &&
     !tabs.some((tab) => tabBelongsToSession(tab, key)) &&
     ![...pendingBackupRestores.values()].some((stage) => stage.key === key);
 }
@@ -827,7 +835,8 @@ async function dashboardSnapshot() {
     // Empty, closed historical conversations are not actionable. Keep all
     // sessions with unfinished work, paused state, or an actual browser tab.
     if (!related.length && !counts.pending && !counts.active && !counts.review &&
-        !schedules.length && !state.queuePaused && !state.halted) continue;
+        !schedules.length && !state.queuePaused && !state.halted &&
+        state.unreadCompleted !== true) continue;
     const active = state.tasks.find((task) =>
       task.id === state.activeTaskId || task.id === state.steeringTaskId);
     const lastEvent = Array.isArray(state.history) ? state.history.at(-1) : null;
@@ -1039,10 +1048,16 @@ function inspectUpdateRefreshSafety() {
   const stop = buttons.some((button) => {
     const testId = button.getAttribute("data-testid") || "";
     const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
-    return /(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
-      /stop (generating|response)|停止(生成|回复|回答)/i.test(label);
+    if (/(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
+        /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim())) return true;
+    const actionForm = button.closest("form");
+    const composer = actionForm?.matches("[data-chatgpt-composer]") ||
+      actionForm?.querySelector('#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]');
+    return Boolean(composer && [...button.querySelectorAll("svg.icon-primary-action > path")]
+      .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964")));
   });
-  if (stop || document.querySelector('main [data-testid="generation-in-progress"]')) {
+  if (stop || document.querySelector(
+    'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]')) {
     return { safe: false, voiceReady: false, reason: "generating" };
   }
   const voiceReady = buttons.some((button) => {
@@ -1057,6 +1072,114 @@ function inspectUpdateRefreshSafety() {
       /^(?:(?:开始|开启|进入|使用)\s*)?语音(?:模式|聊天|对话|通话)?$/i.test(label);
   });
   return { safe: true, voiceReady, reason: "idle" };
+}
+
+// Busy/unsaved tabs cannot be refreshed during an extension update. Give
+// those old documents a temporary passive tab spinner without disturbing
+// their existing composer, drafts, or queue state. It disappears on reload.
+function installDeferredTabSpinner(version) {
+  // An already-running content script (including an older version) owns its
+  // tab indicators. Installing a SECOND title spinner makes both scripts
+  // prefix each other's last frame, growing an unbounded chain in Edge tabs.
+  const stripIndicators = (value) => String(value || "ChatGPT")
+    .replace(/^(?:(?:[◴◷◶◵]|🔴|✅)\s+)+/u, "");
+  const activePlugin = () => Boolean(document.getElementById("cq-extension-root"));
+  const previous = window.__cqDeferredTabSpinner;
+  if (activePlugin()) {
+    if (typeof previous?.stop === "function") previous.stop();
+    else if (previous?.timer != null) {
+      // Compatibility with the earlier injected helper, which exposed its
+      // timer but no stop callback. Its old content script still owns updates.
+      clearInterval(previous.timer);
+      previous.timer = null;
+    }
+    const current = document.title || "";
+    const badges = current.match(/^(?:(?:[◴◷◶◵]|🔴|✅)\s+)+/u)?.[0] || "";
+    if ((badges.match(/[◴◷◶◵]/g) || []).length > 1) {
+      // Remove a stack already accumulated by the old version. The content
+      // script's next redraw restores the one appropriate status indicator.
+      document.title = stripIndicators(current);
+    }
+    return;
+  }
+  if (previous) return; // Never create two passive update spinners.
+  const state = { version, frame: 0, running: false, timer: null };
+  window.__cqDeferredTabSpinner = state;
+  const frames = ["◴", "◷", "◶", "◵"];
+  const visible = (button) =>
+    button.getClientRects().length > 0 && !button.disabled;
+  const busy = () => {
+    const editor = document.querySelector(
+      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]'
+    );
+    const form = editor?.closest("form") ||
+      document.querySelector("form[data-chatgpt-composer]");
+    const buttons = [...document.querySelectorAll("main button, form button")];
+    return buttons.some((button) => {
+      if (!visible(button)) return false;
+      const testId = button.getAttribute("data-testid") || "";
+      const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
+      if (/(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
+          /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim())) return true;
+      return Boolean(form?.contains(button) &&
+        [...button.querySelectorAll("svg.icon-primary-action > path")]
+          .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964")));
+    }) || Boolean(document.querySelector(
+      'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]'));
+  };
+  const draw = () => {
+    const current = document.title || "ChatGPT";
+    const title = stripIndicators(current);
+    const prefix = state.running ? frames[state.frame] + " " : "";
+    if (current !== prefix + title) document.title = prefix + title;
+  };
+  let controlObserver = null;
+  state.stop = () => {
+    if (state.timer !== null) clearInterval(state.timer);
+    state.timer = null;
+    state.running = false;
+    draw();
+    controlObserver?.disconnect();
+    if (window.__cqDeferredTabSpinner === state) {
+      delete window.__cqDeferredTabSpinner;
+    }
+  };
+  const scan = () => {
+    if (activePlugin()) {
+      state.stop();
+      return;
+    }
+    const next = busy();
+    if (next === state.running) return;
+    state.running = next;
+    if (state.timer !== null) clearInterval(state.timer);
+    state.timer = next ? setInterval(() => {
+      state.frame = (state.frame + 1) % frames.length;
+      draw();
+    }, 400) : null;
+    draw();
+  };
+  controlObserver = new MutationObserver((records) => {
+    if (records.some((record) => {
+      const target = record.target;
+      if (!(target instanceof Element) ||
+          target.closest("#cq-extension-root")) return false;
+      if (record.type === "attributes") {
+        return target.closest("button, form") !== null ||
+          target.matches("[data-is-streaming], [data-state='streaming']");
+      }
+      if (target.closest("button, form")) return true;
+      return [...record.addedNodes, ...record.removedNodes].some((node) =>
+        node instanceof Element &&
+        (node.matches("button, form, #cq-extension-root") ||
+          node.querySelector("button, form, #cq-extension-root")));
+    })) scan();
+  });
+  controlObserver.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ["data-testid", "aria-label", "title", "class", "style", "d"],
+  });
+  scan();
 }
 
 async function inspectUpdateTab(tabId, state) {
@@ -1118,6 +1241,17 @@ async function processPendingVersionRefresh() {
       catch (error) {
         console.warn("[ChatQueue] 无法确认页面可安全刷新，稍后重试", error);
       }
+      if (!safe) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: installDeferredTabSpinner,
+            args: [chrome.runtime.getManifest().version],
+          });
+        } catch (error) {
+          console.warn("[ChatQueue] 无法为待安全刷新标签注入临时状态标记", error);
+        }
+      }
       return {entry,action:safe ? "reload" : "keep"};
     }));
     const keep = checks.filter((item) => item.action === "keep").map((item) => item.entry);
@@ -1177,6 +1311,24 @@ function sameMessage(a, b) {
     String(b || "").replace(/\s+/g, " ").trim();
 }
 
+// ChatGPT's first-message timestamp is not always exposed to a content
+// script. Persist when this extension first sees each established chat as a
+// clearly labelled lower bound, rather than inventing a creation date.
+function plausibleConversationTime(value, now = Date.now()) {
+  return Number.isInteger(value) && value >= Date.UTC(2022,0,1) &&
+    value <= now + 60_000;
+}
+
+function recordConversationFirstSeen(state, now = Date.now()) {
+  if (plausibleConversationTime(state.firstSeenAt, now)) return false;
+  // Older plugin versions did not have firstSeenAt. Their local history can
+  // establish an earlier observation, but is NOT the ChatGPT creation time.
+  const recorded = (state.history || [])
+    .map((entry) => entry.at).filter((time) => plausibleConversationTime(time, now));
+  state.firstSeenAt = recorded.length ? Math.min(now,...recorded) : now;
+  return true;
+}
+
 function pendingCount(state) {
   return state.tasks.filter((task) =>
     ["pending", "dispatching", "waiting", "steering", "steering_wait"].includes(task.status)).length;
@@ -1204,7 +1356,8 @@ function sendCooldownUntil(state, now = Date.now()) {
 }
 
 function hasBackgroundWork(state) {
-  return pendingCount(state) > 0 || state.schedules.some((schedule) => schedule.enabled);
+  return pendingCount(state) > 0 || state.schedules.some((schedule) => schedule.enabled) ||
+    handoffBusy(state);
 }
 
 function backgroundProtectionEnabled(store) {
@@ -1426,6 +1579,13 @@ function adoptNewChat(store, sender, url, lastUserText) {
   draft.url = safeUrl(url);
   store.conversations[nextKey] = draft;
   delete store.conversations[draftKey];
+  if (draft.handoffSourceKey) {
+    const source = store.conversations[draft.handoffSourceKey];
+    if (source?.handoff?.token === draft.handoffToken &&
+        source.handoff.destinationKey === draftKey) {
+      source.handoff.destinationKey = nextKey;
+    }
+  }
   return true;
 }
 
@@ -1438,6 +1598,151 @@ function newTask(text, sourceScheduleId = null, images = []) {
     images,
     createdAt: Date.now(),
   };
+}
+
+function handoffState(state) {
+  return state.handoff || (state.handoff = CQHandoff.defaults());
+}
+
+function handoffBusy(state) {
+  return Boolean(state.handoff && !["idle", "completed"].includes(state.handoff.phase));
+}
+
+function maybeRequestHandoff(state, now = Date.now()) {
+  const handoff = state.handoff;
+  if (!handoff?.enabled || !Number.isFinite(handoff.nextAt)) return false;
+  const pending = state.tasks.some((task) => task.status === "pending");
+  // An explicit user-requested handoff may be solely about preserving chat
+  // context: unlike a timer, it must continue even with an empty queue.
+  if (handoff.phase === "due" && !handoff.manualRequested &&
+      !pending && !state.activeTaskId) {
+    handoff.phase = "idle";
+    handoff.nextAt = now + handoff.intervalMinutes * 60_000;
+    return true;
+  }
+  if (handoff.phase !== "idle" || now < handoff.nextAt || !pending ||
+      state.halted || !CQHandoff.projectId(state.url)) return false;
+  handoff.phase = "due";
+  handoff.changedAt = now;
+  recordHistory(state, "handoff_due", null, now);
+  return true;
+}
+
+function failHandoff(source, reason, now = Date.now()) {
+  const handoff = source.handoff;
+  if (!handoff || ["idle","completed","failed"].includes(handoff.phase)) return false;
+  handoff.phase = "failed";
+  handoff.changedAt = now;
+  handoff.error = String(reason).slice(0, 240);
+  recordHistory(source, "handoff_failed", null, now);
+  return true;
+}
+
+function cancelHandoffState(source, now = Date.now()) {
+  const current = source.handoff || CQHandoff.defaults();
+  const minutes = Number.isInteger(current.intervalMinutes)
+    ? current.intervalMinutes : CQHandoff.DEFAULT_MINUTES;
+  source.handoff = {
+    enabled:current.enabled === true, intervalMinutes:minutes,
+    nextAt:current.enabled === true ? now + minutes * 60_000 : null,
+    phase:"idle",
+  };
+  recordHistory(source,"handoff_cancelled",null,now);
+}
+
+function timeoutHandoff(state, now = Date.now()) {
+  const handoff = state.handoff;
+  if (!handoff) return false;
+  if (handoff.phase === "summarizing" &&
+      state.tasks.some((task) => task.kind === "handoff_summary" &&
+        ["error","interrupted"].includes(task.status)) && !state.activeTaskId) {
+    return failHandoff(state, "交接总结发送中断，请核对原对话后取消接力。", now);
+  }
+  if (handoff.phase === "opening" && now - handoff.changedAt > 5 * 60_000) {
+    return failHandoff(state, "生成总结后未能自动进入新对话，旧队列仍在原对话；可取消交接后继续。", now);
+  }
+  if (handoff.phase === "navigating" && now - handoff.changedAt > 5 * 60_000) {
+    return failHandoff(state, "无法确认已进入项目新对话。请返回原对话取消接力，旧队列仍然保留。", now);
+  }
+  if (handoff.phase === "bootstrapping" && now - handoff.changedAt > 60 * 60_000) {
+    return failHandoff(state, "新对话长时间没有确认接收交接内容。旧队列尚未迁移，请人工核对。", now);
+  }
+  return false;
+}
+
+function attachProjectHandoff(store, sender, url) {
+  const projectId = CQHandoff.projectId(url);
+  const tabId = sender.tab?.id;
+  if (!Number.isInteger(tabId) || !projectId ||
+      !CQHandoff.isProjectStart(url,projectId)) return false;
+  const source = Object.values(store.conversations).find((session) =>
+    session.tabId === tabId && session.handoff?.phase === "navigating" &&
+    CQHandoff.normalizeProjectId(session.handoff.projectId) === projectId &&
+    CQHandoff.projectId(session.url) === projectId &&
+    CQHandoff.projectId(session.handoff.projectUrl) === projectId);
+  if (!source) return false;
+  // An in-flight handoff started on an older version can still contain a
+  // slugged project ID. Normalize it before creating the destination draft.
+  source.handoff.projectId = projectId;
+  source.handoff.projectUrl = CQHandoff.projectStart(url);
+  const draftKey = `draft:${tabId}`;
+  const existing = store.conversations[draftKey];
+  if (existing && (existing.tasks.length || existing.schedules.length ||
+                   existing.activeTaskId || existing.handoffSourceKey)) {
+    failHandoff(source, "新对话入口已有未完成的队列，已停止自动迁移");
+    return true;
+  }
+  const draft = blankSession(draftKey, safeUrl(url), tabId);
+  const intro = newTask(CQHandoff.introduction(source.handoff.summary));
+  intro.kind = "handoff_intro";
+  draft.tasks.push(intro);
+  draft.handoffSourceKey = source.key;
+  draft.handoffToken = source.handoff.token;
+  store.conversations[draftKey] = draft;
+  source.handoff.phase = "bootstrapping";
+  source.handoff.destinationKey = draftKey;
+  source.handoff.changedAt = Date.now();
+  recordHistory(source, "handoff_new_chat");
+  return true;
+}
+
+function finishHandoffTransfer(store, destination, task, url) {
+  const source = store.conversations[destination.handoffSourceKey];
+  const handoff = source?.handoff;
+  if (task.kind !== "handoff_intro" || !source || !handoff ||
+      handoff.phase !== "bootstrapping" ||
+      handoff.token !== destination.handoffToken ||
+      source.tabId !== destination.tabId ||
+      CQHandoff.normalizeProjectId(handoff.projectId) !== CQHandoff.projectId(url) ||
+      handoff.destinationKey !== destination.key ||
+      destination.tasks.length !== 1 || destination.tasks[0].id !== task.id) {
+    throw new Error("无法验证同项目对话接力关系，旧队列保持不变");
+  }
+  // One durable storage write moves all references together. Images live in
+  // IndexedDB and are NOT copied or deleted; their IDs remain referenced.
+  destination.tasks = source.tasks;
+  destination.schedules = source.schedules;
+  for (const field of ["queuePaused","compactView","autoOpenTab",
+                       "sendCooldownSeconds","countRateLimit","countRateTimes",
+                       "lastQueueSettledAt","lastTimeScheduleId","lastCountScheduleId"]) {
+    if (source[field] !== undefined) destination[field] = source[field];
+  }
+  destination.lastQueueSettledAt = Date.now();
+  destination.handoff = {
+    enabled: handoff.enabled, intervalMinutes:handoff.intervalMinutes,
+    nextAt:Date.now() + handoff.intervalMinutes * 60_000, phase:"idle",
+  };
+  source.tasks = [];
+  source.schedules = [];
+  source.autoOpenTab = false;
+  source.handoff = {
+    enabled:false,intervalMinutes:handoff.intervalMinutes,nextAt:null,
+    phase:"completed",destinationKey:destination.key,changedAt:Date.now(),
+  };
+  delete destination.handoffSourceKey;
+  delete destination.handoffToken;
+  recordHistory(source,"handoff_completed");
+  recordHistory(destination,"handoff_received");
 }
 
 // Store metadata-only diagnostics. Never write prompts, images or raw errors
@@ -1985,6 +2290,9 @@ function enqueueScheduledTask(state, schedule, now) {
 }
 
 function dueSchedules(state, now = Date.now(), maxPending = DEFAULT_PENDING_LIMIT) {
+  // Scheduled rules move together with the queue; do not create more items
+  // in a source conversation while its handoff is suspended or in transit.
+  if (handoffBusy(state)) return false;
   // Both trigger modes ONLY enqueue ordinary tasks. The existing dispatcher
   // remains the sole owner of actual sending and response completion.
   let changed = pruneCountRateHistory(state, now);
@@ -2180,6 +2488,9 @@ async function handle(message, sender) {
   const key = resolveKey(url, tabId);
   if (!key) throw new Error("只支持 ChatGPT 的有效对话页面");
   let changed = adoptNewChat(store, sender, url, message.lastUserText);
+  if (key.startsWith("draft:")) {
+    changed = attachProjectHandoff(store, sender, url) || changed;
+  }
   const existing = store.conversations[key];
   const state = sessionFor(store, key, url, tabId);
   if (["HELLO", "SCHEDULE_PULSE", "CLAIM"].includes(message.type)) {
@@ -2198,6 +2509,28 @@ async function handle(message, sender) {
 
   try {
   switch (message.type) {
+    case "ACK_COMPLETION_VIEWED": {
+      if (!targetMatches(state, sender, url)) break;
+      if (state.unreadCompleted === true) {
+        state.unreadCompleted = false;
+        changed = true;
+      }
+      break;
+    }
+
+    case "REPLY_COMPLETED": {
+      // Manual replies do not have a queue FINISHED action. The content
+      // script only reports them after a new assistant turn + stable Voice
+      // readiness. Never mark a running queue task ahead of its FINISHED.
+      if (!targetMatches(state, sender, url) || message.viewed !== false ||
+          state.activeTaskId || state.steeringTaskId || state.halted) break;
+      if (state.unreadCompleted !== true) {
+        state.unreadCompleted = true;
+        changed = true;
+      }
+      break;
+    }
+
     case "GET_BACKUP":
       if (!targetMatches(state, sender, url)) throw new Error("只能备份当前对话");
       backupPayload = await createConversationBackup(state);
@@ -2353,12 +2686,170 @@ async function handle(message, sender) {
         state.haltAtUserCount = message.userCount;
         changed = true;
       }
+      if (chatKey(url) && targetMatches(state, sender, url) &&
+          (message.userCount > 0 || state.history?.length ||
+           state.tasks.length || state.schedules.length)) {
+        changed = recordConversationFirstSeen(state) || changed;
+      }
+      break;
+
+    case "OBSERVE_FIRST_MESSAGE_AT":
+      if (!chatKey(url) || !targetMatches(state, sender, url)) {
+        throw new Error("只能记录当前已建立对话的消息时间");
+      }
+      if (!plausibleConversationTime(message.firstMessageAt)) {
+        throw new Error("消息时间无效，未修改对话记录");
+      }
+      changed = recordConversationFirstSeen(state) || changed;
+      // Keep the earliest genuine timestamp even if the page later virtualizes
+      // old turns. No repeated writes once that date has been recorded.
+      if (!plausibleConversationTime(state.firstMessageAt) ||
+          message.firstMessageAt < state.firstMessageAt) {
+        state.firstMessageAt = message.firstMessageAt;
+        changed = true;
+      }
       break;
 
     case "SCHEDULE_PULSE":
       // An open ChatGPT tab can tick precisely when the countdown reaches zero.
       // The minute alarm below is still the fallback for hidden/closed tabs.
       break;
+
+    case "SET_HANDOFF": {
+      if (!targetMatches(state, sender, url)) throw new Error("只能修改本对话的接力设置");
+      if (typeof message.enabled !== "boolean") throw new Error("接力开关参数无效");
+      const minutes = CQHandoff.requireMinutes(message.intervalMinutes);
+      if (message.enabled && (!chatKey(url) || !CQHandoff.projectId(url))) {
+        throw new Error("仅支持 ChatGPT 原生项目内的已建立对话；请先在项目内打开一个聊天");
+      }
+      const handoff = handoffState(state);
+      if (!["idle","completed"].includes(handoff.phase)) {
+        throw new Error("接力正在进行或需要人工恢复，请先处理当前交接");
+      }
+      state.handoff = {
+        enabled:message.enabled,intervalMinutes:minutes,
+        nextAt:message.enabled ? Date.now() + minutes * 60_000 : null,
+        phase:"idle",
+      };
+      recordHistory(state, "handoff_setting");
+      changed = true;
+      break;
+    }
+
+    case "HANDOFF_NOW": {
+      if (!targetMatches(state, sender, url) || !chatKey(url) ||
+          !CQHandoff.projectId(url)) {
+        throw new Error("只能在 ChatGPT 原生项目里的已建立对话中立即接力");
+      }
+      if (state.halted || state.queuePaused) {
+        throw new Error("队列已暂停或需要核对，请先恢复自动发送再立即接力");
+      }
+      if (state.handoffSourceKey) throw new Error("新对话正在接收交接，不能重复创建接力");
+      const handoff = handoffState(state);
+      if (handoff.phase === "due") break; // Double click is idempotent.
+      if (!["idle","completed"].includes(handoff.phase)) {
+        throw new Error("已有接力正在进行或等待人工处理，不能重复启动");
+      }
+      // Reuse the same durable due state as the timer. The normal CLAIM gate
+      // waits for an active reply and sends the summary before any pending job.
+      handoff.phase = "due";
+      handoff.changedAt = Date.now();
+      handoff.manualRequested = true;
+      delete handoff.error;
+      recordHistory(state, "handoff_manual");
+      changed = true;
+      break;
+    }
+
+    case "CANCEL_HANDOFF": {
+      if (!targetMatches(state, sender, url)) throw new Error("只能从原对话恢复旧队列");
+      const handoff = state.handoff;
+      if (!handoff || !["due","summarizing","opening","navigating","failed","bootstrapping"]
+        .includes(handoff.phase)) {
+        throw new Error("没有可以安全取消的接力");
+      }
+      if (handoff.phase === "summarizing") {
+        const activeSummary = state.tasks.find((task) =>
+          task.id === state.activeTaskId && task.kind === "handoff_summary" &&
+          ["dispatching","waiting"].includes(task.status));
+        if (activeSummary) {
+          // A native Send might already have happened. Keep its lock until
+          // RELEASE_CLAIM/FINISHED; never delete a possibly-sent active row.
+          if (!handoff.cancelRequested) {
+            handoff.cancelRequested = true;
+            handoff.changedAt = Date.now();
+            changed = true;
+          }
+          break;
+        }
+      }
+      const destination = store.conversations[handoff.destinationKey];
+      if (destination) {
+        const intro = destination.tasks.find((task) => task.kind === "handoff_intro");
+        if (!intro || destination.tasks.length !== 1 ||
+            destination.handoffToken !== handoff.token ||
+            destination.handoffSourceKey !== state.key) {
+          throw new Error("新对话队列状态无法确认；拒绝删除可能包含正常任务的对话");
+        }
+        if (intro.status !== "pending" && message.reviewed !== true) {
+          throw new Error("新对话可能已收到交接记录；请人工核对并明确确认后再恢复旧队列");
+        }
+        // Only the context-introduction row can be discarded here. No
+        // original work was ever copied before a successful FINISHED.
+        delete store.conversations[destination.key];
+      }
+      if (state.activeTaskId && state.tasks.some((task) =>
+          task.id === state.activeTaskId && task.kind === "handoff_summary")) {
+        throw new Error("总结消息仍在执行，不能中途取消");
+      }
+      state.tasks = state.tasks.filter((task) =>
+        task.kind !== "handoff_summary" ||
+        (task.status !== "pending" && task.status !== "error" && task.status !== "interrupted"));
+      cancelHandoffState(state);
+      // Recovery from a failed handoff may leave ordinary pending messages,
+      // including ones the user has already sent by hand. Let the UI request
+      // a paused recovery so those messages cannot be duplicated unattended.
+      if (message.pauseAfter === true) state.queuePaused = true;
+      if (state.halted && ["failure","timeout"].includes(state.haltReason) &&
+          !state.activeTaskId && !state.steeringTaskId &&
+          !state.tasks.some((task) => ["error","interrupted"].includes(task.status))) {
+        // User explicitly reviewed and abandoned the failed *summary* turn.
+        // This must never override an unrelated or user-initiated stop.
+        state.halted = false;
+        state.haltReason = null;
+        state.haltAtUserCount = null;
+        state.error = "";
+        state.lastQueueSettledAt = Date.now();
+      }
+      changed = true;
+      break;
+    }
+
+    case "HANDOFF_NAVIGATE": {
+      if (!targetMatches(state, sender, url) || state.handoff?.phase !== "opening") {
+        throw new Error("交接导航尚未准备好");
+      }
+      const handoff = state.handoff;
+      const projectId = CQHandoff.projectId(url);
+      if (!projectId || projectId !== CQHandoff.normalizeProjectId(handoff.projectId) ||
+          projectId !== CQHandoff.projectId(handoff.projectUrl)) {
+        throw new Error("无法确认当前项目，已停止自动切换");
+      }
+      if (Number.isInteger(handoff.sourceUserCount) &&
+          handoff.sourceUserCount !== message.userCount) {
+        failHandoff(state,"总结之后发现新的用户消息，交接记录已过期；请重新总结以避免丢失上下文");
+        changed = true;
+        break;
+      }
+      // ChatGPT uses a canonical /project link even if the current /c/ URL
+      // includes a human-readable slug; repair old staged handoffs as well.
+      handoff.projectId = projectId;
+      handoff.projectUrl = CQHandoff.projectStart(url);
+      handoff.phase = "navigating";
+      handoff.changedAt = Date.now();
+      changed = true;
+      break;
+    }
 
     case "RECOVER_ON_VOICE": {
       // The page owns the Voice Mode readiness observation. Verify the same
@@ -2483,7 +2974,7 @@ async function handle(message, sender) {
     }
 
     case "STEER_CLAIM": {
-      if (!targetMatches(state, sender, url) || state.halted) {
+      if (!targetMatches(state, sender, url) || state.halted || handoffBusy(state)) {
         throw new Error("当前对话不可即时发送，请先返回原对话或核对暂停状态");
       }
       if (state.steeringTaskId || state.activeTaskId &&
@@ -2718,7 +3209,32 @@ async function handle(message, sender) {
           !targetMatches(state, sender, url) || !message.ready) break;
       // Serialize the decision in the service worker: a stale tab or an old
       // content script cannot skip this gate by polling CLAIM early.
-      if (sendCooldownUntil(state)) break;
+      // The manual button is an explicit send request. Do not impose the
+      // automatic queue's between-task cooldown on its summary message.
+      if (sendCooldownUntil(state) &&
+          !(state.handoff?.phase === "due" && state.handoff.manualRequested)) break;
+      changed = maybeRequestHandoff(state) || changed;
+      if (handoffBusy(state) && state.handoff.phase !== "due") break;
+      if (state.handoff?.phase === "due") {
+        const handoff = state.handoff;
+        if (!handoff.manualRequested &&
+            !state.tasks.some((item) => item.status === "pending")) {
+          handoff.phase = "idle";
+          handoff.nextAt = Date.now() + handoff.intervalMinutes * 60_000;
+          changed = true;
+          break;
+        }
+        // Tag each request with unique visible delimiters. The assistant's
+        // matching reply proves which generation produced the summary, even if
+        // ChatGPT virtualizes or reformats the original user bubble.
+        handoff.requestId = id();
+        const summary = newTask(CQHandoff.summaryPrompt(handoff.requestId));
+        summary.kind = "handoff_summary";
+        state.tasks.unshift(summary);
+        handoff.phase = "summarizing";
+        handoff.changedAt = Date.now();
+        changed = true;
+      }
       const task = state.tasks.find((item) => item.status === "pending" &&
         (!item.retryNotBefore || Date.now() >= item.retryNotBefore));
       if (!task) break;
@@ -2726,6 +3242,10 @@ async function handle(message, sender) {
       task.claimedAt = Date.now();
       task.baselineUserCount = Math.max(0, Number(message.userCount) || 0);
       task.baselineUserId = typeof message.lastUserId === "string" ? message.lastUserId : null;
+      task.baselineAssistantCount = Number.isInteger(message.assistantCount)
+        ? message.assistantCount : null;
+      task.baselineAssistantId = typeof message.lastAssistantId === "string"
+        ? message.lastAssistantId : null;
       state.activeTaskId = task.id;
       dispatch = {
         id: task.id, text: task.text,
@@ -2774,6 +3294,13 @@ async function handle(message, sender) {
       const task = state.tasks.find((item) => item.id === message.id &&
         item.id === state.activeTaskId && item.status === "dispatching");
       if (!task) break;
+      if (task.kind === "handoff_summary" && state.handoff?.cancelRequested) {
+        state.tasks.splice(state.tasks.indexOf(task),1);
+        state.activeTaskId = null;
+        cancelHandoffState(state);
+        changed = true;
+        break;
+      }
       task.status = "pending";
       task.retryNotBefore = Date.now() + 2500;
       state.activeTaskId = null;
@@ -2823,17 +3350,92 @@ async function handle(message, sender) {
       // returning stable after an actual Send click. No user-bubble detection,
       // assistant-text comparison, or a second post-send confirmation phase.
       // These fields are sampled by our content script, not by the timer.
-      if (message.voiceReady !== true || message.editorEmpty !== true ||
-          message.busy !== false || !Number.isFinite(message.voiceStableMs) ||
-          message.voiceStableMs < 1700 || !Number.isFinite(task.sentAt) ||
-          Date.now() - task.sentAt < 1700) {
-        throw new Error("语音模式按钮尚未稳定恢复，继续等待");
+      const waveformConfirmed = message.voiceReady === true &&
+        Number.isFinite(message.voiceStableMs) && message.voiceStableMs >= 1700;
+      const handoffTask = ["handoff_summary","handoff_intro"].includes(task.kind) ||
+        state.handoff?.phase === "due";
+      // Current ChatGPT layouts can show only a dictation microphone, with no
+      // dedicated Voice Mode button. For handoff tasks ONLY, accept a more
+      // conservative proof: the native Stop is gone, an actual newer assistant
+      // reply/final toolbar exists, and the surface stayed idle and unchanged.
+      const handoffNativeConfirmed = handoffTask && message.handoffReady === true &&
+        message.handoffNativeIdle === true && message.handoffResponseConfirmed === true &&
+        Number.isFinite(message.handoffIdleStableMs) &&
+        message.handoffIdleStableMs >= 4500 &&
+        Number.isFinite(message.handoffReplyStableMs) &&
+        message.handoffReplyStableMs >= 2500;
+      if ((!waveformConfirmed && !handoffNativeConfirmed) ||
+          message.editorEmpty !== true || message.busy !== false ||
+          !Number.isFinite(task.sentAt) || Date.now() - task.sentAt < 1700) {
+        throw new Error("尚未确认本轮回复完整结束，继续等待");
       }
-      // Remove exactly this task and release the lock; all later and timed
-      // tasks now use the same ordinary CLAIM dispatch path.
+      if (task.kind === "handoff_summary") {
+        const handoff = state.handoff;
+        if (handoff?.phase !== "summarizing") throw new Error("接力状态异常，旧队列未迁移");
+        if (handoff.cancelRequested) {
+          state.tasks.splice(state.tasks.indexOf(task),1);
+          state.activeTaskId = null;
+          state.lastQueueSettledAt = Date.now();
+          cancelHandoffState(state);
+          changed = true;
+          break;
+        }
+        try {
+          if (!handoff.manualRequested && !state.tasks.some((item) =>
+              item.id !== task.id && item.status === "pending")) {
+            // Timed handoffs still require queued work. Explicit manual
+            // handoffs can transfer context even if the queue is empty.
+            state.handoff = {
+              enabled:handoff.enabled,intervalMinutes:handoff.intervalMinutes,
+              nextAt:Date.now() + handoff.intervalMinutes * 60_000,phase:"idle",
+            };
+            recordHistory(state,"handoff_cancelled");
+          } else {
+            // A stale assistant message can contain old handoff markers. Only
+            // accept output when the newest user bubble is our summary request.
+            // Otherwise keep the source queue instead of transferring on
+            // unrelated/stale ChatGPT content.
+            if (!handoff.requestId && !sameMessage(message.handoffLastUserText, task.text)) {
+              throw new Error("未确认交接总结对应最新的用户请求，已保留旧队列");
+            }
+            const summary = CQHandoff.parseSummary(message.handoffSummary,handoff.requestId);
+            handoff.summary = summary;
+            handoff.token = id();
+            handoff.sourceUserCount = Number.isInteger(message.userCount)
+              ? message.userCount : null;
+            handoff.projectId = CQHandoff.projectId(url);
+            handoff.projectUrl = CQHandoff.projectStart(url);
+            if (!handoff.projectId) throw new Error("无法确认原生项目归属");
+            handoff.phase = "opening";
+            handoff.changedAt = Date.now();
+            recordHistory(state,"handoff_summary");
+          }
+        } catch (error) {
+          failHandoff(state,error.message);
+          task.status = "error";
+          task.error = error.message;
+          state.activeTaskId = null;
+          state.lastQueueSettledAt = Date.now();
+          changed = true;
+          break;
+        }
+      } else if (task.kind === "handoff_intro") {
+        if (!chatKey(url)) throw new Error("还没有确认新对话地址，旧队列未迁移");
+        finishHandoffTransfer(store,state,task,url);
+        state.activeTaskId = null;
+        state.lastQueueSettledAt = Date.now();
+        changed = true;
+        break;
+      }
+      // Remove exactly this task and release the lock; the source keeps all
+      // pending work until the destination introduction is confirmed.
       state.tasks.splice(state.tasks.indexOf(task), 1);
       state.activeTaskId = null;
       state.lastQueueSettledAt = Date.now();
+      // Older content scripts from safely deferred extension updates do not
+      // yet send the viewed flag. Preserve their completed reply as unread
+      // rather than lose it; a foreground page acknowledges after upgrading.
+      if (message.viewed !== true) state.unreadCompleted = true;
       changed = true;
       break;
     }
@@ -2951,6 +3553,14 @@ async function handle(message, sender) {
         : Number.isInteger(task.baselineUserCount) ? task.baselineUserCount +
           (wasWaiting ? 1 + (task.steerCount || 0) : 0) : null;
       failed.error = task.error;
+      if (task.kind === "handoff_summary") {
+        failHandoff(failed,"交接总结发送状态不确定；已保留原有队列");
+      } else if (task.kind === "handoff_intro") {
+        const source = store.conversations[failed.handoffSourceKey];
+        if (source?.handoff?.token === failed.handoffToken) {
+          failHandoff(source,"新对话开场消息状态不确定；旧队列未迁移");
+        }
+      }
       recordHistory(failed, "send_failed", task.id);
       changed = true;
       break;
@@ -3009,6 +3619,9 @@ async function handle(message, sender) {
        "UNCERTAIN_SEND", "FAIL", "SKIP_FAILED", "ACK_RECOVERY", "SAVE_SETTINGS",
        "SAVE_COUNT_RATE_LIMIT"].includes(message.type) &&
       dueSchedules(state, Date.now(), queueLimit(store))) changed = true;
+  if (["HELLO","SCHEDULE_PULSE","ENQUEUE","ADD_TASK","FINISHED","CLAIM"].includes(message.type)) {
+    changed = maybeRequestHandoff(state) || changed;
+  }
 
   if (changed) {
     store.conversations[key] = state;
@@ -3058,7 +3671,7 @@ async function handle(message, sender) {
 }
 
 async function ensureTargetTab(state) {
-  if (state.halted || !state.autoOpenTab || !state.url ||
+  if (state.halted || handoffBusy(state) || !state.autoOpenTab || !state.url ||
       (!state.activeTaskId && !state.tasks.some((t) => t.status === "pending")) ||
       chatKey(state.url) !== state.key) return;
   let current = null;
@@ -3142,6 +3755,8 @@ async function onScheduleTick() {
       const inconsistent = checkInFlightIntegrity(state);
       const timedOut = checkTimeout(state);
       const steerTimedOut = checkSteerTimeout(state);
+      const handoffDue = maybeRequestHandoff(state);
+      const handoffExpired = timeoutHandoff(state);
       // A single failed tabs.query/reload/create must not abort scheduling for
       // every other conversation or discard this minute's newly due tasks.
       let reopened = false;
@@ -3155,7 +3770,8 @@ async function onScheduleTick() {
           changed = true;
         }
       }
-      if (recovered || scheduled || inconsistent || timedOut || steerTimedOut || reopened) changed = true;
+      if (recovered || scheduled || inconsistent || timedOut || steerTimedOut ||
+          handoffDue || handoffExpired || reopened) changed = true;
     }
     if (changed) await saveStore(store);
     return maintainTabProtection(store);

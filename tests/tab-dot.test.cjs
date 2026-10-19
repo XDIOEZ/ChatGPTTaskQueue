@@ -26,8 +26,8 @@ test("finished background reply adds exactly one tab-title red dot; foreground c
       .replace("const VOICE_READY_STABLE_MS = 1700;", "const VOICE_READY_STABLE_MS = 120;")
       .replace("if (!state || !sessionKey || !validUrl(location.href)) return false;",
         "if (!state || !sessionKey || (!validUrl(location.href) && !location.href.startsWith('file:'))) return false;")
-      .replace('if (document.visibilityState !== "hidden" && document.hasFocus()) return;',
-        'if (!window.__cqSimulateUnfocused) return;')
+      .replace('return document.visibilityState === "visible" && document.hasFocus();',
+        'return !window.__cqSimulateUnfocused;')
       .replace("  void init();\n})();", `  window.__cqTabTest = {
         snapshot: conversationSnapshot,
         observe() {
@@ -57,10 +57,18 @@ test("finished background reply adds exactly one tab-title red dot; foreground c
 </main>
 <script>
 window.__cqSimulateUnfocused = true;
+window.__cqReplyState = {key:'draft:1', halted:false, tasks:[], schedules:[], error:'',
+  activeTaskId:null, autoOpenTab:false, unreadCompleted:false};
 window.chrome = {
-  runtime: { onMessage: { addListener() {} }, async sendMessage() {
-    return {ok:true, state: {key:'draft:1', halted:false, tasks:[], schedules:[], error:'',
-      activeTaskId:null, autoOpenTab:false}, sessionKey:'draft:1', dispatch:null};
+  runtime: { onMessage: { addListener() {} }, async sendMessage(message) {
+    if (message.type === 'REPLY_COMPLETED' && message.viewed === false) {
+      window.__cqReplyState.unreadCompleted = true;
+    }
+    if (message.type === 'ACK_COMPLETION_VIEWED') {
+      window.__cqReplyState.unreadCompleted = false;
+    }
+    return {ok:true, state: {...window.__cqReplyState},
+      sessionKey:'draft:1', dispatch:null};
   }},
   storage: { onChanged: {addListener() {}} },
 };
@@ -70,7 +78,8 @@ window.chrome = {
 setTimeout(async () => {
   const h = window.__cqTabTest;
   const flags = {};
-  flags.existingReplyUnmarked = !document.title.startsWith('🔴 ');
+  flags.existingReplyUnmarked = !document.title.startsWith('🔴 ') &&
+    !document.title.startsWith('✅ ');
   const original = document.querySelector('#messages');
   const voice = document.querySelector('#voice');
   function turn(userId, assistantId, answer) {
@@ -88,17 +97,23 @@ setTimeout(async () => {
   h.observe();
   await new Promise((resolve) => setTimeout(resolve, 160));
   h.observe();
-  flags.noDotBeforeVoice = !document.title.startsWith('🔴 ');
+  flags.noDotBeforeVoice = !document.title.startsWith('🔴 ') &&
+    !document.title.startsWith('✅ ');
   voice.style.display = '';
   h.observe();
   await new Promise((resolve) => setTimeout(resolve, 160));
   h.observe();
   flags.dotAfterReply = document.title.startsWith('🔴 ');
+  flags.completedAfterReply = document.title.startsWith('🔴 ✅ ');
   h.observe();
-  flags.oneDotOnly = !document.title.startsWith('🔴 🔴 ');
+  flags.oneDotOnly = !document.title.startsWith('🔴 🔴 ') &&
+    !document.title.includes('✅ ✅ ');
   document.title = '更新后的对话标题';
   await new Promise((resolve) => setTimeout(resolve, 25));
-  flags.titleRenameKeepsDot = document.title === '🔴 更新后的对话标题';
+  flags.titleRenameKeepsDot = document.title === '🔴 ✅ 更新后的对话标题';
+  document.title = '🔴 ✅ 🔴 ✅ 🔴 更新后的对话标题';
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  flags.oldUnreadsDeduplicated = document.title === '🔴 ✅ 更新后的对话标题';
 
   // The user returns to that Edge tab, so the unread mark disappears.
   window.__cqSimulateUnfocused = false;
@@ -110,16 +125,38 @@ setTimeout(async () => {
   voice.style.display = 'none';
   turn('u3', 'a3', 'Waiting for a tool result.');
   h.observe();
+  flags.newTurnClearsComplete = document.title === '更新后的对话标题';
   await new Promise((resolve) => setTimeout(resolve, 165));
   h.observe();
-  flags.toolWaitNoDot = !document.title.startsWith('🔴 ');
+  flags.toolWaitNoDot = !document.title.startsWith('🔴 ') &&
+    !document.title.startsWith('✅ ');
   const tool = original.querySelector('.markdown');
   tool.textContent = '最终报告完成';
   voice.style.display = '';
   h.observe();
   await new Promise((resolve) => setTimeout(resolve, 155));
   h.observe();
-  flags.toolFinishesDot = document.title.startsWith('🔴 ');
+  flags.toolFinishesDot = document.title.startsWith('🔴 ✅ ');
+
+  // Modern ChatGPT pages can use section[data-turn] instead of
+  // data-message-author-role on every turn.
+  window.__cqSimulateUnfocused = false;
+  window.dispatchEvent(new Event('focus'));
+  window.__cqSimulateUnfocused = true;
+  voice.style.display = 'none';
+  original.innerHTML =
+    '<section data-turn="user" data-turn-id="u-modern"><div data-testid="user-message">新版提问</div></section>';
+  h.observe();
+  original.insertAdjacentHTML('beforeend',
+    '<section data-turn="assistant" data-turn-id="a-modern"><div class="markdown">新版回复</div></section>');
+  h.observe();
+  flags.modernTurnsRecognized = h.snapshot().userCount === 1 &&
+    h.snapshot().assistantCount === 1 && h.snapshot().lastRole === 'assistant';
+  voice.style.display = '';
+  h.observe();
+  await new Promise((resolve) => setTimeout(resolve, 155));
+  h.observe();
+  flags.modernTurnsFinishMarked = document.title.startsWith('🔴 ✅ ');
 
   const success = Object.values(flags).every(Boolean);
   document.body.dataset.dotTest = JSON.stringify({ success, ...flags });

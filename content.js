@@ -11,7 +11,19 @@
   const VOICE_READY_STABLE_MS = 1700;
   const TAB_DOT_STABLE_MS = 6500;
   const TAB_UNREAD_DOT = "🔴 ";
+  const TAB_COMPLETED_MARK = "✅ ";
+  const TAB_SPINNER_FRAMES = ["◴", "◷", "◶", "◵"];
+  // A previously injected update spinner (or an older content script) may
+  // have prefixed the title too. Remove ALL extension-owned badges rather
+  // than only our last frame, or two writers accumulate infinite prefixes.
+  const TAB_INDICATOR_PREFIX = /^(?:(?:[◴◷◶◵]|🔴|✅)\s+)+/u;
+  const TAB_SPINNER_MS = 300;
+  const COMPLETION_SOUND_KEY = "cq.completionSoundEnabled.v1";
+  // The icon-only Stop control has no reliable localized label/testid in
+  // some ChatGPT composer variants. Recognize its primary-action glyph.
+  const NATIVE_STOP_ICON_PREFIX = "M4.5 5.75C4.5 5.05964";
   const STEER_CONFIRM_MS = 18000;
+  const EXTENSION_VERSION = chrome.runtime?.getManifest?.()?.version || "";
   const STATUS = {
     pending: "待发送",
     dispatching: "正在发送",
@@ -25,6 +37,7 @@
 
   const root = document.createElement("div");
   root.id = "cq-extension-root";
+  root.dataset.cqVersion = chrome.runtime?.getManifest?.()?.version || "";
 
   let state = null;
   let sessionKey = null;
@@ -55,6 +68,10 @@
   const expandedTaskIds = new Set();
   const expandedErrorIds = new Set();
   let schedulerOpen = false;
+  const AUTO_ADVANCED_STORAGE_KEY = "cq.autoAdvancedExpanded.v1";
+  let autoAdvancedOpen = false;
+  try { autoAdvancedOpen = localStorage.getItem(AUTO_ADVANCED_STORAGE_KEY) === "1"; }
+  catch { /* The panel still works when site storage is unavailable. */ }
   let schedulerView = "list";
   let scheduleFilter = "all";
   let scheduleKind = "all";
@@ -74,6 +91,7 @@
   // native file input. Never persist previews without their source bytes.
   let nativeComposerImages = null;
   let settingsOpen = false;
+  let settingsPage = "cooldown";
   let diagnosticsOpen = false;
   let settingsDraftRevision = 0;
   let maxPendingDraft = "100";
@@ -121,6 +139,8 @@
   let lastPagePulseAt = 0;
   let voiceReadySignature = "";
   let voiceReadySince = 0;
+  let handoffComposerIdleSince = 0;
+  let handoffReplyProbe = null;
   let lastLocation = location.href;
   let lastClaimAttempt = 0;
   let lastSchedulePulseAt = 0;
@@ -129,6 +149,15 @@
   let lastReplySnapshot = null;
   let replyCompletionWatch = null;
   let tabUnread = false;
+  let tabCompleted = false;
+  let tabRunning = false;
+  let tabSpinnerFrame = 0;
+  let tabSpinnerTimer = null;
+  let queueCompletionPending = false;
+  const completionAcksInFlight = new Set();
+  let completionSoundEnabled = true;
+  let completionSoundPlayed = false;
+  let completionAudioContext = null;
 
   const clock = () => Date.now();
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -200,13 +229,14 @@
       ["settings",hasUnsavedSettings() || hasUnsavedCooldown()],
       ["favorite",hasUnsavedFavoriteTemplate()],
     ]) {
-      const indicator = root.querySelector(`.cq-draft-indicator[data-draft-kind="${kind}"]`);
-      if (indicator) indicator.hidden = !dirty;
+      for (const indicator of root.querySelectorAll(`.cq-draft-indicator[data-draft-kind="${kind}"]`)) {
+        indicator.hidden = !dirty;
+      }
     }
     for (const [action, label, dirty] of [
       ["toggle-queue-composer","图文入队",hasQueueDraft() || Boolean(editingTask)],
       ["toggle-scheduler","自动入队规则",hasUnsavedAutomation()],
-      ["toggle-settings","队列设置",hasUnsavedSettings() || hasUnsavedCooldown()],
+      ["toggle-settings","队列设置",hasUnsavedSettings() || hasUnsavedCooldown() || hasQueueDraft()],
       ["toggle-favorites","提示词收藏夹",hasUnsavedFavoriteTemplate()],
     ]) {
       const button = root.querySelector(`[data-action="${action}"]`);
@@ -223,6 +253,10 @@
     if (queueHint) queueHint.hidden = !hasQueueDraft();
     const settingsHint = root.querySelector(".cq-draft-hint[data-draft-hint='settings']");
     if (settingsHint) settingsHint.hidden = !(hasUnsavedSettings() || hasUnsavedCooldown());
+    const cooldownTabDraft = root.querySelector('[data-settings-dirty="cooldown"]');
+    if (cooldownTabDraft) cooldownTabDraft.hidden = !hasUnsavedCooldown();
+    const generalTabDraft = root.querySelector('[data-settings-dirty="general"]');
+    if (generalTabDraft) generalTabDraft.hidden = !hasUnsavedSettings();
     const createTabTitle = root.querySelector(".cq-create-tab-title");
     if (createTabTitle) createTabTitle.textContent = editingSchedule
       ? "继续编辑" : hasScheduleDraft() ? "继续草稿" : "＋ 创建任务";
@@ -376,27 +410,38 @@
     return Boolean(element && element.getClientRects().length > 0 && !element.disabled);
   }
 
+  function isNativeStopButton(button) {
+    if (!button || root.contains(button)) return false;
+    const testId = button.getAttribute("data-testid") || "";
+    const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
+    if (/(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
+        /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim())) {
+      return true;
+    }
+    // The square primary-action glyph only counts when it belongs to the
+    // ChatGPT composer, never an arbitrary Stop button in a chat reply.
+    const form = button.closest("form");
+    if (!form || (!form.querySelector('#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]') &&
+        !form.matches("[data-chatgpt-composer]"))) return false;
+    return [...button.querySelectorAll("svg.icon-primary-action > path")]
+      .some((path) => (path.getAttribute("d") || "").startsWith(NATIVE_STOP_ICON_PREFIX));
+  }
+
   function controls() {
     // Prefer only buttons in this composer. A generated answer may include
     // other clickable "Send" buttons which must never be used by the queue.
     const form = getEditor()?.closest("form");
     const buttons = [...(form?.querySelectorAll("button") || document.querySelectorAll("main button, form button"))]
       .filter((button) => !root.contains(button));
-    const isStop = (button) => {
-      const testId = button.getAttribute("data-testid") || "";
-      const name = button.getAttribute("aria-label") || button.getAttribute("title") || "";
-      return /(?:^|-)stop-button$|composer-stop-button/.test(testId) ||
-        /stop (generating|response)|停止(生成|回复|回答)/i.test(name);
-    };
     // The stop control sometimes moves outside the composer during tool calls.
-    const stop = buttons.find((button) => isStop(button) && isVisible(button)) ||
+    const stop = buttons.find((button) => isNativeStopButton(button) && isVisible(button)) ||
       [...document.querySelectorAll("main button, button[data-testid='stop-button']")]
-        .find((button) => !root.contains(button) && isStop(button) && isVisible(button));
+        .find((button) => isNativeStopButton(button) && isVisible(button));
     const send = buttons.find((button) => {
       const testId = button.getAttribute("data-testid") || "";
       const name = button.getAttribute("aria-label") || button.getAttribute("title") || "";
       return (/^(send-button|composer-submit-button|composer-send-button)$/.test(testId) ||
-        /^(send|send message|send prompt|发送|发送消息|发送提示词)$/.test(name.toLowerCase())) && !isStop(button);
+        /^(send|send message|send prompt|发送|发送消息|发送提示词)$/.test(name.toLowerCase())) && !isNativeStopButton(button);
     });
     // ChatGPT distinguishes the waveform "Start Voice" from the adjacent
     // microphone "Start dictation". Never use the dictation mic as ready.
@@ -414,16 +459,73 @@
     return { stop, send, voice };
   }
 
+  function nativeGenerationRunning() {
+    if (controls().stop) return true;
+    return [...document.querySelectorAll(
+      'main [data-testid="generation-in-progress"], main [data-is-streaming="true"],' +
+      'main [data-state="streaming"]'
+    )].some(isVisible);
+  }
+
+  function tabGenerationRunning() {
+    if (nativeGenerationRunning()) return true;
+    // A queued reply may temporarily hide the Stop button while a tool runs.
+    // Do not let pending tasks or an idle Voice composer cause false spinners.
+    if (!state || !boundHere() || state.halted || !state.activeTaskId) return false;
+    const task = state.tasks.find((item) => item.id === state.activeTaskId);
+    return task?.status === "waiting" && !isVisible(controls().voice);
+  }
+
+  function turnRole(element) {
+    return element?.getAttribute("data-message-author-role") ||
+      element?.getAttribute("data-turn") ||
+      element?.getAttribute("data-conversation-role") || null;
+  }
+
   function turns() {
-    return [...document.querySelectorAll('[data-message-author-role="assistant"], [data-message-author-role="user"]')]
-      .filter((element) => !root.contains(element));
+    const selector =
+      '[data-message-author-role="assistant"], [data-message-author-role="user"],' +
+      'section[data-turn="assistant"], section[data-turn="user"],' +
+      '[data-conversation-role="assistant"], [data-conversation-role="user"]';
+    return [...document.querySelectorAll(selector)]
+      .filter((element) => !root.contains(element) &&
+        !element.parentElement?.closest(selector));
+  }
+
+  function nativeFirstMessageAt(firstUser) {
+    if (!firstUser) return null;
+    // If ChatGPT is virtualizing turns, a displayed middle turn must not be
+    // mistaken for the beginning of the conversation.
+    const wrapper = firstUser.closest('[data-testid^="conversation-turn-"]');
+    const index = wrapper?.getAttribute("data-testid")?.match(/^conversation-turn-(\d+)$/);
+    if (index && Number(index[1]) !== 0) return null;
+    const message = firstUser.querySelector("[data-message-id]");
+    const timestamps = [
+      firstUser.getAttribute("data-message-created-at"),
+      message?.getAttribute("data-message-created-at"),
+      wrapper?.getAttribute("data-message-created-at"),
+      firstUser.querySelector("time[datetime]")?.getAttribute("datetime"),
+      wrapper?.querySelector("time[datetime]")?.getAttribute("datetime"),
+    ];
+    const now = clock();
+    for (const value of timestamps) {
+      if (typeof value !== "string") continue;
+      const raw = value.trim();
+      const timestamp = /^\d{13}$/.test(raw) ? Number(raw) :
+        /^\d{10}$/.test(raw) ? Number(raw) * 1000 :
+        /^\d{4}-\d\d-\d\dT\d\d:\d\d:/.test(raw) &&
+        /(?:Z|[+-]\d\d:\d\d)$/i.test(raw) ? Date.parse(raw) : NaN;
+      if (Number.isInteger(timestamp) && timestamp >= Date.UTC(2022,0,1) &&
+          timestamp <= now + 60_000) return timestamp;
+    }
+    return null;
   }
 
   function messageText(element) {
     if (!element) return "";
     // Use the complete assistant turn, including tool placeholders/status.
     // A single .markdown node can be only the first segment of a tool reply.
-    const role = element.getAttribute("data-message-author-role");
+    const role = turnRole(element);
     if (role === "assistant") return element.innerText || element.textContent || "";
     // For user bubbles prefer the authored text instead of action buttons.
     const parts = [...element.querySelectorAll('[data-message-content-part]')]
@@ -436,7 +538,9 @@
 
   function messageId(element) {
     const message = element?.closest("[data-message-id]") || element?.querySelector("[data-message-id]");
-    return message?.getAttribute("data-message-id") || null;
+    return message?.getAttribute("data-message-id") ||
+      element?.getAttribute("data-turn-id") ||
+      element?.getAttribute("data-testid") || null;
   }
 
   function assistantOutputText(element) {
@@ -464,17 +568,22 @@
     let userCount = 0;
     let lastAssistant = null;
     let lastUser = null;
+    let firstUser = null;
     for (const element of list) {
-      const role = element.getAttribute("data-message-author-role");
+      const role = turnRole(element);
       if (role === "assistant") { assistantCount++; lastAssistant = element; }
-      if (role === "user") { userCount++; lastUser = element; }
+      if (role === "user") {
+        userCount++;
+        lastUser = element;
+        firstUser ||= element;
+      }
     }
     const text = assistantOutputText(lastAssistant);
     const surface = messageText(lastAssistant);
     return {
       assistantCount,
       userCount,
-      lastRole: list.at(-1)?.getAttribute("data-message-author-role") || null,
+      lastRole: turnRole(list.at(-1)),
       lastAssistantText: text,
       lastAssistantSurface: surface,
       lastAssistantSignature: `${text.length}|${text.slice(-2500)}`,
@@ -483,7 +592,115 @@
       lastUserText: messageText(lastUser),
       lastUserId: messageId(lastUser),
       lastUserElement: lastUser,
-      busy: Boolean(controls().stop),
+      firstUserElement: firstUser,
+      busy: nativeGenerationRunning(),
+    };
+  }
+
+  function handoffBoundaryPresent(text, name, requestId) {
+    const suffix = requestId ? `\\s*:\\s*${requestId}` : "";
+    return new RegExp(
+      `\\[\\[\\s*CHATGPT_TASKQUEUE_HANDOFF_${name}${suffix}\\s*\\]\\]`,"i")
+      .test(text);
+  }
+
+  function extractHandoffReply(snapshot, requestId) {
+    const element = snapshot.lastAssistantElement;
+    const candidates = [
+      snapshot.lastAssistantText, snapshot.lastAssistantSurface,
+      element?.textContent,
+    ].filter((value) => typeof value === "string" && value.trim());
+    const complete = candidates.filter((value) =>
+      handoffBoundaryPresent(value,"START",requestId) &&
+      handoffBoundaryPresent(value,"END",requestId));
+    // A response can have multiple markdown/code/tool segments. Prefer a
+    // complete source before a short .markdown fragment; the background still
+    // performs the authoritative UUID and summary-length validation.
+    const text = (complete.length ? complete : candidates)
+      .sort((a,b) => b.length - a.length)[0] || "";
+    return {
+      text,
+      completeMarkers:complete.length > 0,
+    };
+  }
+
+  function nativeReplyHasFinalActions(element) {
+    if (!element) return false;
+    const turn = element.closest(
+      '[data-testid^="conversation-turn-"], article, [data-turn-id]'
+    ) || element.parentElement || element;
+    return [...turn.querySelectorAll("button")].some((button) => {
+      const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
+      const testId = button.getAttribute("data-testid") || "";
+      return isVisible(button) && (
+        /^(复制|复制消息|复制回复|copy|copy message|copy response)$/i.test(label.trim()) ||
+        /^(copy-turn-action-button|copy-message-button)$/.test(testId));
+    });
+  }
+
+  function handoffComposerReady(snapshot) {
+    const editor = getEditor();
+    const safe = Boolean(editor && !normalize(editorText(editor)) &&
+      !hasComposerAttachments(editor) && !nativeGenerationRunning() &&
+      !controls().stop && (snapshot.userCount === 0 || snapshot.lastRole === "assistant"));
+    if (!safe) {
+      handoffComposerIdleSince = 0;
+      return false;
+    }
+    handoffComposerIdleSince ||= clock();
+    // Used only for the two internal handoff messages when ChatGPT does not
+    // expose the Voice Mode waveform at all. Never dispatch ordinary tasks
+    // from a temporarily hidden Stop button.
+    return clock() - handoffComposerIdleSince >= 4500;
+  }
+
+  function handoffCompletionEvidence(task, snapshot) {
+    // A handoff may first have to wait for a normal queue reply already sent.
+    // Only while handoff is due may that existing reply use the same strict
+    // native-final-action proof; ordinary queue dispatch remains unchanged.
+    const finishingBeforeHandoff = state?.handoff?.phase === "due";
+    if (!task || (!["handoff_summary","handoff_intro"].includes(task.kind) &&
+        !finishingBeforeHandoff)) {
+      handoffReplyProbe = null;
+      return {ready:false};
+    }
+    const editor = getEditor();
+    if (!editor || normalize(editorText(editor)) || hasComposerAttachments(editor) ||
+        nativeGenerationRunning() || controls().stop) {
+      handoffReplyProbe = null;
+      return {ready:false};
+    }
+    const result = extractHandoffReply(snapshot,
+      task.kind === "handoff_summary" ? state?.handoff?.requestId : null);
+    const newerAssistant = Boolean(
+      task.kind === "handoff_summary" && result.completeMarkers ||
+      Number.isInteger(task.baselineAssistantCount) &&
+        snapshot.assistantCount > task.baselineAssistantCount ||
+      task.baselineAssistantId && snapshot.lastAssistantId &&
+        snapshot.lastAssistantId !== task.baselineAssistantId ||
+      Number.isInteger(task.baselineUserCount) &&
+        snapshot.userCount > task.baselineUserCount && snapshot.lastRole === "assistant"
+    );
+    const finalActions = nativeReplyHasFinalActions(snapshot.lastAssistantElement);
+    const responseConfirmed = Boolean(newerAssistant && result.text &&
+      (finalActions || task.kind === "handoff_summary" && result.completeMarkers));
+    const now = clock();
+    const signature = `${snapshot.lastAssistantId || ""}|${result.text.length}|` +
+      `${result.text.slice(0,120)}|${result.text.slice(-380)}`;
+    if (!handoffReplyProbe || handoffReplyProbe.taskId !== task.id) {
+      handoffReplyProbe = {
+        taskId:task.id,idleSince:now,replySince:now,signature,
+      };
+    } else if (handoffReplyProbe.signature !== signature) {
+      handoffReplyProbe.signature = signature;
+      handoffReplyProbe.replySince = now;
+    }
+    const idleStableMs = now - handoffReplyProbe.idleSince;
+    const replyStableMs = now - handoffReplyProbe.replySince;
+    return {
+      ready:responseConfirmed && idleStableMs >= 4500 && replyStableMs >= 2500,
+      idleStableMs,replyStableMs,responseConfirmed,
+      newerAssistant:Boolean(newerAssistant),summary:result.text,
     };
   }
 
@@ -500,27 +717,184 @@
     } catch { /* Monitoring is optional; sending tasks is not. */ }
   }
 
-  function syncTabRedDot() {
-    // Edge's vertical tab strip displays the page title. Prefixing one red
-    // dot marks *that tab*, without opening Edge's side panel or a popup.
+  function syncTabIndicators() {
+    // Animate the title prefix so Edge's vertical tab strip shows work in
+    // progress without opening a window or replacing ChatGPT's favicon.
+    // Both the normal script and the temporary update spinner can touch the
+    // same title; previous-frame matching alone is not idempotent.
     const current = document.title || "ChatGPT";
-    if (tabUnread && !current.startsWith(TAB_UNREAD_DOT)) {
-      document.title = TAB_UNREAD_DOT + current;
-    } else if (!tabUnread && current.startsWith(TAB_UNREAD_DOT)) {
-      document.title = current.slice(TAB_UNREAD_DOT.length);
+    const title = current.replace(TAB_INDICATOR_PREFIX, "");
+    const prefix = (tabRunning ? TAB_SPINNER_FRAMES[tabSpinnerFrame] + " " : "") +
+      (tabUnread ? TAB_UNREAD_DOT : "") +
+      (tabCompleted ? TAB_COMPLETED_MARK : "");
+    if (current !== prefix + title) document.title = prefix + title;
+  }
+
+  function isTabViewed() {
+    return document.visibilityState === "visible" && document.hasFocus();
+  }
+
+  function setTabRunning(running) {
+    if (tabRunning === running) return;
+    tabRunning = running;
+    if (tabSpinnerTimer !== null) {
+      clearInterval(tabSpinnerTimer);
+      tabSpinnerTimer = null;
     }
+    if (running) {
+      tabSpinnerFrame = 0;
+      tabSpinnerTimer = window.setInterval(() => {
+        tabSpinnerFrame = (tabSpinnerFrame + 1) % TAB_SPINNER_FRAMES.length;
+        syncTabIndicators();
+      }, TAB_SPINNER_MS);
+    }
+    syncTabIndicators();
+  }
+
+  // ChatGPT can swap a labelled Stop button for an icon-only square during
+  // generation. Observe composer mutations directly instead of relying on
+  // 1.3-second polling (heavily throttled in background Edge tabs).
+  const tabControlObserver = new MutationObserver((records) => {
+    const controlsChanged = records.some((record) => {
+      const target = record.target;
+      if (!(target instanceof Element) || root.contains(target)) return false;
+      if (record.type === "attributes") {
+        return target.matches("button, svg, path, [data-is-streaming], [data-state], [data-testid]") &&
+          (target.closest("button, form") !== null ||
+            target.matches('[data-is-streaming], [data-state="streaming"], [data-testid="generation-in-progress"]'));
+      }
+      if (target.closest("form, button")) return true;
+      return [...record.addedNodes, ...record.removedNodes].some((node) =>
+        node instanceof Element && node !== root && !root.contains(node) &&
+        (node.matches("button, form, [data-is-streaming], [data-testid='generation-in-progress']") ||
+          node.querySelector("button, form, [data-is-streaming], [data-testid='generation-in-progress']")));
+    });
+    if (controlsChanged) setTabRunning(tabGenerationRunning());
+  });
+  if (document.body) {
+    tabControlObserver.observe(document.body, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ["data-testid", "aria-label", "title", "style", "class", "disabled", "d", "data-is-streaming", "data-state"],
+    });
   }
 
   function clearTabRedDot() {
     tabUnread = false;
-    syncTabRedDot();
+    syncTabIndicators();
+  }
+
+  function clearTabCompleted() {
+    if (!tabCompleted) return;
+    tabCompleted = false;
+    syncTabIndicators();
+  }
+
+  function syncStoredCompletion() {
+    // The notification belongs to the conversation, not this particular DOM
+    // instance. Never clear it merely because more queue tasks were enqueued.
+    tabCompleted = Boolean(state?.unreadCompleted) && !isTabViewed();
+    syncTabIndicators();
+    if (isTabViewed() && state?.unreadCompleted) acknowledgeViewedTab();
+  }
+
+  function getCompletionAudio() {
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) return null;
+    if (!completionAudioContext || completionAudioContext.state === "closed") {
+      completionAudioContext = new AudioContextCtor();
+    }
+    return completionAudioContext;
+  }
+
+  function unlockCompletionAudio() {
+    if (!completionSoundEnabled) return;
+    try {
+      const audio = getCompletionAudio();
+      if (audio?.state === "suspended") {
+        void audio.resume().catch(() => { /* Requires a real user gesture. */ });
+      }
+    } catch { /* Audio is optional; never interrupt queue dispatch. */ }
+  }
+
+  // A gesture on ChatGPT or on the queue controls authorizes this document
+  // to play later while it is in a background tab. A brand new, never
+  // interacted-with tab may still be blocked by the browser's autoplay policy.
+  window.addEventListener("pointerdown", unlockCompletionAudio, { capture: true, passive: true });
+  window.addEventListener("keydown", unlockCompletionAudio, true);
+
+  function emitCompletionChime(audio) {
+    // Two gentle tones, generated locally. No remote file, OS integration,
+    // extra extension permission or autoplaying audio element is required.
+    const start = audio.currentTime + 0.01;
+    for (const [offset, frequency] of [[0, 784], [0.12, 1047]]) {
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      const at = start + offset;
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, at);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.065, at + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.18);
+      oscillator.connect(gain);
+      gain.connect(audio.destination);
+      oscillator.start(at);
+      oscillator.stop(at + 0.19);
+    }
+  }
+
+  async function playCompletionSound(preview = false) {
+    if (!completionSoundEnabled && !preview) return false;
+    try {
+      const audio = getCompletionAudio();
+      if (!audio) return false;
+      if (audio.state !== "running") {
+        // Only a user-clicked preview may wait for resume; a finished reply
+        // must not play a stale notification on the user's next interaction.
+        if (!preview) return false;
+        await audio.resume();
+      }
+      if (audio.state !== "running") return false;
+      emitCompletionChime(audio);
+      return true;
+    } catch { return false; }
+  }
+
+  async function loadCompletionSoundPreference() {
+    try {
+      const stored = await chrome.storage?.local?.get?.(COMPLETION_SOUND_KEY);
+      if (typeof stored?.[COMPLETION_SOUND_KEY] === "boolean") {
+        completionSoundEnabled = stored[COMPLETION_SOUND_KEY];
+      }
+    } catch { /* Keep the default if extension storage is unavailable. */ }
+  }
+
+  function markTabCompletedIfDrained(voiceReady) {
+    // Empty queues on page load, manual deletion, interrupted sends and
+    // scheduled refills are NOT evidence of a successfully finished reply.
+    if (!voiceReady || !boundHere() || !state || state.halted ||
+        state.tasks.length || state.activeTaskId || state.steeringTaskId ||
+        composerActionInProgress || workInProgress) return;
+    if (!completionSoundPlayed) {
+      completionSoundPlayed = true;
+      void playCompletionSound();
+    }
+    if (isTabViewed()) return; // Already reading this conversation.
+    tabCompleted = true;
+    syncTabIndicators();
+  }
+
+  function clearCompletionIfWorkQueued() {
+    if (state?.tasks?.length || state?.activeTaskId || state?.steeringTaskId || state?.halted) {
+      queueCompletionPending = false;
+      completionSoundPlayed = false;
+    }
   }
 
   function unreadRedDot() {
     // A user already looking at the answer does not need an unread marker.
-    if (document.visibilityState !== "hidden" && document.hasFocus()) return;
+    if (isTabViewed()) return;
     tabUnread = true;
-    syncTabRedDot();
+    syncTabIndicators();
   }
 
   function observeReplyCompleted(snapshot, voiceReady) {
@@ -537,6 +911,11 @@
         (snapshot.lastUserText !== prior.lastUserText || snapshot.lastRole === "user"));
 
     if (newUserTurn) {
+      // Automatic follow-up messages in a hidden queue must not count as
+      // the user reading the earlier completed answer.
+      if (isTabViewed()) acknowledgeViewedTab();
+      queueCompletionPending = false;
+      completionSoundPlayed = false;
       replyCompletionWatch = {
         assistantCount: prior.assistantCount,
         assistantId: prior.lastAssistantId,
@@ -563,21 +942,40 @@
       // raise a false unread dot without a new user/assistant exchange.
       if (newAssistant && voiceReady) {
         unreadRedDot();
+        markTabCompletedIfDrained(voiceReady);
+        // Ordinary manual replies have no FINISHED event in the queue
+        // backend. Persist their unread state separately after confirmation.
+        if (!state?.activeTaskId && !state?.steeringTaskId && !state?.halted) {
+          void rpc("REPLY_COMPLETED", { viewed: isTabViewed() }).catch(() => {
+            // A missed cosmetic notification must never stop the queue.
+          });
+        }
         replyCompletionWatch = null; // One dot per completed reply.
       }
     }
     lastReplySnapshot = snapshot;
-    syncTabRedDot();
+    syncTabIndicators();
   }
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") clearTabRedDot();
-  });
-  window.addEventListener("focus", clearTabRedDot);
+  function acknowledgeViewedTab() {
+    if (!isTabViewed()) return;
+    tabUnread = false;
+    tabCompleted = false;
+    syncTabIndicators();
+    if (!state?.unreadCompleted || !boundHere() ||
+        completionAcksInFlight.has(sessionKey)) return;
+    const key = sessionKey;
+    completionAcksInFlight.add(key);
+    void rpc("ACK_COMPLETION_VIEWED").catch(() => {
+      // Leave the stored unread marker intact for a future retry.
+    }).finally(() => completionAcksInFlight.delete(key));
+  }
+  document.addEventListener("visibilitychange", acknowledgeViewedTab);
+  window.addEventListener("focus", acknowledgeViewedTab);
   // ChatGPT can rename the tab at any moment (including after a response).
-  // Keep the single red dot visible until this tab is viewed again.
+  // Keep the indicator visible until the tab is actually viewed again.
   const tabTitleObserver = new MutationObserver(() => {
-    if (tabUnread) syncTabRedDot();
+    if (tabUnread || tabCompleted || tabRunning) syncTabIndicators();
   });
   if (document.head) {
     tabTitleObserver.observe(document.head, { childList: true, characterData: true, subtree: true });
@@ -595,7 +993,8 @@
     // assistant text, message counts, or delivery confirmation as a second gate.
     // The editor must be empty and the native Stop button absent so unsent
     // drafts and active generation cannot be mistaken for a ready composer.
-    if (!editor || normalize(editorText(editor)) || !isVisible(voice) || stop) {
+    if (!editor || normalize(editorText(editor)) || !isVisible(voice) || stop ||
+        nativeGenerationRunning()) {
       resetVoiceReadiness();
       return false;
     }
@@ -620,6 +1019,11 @@
 
   async function rpc(type, properties = {}) {
     const requestedUrl = location.href;
+    const completingQueuedReply = type === "FINISHED"
+      ? state?.activeTaskId === properties.id &&
+        state?.tasks?.some((task) => task.id === properties.id && task.status === "waiting")
+      : type === "STEER_CONFIRM" && state?.steeringTaskId === properties.id &&
+        state?.tasks?.some((task) => task.id === properties.id && task.status === "steering_wait");
     const reply = await chrome.runtime.sendMessage({ type, url: requestedUrl, ...properties });
     if (!reply?.ok) throw new Error(reply?.error || "插件后台未响应，请刷新 ChatGPT 页面");
     // A user may navigate between chats while a large image is being saved.
@@ -629,6 +1033,10 @@
     if (location.href !== requestedUrl) return reply;
     const switched = Boolean(reply.sessionKey && sessionKey !== reply.sessionKey);
     if (switched) {
+      queueCompletionPending = false;
+      completionSoundPlayed = false;
+      tabCompleted = false;
+      clearTabRedDot();
       imageHealthResult = null;
       nativeSubmission = null;
       queueFilter = "all";
@@ -681,9 +1089,18 @@
     }
     if (reply.state) {
       state = reply.state;
+      clearCompletionIfWorkQueued();
+      syncStoredCompletion();
       if (switched) countRateDirty = false;
       if (!countRateDirty) resetCountRateDraft();
       if (!cooldownDraftDirty) resetCooldownDraft();
+    }
+    if (completingQueuedReply && reply.state &&
+        !state.halted && !state.tasks.length && !state.activeTaskId && !state.steeringTaskId) {
+      // FINISHED is backed by the native stable Voice signal; STEER_CONFIRM
+      // only proves a native user message, so it must wait for Voice readiness.
+      queueCompletionPending = type === "STEER_CONFIRM";
+      if (type === "FINISHED") markTabCompletedIfDrained(updateVoiceReadiness());
     }
     if (reply.settings) {
       const settingsWereDirty = hasUnsavedSettings();
@@ -746,6 +1163,44 @@
     return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   }
 
+  function conversationDuration(startedAt, now = clock()) {
+    const minutes = Math.max(0, Math.floor((now - startedAt) / 60_000));
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    const rest = minutes % 60;
+    if (days) return `${days}天 ${hours}小时${rest}分钟`;
+    if (hours) return `${hours}小时${rest}分钟`;
+    return minutes ? `${minutes}分钟` : "不到1分钟";
+  }
+
+  function handoffHoverText(hint, now = clock()) {
+    const date = (value) => new Date(value).toLocaleString("zh-CN", {
+      month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit",
+    });
+    const valid = (value) => Number.isInteger(value) &&
+      value >= Date.UTC(2022,0,1) && value <= now + 60_000;
+    const firstMessageAt = valid(state?.firstMessageAt) ? state.firstMessageAt : null;
+    const firstSeenAt = valid(state?.firstSeenAt) ? state.firstSeenAt : null;
+    if (firstMessageAt) {
+      return `当前对话已至少持续：${conversationDuration(firstMessageAt, now)}\n` +
+        `首条消息：${date(firstMessageAt)}\n${hint}`;
+    }
+    if (firstSeenAt) {
+      return `插件已记录此对话至少：${conversationDuration(firstSeenAt, now)}\n` +
+        `首次记录：${date(firstSeenAt)}（实际开始可能更早）\n${hint}`;
+    }
+    return `对话时长：尚无可靠记录\n${hint}`;
+  }
+
+  function updateHandoffHover(now = clock()) {
+    const button = root.querySelector('.cq-handoff-now[data-handoff-hint]');
+    if (!button) return;
+    const value = handoffHoverText(button.dataset.handoffHint,now);
+    if (button.title !== value) button.title = value;
+    const wrapper = button.closest(".cq-handoff-hover-area");
+    if (wrapper && wrapper.title !== value) wrapper.title = value;
+  }
+
   function countdownText(nextRunAt, now = clock()) {
     const seconds = Math.max(0, Math.ceil((Number(nextRunAt) - now) / 1000));
     const days = Math.floor(seconds / 86400);
@@ -776,6 +1231,7 @@
     updateDraftWaiting();
     if (!boundHere()) return;
     const now = clock();
+    updateHandoffHover(now);
     for (const element of root.querySelectorAll(".cq-countdown[data-next-run-at]")) {
       const nextRunAt = Number(element.dataset.nextRunAt);
       element.textContent = `${element.dataset.prefix || ""}${countdownText(nextRunAt, now)}`;
@@ -836,6 +1292,7 @@
       grip: '<circle cx="9" cy="5" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="19" r="1"/>',
       pin: '<path d="m16 3 5 5-4 1-3 4 1 4-2 2-4-5-5-5 2-2 4 1 4-3zM9 15l-6 6"/>',
       star: '<path d="m12 2 3.1 6.3 7 .9-5 4.9 1.2 6.9-6.3-3.3-6.3 3.3 1.2-6.9-5-4.9 7-.9z"/>',
+      handoff: '<path d="M4 7h14m-4-4 4 4-4 4M20 17H6m4-4-4 4 4 4"/>',
       steer: '<path d="m7 17 10-10M8 7h9v9"/>',
       edit: '<path d="m4 17-.5 3.5L7 20l11-11-3-3L4 17zM13 8l3 3"/>',
       image: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.6"/><path d="m3 17 6-6 4 4 3-3 5 5"/>',
@@ -1001,7 +1458,7 @@
 
   function renderTasks() {
     const visible = filteredTasks();
-    if (!state.tasks.length) return '<p class="cq-empty">队列为空 · 在 ChatGPT 输入框按 Enter 入队，或用下方「图文」添加任务</p>';
+    if (!state.tasks.length) return '<p class="cq-empty">队列为空 · 在 ChatGPT 输入框按 Enter，将文字或图片加入队列</p>';
     if (!visible.length) return `<div class="cq-filter-empty">
       <p>没有符合条件的队列任务</p>
       <button type="button" data-action="reset-task-filter">清除筛选条件</button>
@@ -1533,6 +1990,15 @@
       queue_paused: "暂停自动发送", queue_resumed: "继续自动发送",
       rate_limit_updated: "修改本对话补队限速",
       send_cooldown_updated: "修改本对话发送冷却",
+      handoff_due: "定时上下文接力到期",
+      handoff_manual: "手动启动上下文接力",
+      handoff_setting: "修改接力间隔或开关",
+      handoff_summary: "已保存本轮交接总结",
+      handoff_new_chat: "已进入项目新对话入口",
+      handoff_completed: "旧队列已成功迁移",
+      handoff_received: "新对话已接收任务和规则",
+      handoff_failed: "交接失败，保留旧队列",
+      handoff_cancelled: "取消交接",
       backup_restored: "从备份恢复并暂停",
     };
     const entries = Array.isArray(state.history) ? state.history.slice(-30).reverse() : [];
@@ -1582,14 +2048,40 @@
       .sort((a, b) => a.nextRunAt - b.nextRunAt)[0];
     const countSchedule = state.schedules.find((schedule) => schedule.enabled && schedule.mode === "count");
     const rate = countRateStatus();
-    const backgroundWork = pending > 0 || state.schedules.some((schedule) => schedule.enabled);
+    const handoff = state.handoff || {enabled:false,intervalMinutes:120,phase:"idle"};
+    const handoffRunning = !["idle","completed"].includes(handoff.phase);
+    const handoffCancelling = handoff.cancelRequested === true;
+    const projectChat = /^\/g\/g-p-[a-zA-Z0-9-]+\/c\/[a-zA-Z0-9-]+\/?$/
+      .test(new URL(location.href).pathname);
+    const canHandoffNow = projectChat &&
+      !state.halted && !state.queuePaused && !state.handoffSourceKey && !handoffRunning;
+    const canCancelHandoff = projectChat && handoffRunning &&
+      !state.handoffSourceKey && !handoffCancelling;
+    const handoffButtonHint = handoffCancelling ? "已请求取消：等待当前总结安全结束，不会跳转新对话" :
+      handoffRunning ? (state.handoffSourceKey
+        ? "接力正在新对话中进行，若有异常请回到原对话核对"
+        : handoff.phase === "summarizing"
+          ? "再次点击取消接力：已发送的总结会自然结束，但不再自动跳转"
+          : "再次点击取消接力，原有队列和规则保留") :
+      !projectChat ? "请先打开 ChatGPT 原生项目内的已有对话" :
+      state.halted || state.queuePaused ? "队列已暂停，请先恢复自动发送" :
+      "手动总结当前对话并在同项目新对话继续；无需待发送任务，也不必开启定时";
+    const handoffLabels = {
+      due:"已到期 · 等待当前任务结束", summarizing:"正在生成交接总结",
+      opening:"总结已保存 · 准备进入新对话",
+      navigating:"正在进入原生项目的新对话", bootstrapping:"等待新对话确认接收",
+      failed:"交接失败 · 旧队列已保留", completed:"已接力到新对话",
+    };
+    const backgroundWork = pending > 0 || handoffRunning ||
+      state.schedules.some((schedule) => schedule.enabled);
     const activeElement = root.contains(document.activeElement) ? document.activeElement : null;
     const activeId = activeElement?.id;
     const focusedTaskRowId = activeElement?.matches?.(".cq-list .cq-task[data-task-id]")
       ? activeElement.dataset.taskId : null;
     const focusedButton = activeElement?.matches?.("button[data-action]") ?
       { action:activeElement.dataset.action, id:activeElement.dataset.id || "",
-        filter:activeElement.dataset.filter || "" } : null;
+        filter:activeElement.dataset.filter || "",
+        page:activeElement.dataset.page || "" } : null;
     const caret = activeElement && typeof activeElement.selectionStart === "number" ? activeElement.selectionStart : null;
 
     root.innerHTML = `
@@ -1601,6 +2093,12 @@
           ${active ? `<span class="cq-status cq-status-active">${icon("clock")} ${STATUS[active.status]}</span>` :
             state.halted ? `<span class="cq-status">${state.haltReason === "user" ? "用户已暂停" : "等待核对"}</span>` : ''}
           ${state.queuePaused ? `<span class="cq-status cq-status-paused" title="只暂停领取下一条，当前正在运行的任务不会被强行中断">自动发送已暂停</span>` : ""}
+          ${state.handoffSourceKey ? `<span class="cq-status cq-status-active" title="旧队列会在当前对话确认接收总结后一次性迁移">接收交接中</span>` : ""}
+          ${handoffRunning ? `<span class="cq-status ${handoff.phase === "failed" ? "" : "cq-status-active"}"
+            title="${escapeHtml(handoff.error || handoffLabels[handoff.phase] || "接力正在进行")}">
+            ${handoffCancelling ? "接力取消中" :
+              handoff.phase === "failed" ? "接力失败" : handoff.phase === "due" ? "接力待总结" :
+              handoff.phase === "summarizing" ? "接力总结中" : "接力切换中"}</span>` : ""}
           ${cooldownAt && waitingToDispatch && !active && !state.halted &&
              !state.queuePaused && !state.steeringTaskId
             ? `<span class="cq-status cq-cooldown-status" data-cooldown-until="${cooldownAt}"
@@ -1617,6 +2115,8 @@
               ? pending >= settings.maxPending ? "已到期 · 队列已满" : "已到期 · 待入队"
               : countdownMarkup(nearestSchedule.nextRunAt)}</span>` : ""}
           ${!nearestSchedule && countSchedule ? `<span class="cq-next-run" title="队列数量低于阈值时自动补入">${icon("list")} 补队 ${pending}/${countSchedule.threshold}</span>` : ""}
+          ${EXTENSION_VERSION ? `<span class="cq-version-badge" title="ChatGPT 自动对话队列 v${escapeHtml(EXTENSION_VERSION)}"
+            aria-label="插件版本 ${escapeHtml(EXTENSION_VERSION)}">v${escapeHtml(EXTENSION_VERSION)}</span>` : ""}
         </div>
         ${queueExpanded ? `
           ${needsReview || notification ? `<div class="cq-notice" role="status">
@@ -1628,6 +2128,11 @@
             ${recoverable ? `<button type="button" data-action="skip-failed" data-id="${recoverable.id}" title="人工核对后跳过，不会重发">核对后跳过</button>` :
               needsReview && !state.activeTaskId ? `<button type="button" data-action="ack-recovery" title="确认上一条已经处理或无需重发后恢复">核对后继续</button>` : ""}
           </div>` : ''}
+          ${handoff.phase === "failed" ? `<div class="cq-notice cq-handoff-failed-notice" role="alert">
+            <span>接力未完成：${escapeHtml(handoff.error || "请核对原对话后取消本次接力")}
+              · 旧队列与规则没有迁移</span>
+            <button type="button" data-action="cancel-handoff" title="人工核对后取消失败的接力，保留原队列">取消本次接力</button>
+          </div>` : ""}
           ${renderQueueTools()}
           <div class="cq-list${settings.queueListHeight !== null ? " cq-list-custom" : ""}"
             role="list" aria-label="当前对话的队列任务"
@@ -1667,6 +2172,12 @@
                   <span class="cq-create-tab-title">${editingSchedule ? "继续编辑" : hasScheduleDraft() ? "继续草稿" : "＋ 创建任务"}</span>
                   <small class="cq-unsaved-label" ${hasScheduleDraft() ? "" : "hidden"}>未保存</small>
                 </button>
+                <button type="button" class="cq-auto-advanced-toggle" data-action="toggle-auto-advanced"
+                  aria-expanded="${autoAdvancedOpen}" aria-controls="cq-auto-advanced"
+                  aria-label="${autoAdvancedOpen ? "收起不常用设置" : "展开不常用设置"}"
+                  title="${autoAdvancedOpen ? "收起不常用设置" : "展开不常用设置"}">
+                  ${icon(autoAdvancedOpen ? "arrowUp" : "arrowDown")}<span>${autoAdvancedOpen ? "收起设置" : "高级设置"}</span>
+                </button>
               </div>
               ${schedulerView === "create" ? `
               <div class="cq-section-title">${editingSchedule ? '编辑自动入队任务' : '创建自动入队任务'} <span>只负责入队，由原队列依次发送</span></div>
@@ -1691,6 +2202,7 @@
               ` : `<div class="cq-section-title">当前自动任务 <span>筛选与排序仅影响显示，不改变入队顺序</span></div>
                 ${renderScheduleControls()}
                 <div class="cq-schedule-results" aria-label="当前自动任务列表">${renderSchedules()}</div>`}
+              <div id="cq-auto-advanced" class="cq-auto-advanced" ${autoAdvancedOpen ? "" : "hidden"}>
               <div class="cq-count-rate-panel">
                 <div class="cq-section-title">数量补队频率限制 <span>仅当前对话，不是全局设置</span></div>
                 <label class="cq-switch" for="cq-count-rate-enabled">
@@ -1713,13 +2225,55 @@
                   手动入队和按时间触发的任务不计入此限制。
                 </p>
               </div>
+              <div class="cq-handoff-panel">
+                <div class="cq-section-title">自动上下文接力 <span>原生项目 · 本对话独立设置</span></div>
+                <label class="cq-switch" for="cq-handoff-enabled">
+                  <input type="checkbox" id="cq-handoff-enabled" ${handoff.enabled ? "checked" : ""} ${handoffRunning ? "disabled" : ""}>
+                  定时总结并在同项目的新对话继续队列
+                </label>
+                <div class="cq-schedule-controls">
+                  <label for="cq-handoff-minutes">每 <input type="number" id="cq-handoff-minutes"
+                    min="5" max="1440" step="1" value="${escapeHtml(handoff.intervalMinutes)}"
+                    ${handoffRunning ? "disabled" : ""}> 分钟</label>
+                  <button type="button" class="cq-save" data-action="save-handoff"
+                    ${handoffRunning ? "disabled" : ""}>保存接力设置</button>
+                </div>
+                <p class="cq-repeat-hint" role="status">
+                  ${handoffLabels[handoff.phase] || (handoff.enabled
+                    ? handoff.nextAt && handoff.nextAt > clock()
+                      ? `下次检查 ${countdownMarkup(handoff.nextAt)} 后；仅队列还有未发送任务时接力。`
+                      : "等待队列任务；到期且还有待办时启动接力。"
+                    : "默认关闭。仅支持项目聊天链接；没有待办时不会创建新对话。")}
+                  ${handoff.error ? ` · ${escapeHtml(handoff.error)}` : ""}
+                </p>
+                ${["due","opening","navigating","failed","bootstrapping"].includes(handoff.phase)
+                  ? `<button type="button" data-action="cancel-handoff" class="cq-handoff-cancel"
+                      title="仅在尚未发送新对话开场内容时可以安全取消">取消接力并保留旧队列</button>`
+                  : ""}
+                <p class="cq-repeat-hint">无需开启定时，也可以点击底部「接力」按钮立即触发；会先等待当前回复完成。新对话确认接收总结后才转移剩余图文任务与规则，失败时不会自动重复发送。</p>
+              </div>
               <label class="cq-switch"><input type="checkbox" id="cq-auto-open" ${state.autoOpenTab ? "checked" : ""}> 对话标签关闭或被丢弃后自动恢复（浏览器需保持运行）</label>
+              </div>
             </div>
           ` : ''}
           ${settingsOpen ? `
             <div class="cq-scheduler cq-settings">
-              <div class="cq-section-title">队列设置 <span>本对话发送冷却 · 其他选项全局通用</span></div>
+              <div class="cq-settings-heading">
+                <div class="cq-section-title">队列设置 <span>按类别查看与修改</span></div>
+                <button type="button" data-action="discard-settings-draft" ${hasUnsavedSettings() || hasUnsavedCooldown() ? "" : "hidden"}>放弃未保存更改</button>
+              </div>
               <p class="cq-draft-hint" data-draft-hint="settings" ${hasUnsavedSettings() || hasUnsavedCooldown() ? "" : "hidden"}>设置有未保存的修改 · 切换面板会保留，刷新页面会丢失。</p>
+              <div class="cq-settings-tabs" role="tablist" aria-label="设置分类">
+                <button type="button" role="tab" id="cq-settings-tab-cooldown" data-action="show-settings-page" data-page="cooldown"
+                  aria-selected="${settingsPage === "cooldown"}" aria-controls="cq-settings-page-cooldown" tabindex="${settingsPage === "cooldown" ? 0 : -1}" class="${settingsPage === "cooldown" ? "cq-tab-active" : ""}">发送冷却<small class="cq-settings-dirty" data-settings-dirty="cooldown" ${hasUnsavedCooldown() ? "" : "hidden"}>未保存</small></button>
+                <button type="button" role="tab" id="cq-settings-tab-general" data-action="show-settings-page" data-page="general"
+                  aria-selected="${settingsPage === "general"}" aria-controls="cq-settings-page-general" tabindex="${settingsPage === "general" ? 0 : -1}" class="${settingsPage === "general" ? "cq-tab-active" : ""}">队列与自动<small class="cq-settings-dirty" data-settings-dirty="general" ${hasUnsavedSettings() ? "" : "hidden"}>未保存</small></button>
+                <button type="button" role="tab" id="cq-settings-tab-background" data-action="show-settings-page" data-page="background"
+                  aria-selected="${settingsPage === "background"}" aria-controls="cq-settings-page-background" tabindex="${settingsPage === "background" ? 0 : -1}" class="${settingsPage === "background" ? "cq-tab-active" : ""}">后台运行</button>
+                <button type="button" role="tab" id="cq-settings-tab-diagnostics" data-action="show-settings-page" data-page="diagnostics"
+                  aria-selected="${settingsPage === "diagnostics"}" aria-controls="cq-settings-page-diagnostics" tabindex="${settingsPage === "diagnostics" ? 0 : -1}" class="${settingsPage === "diagnostics" ? "cq-tab-active" : ""}">诊断备份</button>
+              </div>
+              <div class="cq-settings-page" id="cq-settings-page-cooldown" role="tabpanel" aria-labelledby="cq-settings-tab-cooldown" ${settingsPage === "cooldown" ? "" : "hidden"}>
               <div class="cq-send-cooldown-panel">
                 <div class="cq-section-title">自动发送冷却 <span>仅当前对话</span></div>
                 <div class="cq-schedule-controls">
@@ -1736,6 +2290,8 @@
                   · 只能降低短时间发送频率，不能保证避开平台限制。
                 </p>
               </div>
+              </div>
+              <div class="cq-settings-page" id="cq-settings-page-general" role="tabpanel" aria-labelledby="cq-settings-tab-general" ${settingsPage === "general" ? "" : "hidden"}>
               <div class="cq-defaults-settings">
                 <div class="cq-section-title">全局队列设置 <span>所有对话共用</span></div>
               <div class="cq-schedule-controls">
@@ -1752,8 +2308,24 @@
                 <p class="cq-repeat-hint">-1 无限循环 · 0 只入队一次 · N 再重复 N 次；循环间隔仅用于按时间模式，数量模式按阈值触发。</p>
               </div>
               <div class="cq-panel-actions">
-                <button type="button" data-action="discard-settings-draft" ${hasUnsavedSettings() || hasUnsavedCooldown() ? "" : "hidden"}>放弃未保存更改</button>
+                <button type="button" data-action="toggle-queue-composer"
+                  title="在这里打开不常用的独立图文任务编辑器">${icon("image")} 图文任务
+                  <small class="cq-draft-indicator" data-draft-kind="queue" ${hasQueueDraft() || editingTask ? "" : "hidden"}>草稿</small>
+                </button>
                 <button type="button" class="cq-save" data-action="save-settings">保存设置</button>
+              </div>
+              </div>
+              <div class="cq-settings-page" id="cq-settings-page-background" role="tabpanel" aria-labelledby="cq-settings-tab-background" ${settingsPage === "background" ? "" : "hidden"}>
+              <div class="cq-protection-settings">
+                <div class="cq-section-title">完成提示音 <span>网页内播放 · 所有对话共用</span></div>
+                <label class="cq-switch" for="cq-completion-sound">
+                  <input type="checkbox" id="cq-completion-sound" ${completionSoundEnabled ? "checked" : ""}>
+                  对话回复或整个队列完成后播放轻提示音
+                </label>
+                <div class="cq-schedule-controls">
+                  <button type="button" data-action="preview-completion-sound">试听提示音</button>
+                </div>
+                <p class="cq-repeat-hint">不调用 Windows 通知。浏览器可能限制从未交互过的后台网页播放声音；在需要提醒的对话中点击一次页面，或点击「试听提示音」可尝试解锁。</p>
               </div>
               <div class="cq-protection-settings">
                 <label class="cq-switch" for="cq-protect-background">
@@ -1763,6 +2335,8 @@
                 <p class="cq-repeat-hint">有待发送、执行中任务或启用的自动规则时，阻止浏览器自动释放对应标签页；队列清空后恢复原设置。后台每分钟尝试唤醒运行中的队列。</p>
                 <p class="cq-repeat-hint">无法阻止 Edge 休眠/冻结。为确保长期运行，请前往 Edge 设置 → 系统和性能 → 性能 → 始终保持这些网站处于活动状态，添加 chatgpt.com。</p>
               </div>
+              </div>
+              <div class="cq-settings-page" id="cq-settings-page-diagnostics" role="tabpanel" aria-labelledby="cq-settings-tab-diagnostics" ${settingsPage === "diagnostics" ? "" : "hidden"}>
               <div class="cq-diagnostics">
                 <button type="button" class="cq-diagnostics-toggle" data-action="toggle-diagnostics"
                   aria-expanded="${diagnosticsOpen ? "true" : "false"}" aria-controls="cq-diagnostics-content">
@@ -1790,6 +2364,7 @@
                   <p class="cq-repeat-hint">图片存档检查只检查原图记录是否存在，不代表 ChatGPT 一定能成功上传附件。</p>
                 </div>` : ""}
               </div>
+              </div>
             </div>
           ` : ''}
         ` : ''}
@@ -1807,15 +2382,23 @@
               aria-label="${state.queuePaused ? "继续自动发送" : "暂停自动发送"}"
               title="${state.queuePaused ? "继续自动发送" : "暂停自动发送（不会强行打断正在运行的消息）"}"
               aria-pressed="${state.queuePaused ? "true" : "false"}">${icon(state.queuePaused ? "play" : "pause")}<span>${state.queuePaused ? "继续" : "暂停"}</span></button>
-            <button type="button" class="cq-tool ${queueComposerOpen && queueExpanded ? 'cq-tool-active' : ''}"
-              data-action="toggle-queue-composer" aria-label="${hasQueueDraft() || editingTask ? "图文入队，有未保存草稿" : "打开图文入队"}" title="添加带图片的队列任务">${icon("image")}<span>图文</span><small class="cq-draft-indicator" data-draft-kind="queue" ${hasQueueDraft() || editingTask ? "" : "hidden"}>草稿</small></button>
             <button type="button" class="cq-tool ${favoritesOpen && queueExpanded ? 'cq-tool-active' : ''}"
               data-action="toggle-favorites" aria-pressed="${favoritesOpen && queueExpanded}"
               aria-label="打开提示词收藏夹" title="收藏常用图文任务并一键重新入队">${icon("star")}<span>收藏</span>${favoriteItems.length ? `<small>${favoriteItems.length}</small>` : ""}<small class="cq-draft-indicator" data-draft-kind="favorite" ${hasUnsavedFavoriteTemplate() ? "" : "hidden"}>草稿</small></button>
             <button type="button" class="cq-tool ${schedulerOpen && queueExpanded ? 'cq-tool-active' : ''}"
               data-action="toggle-scheduler" aria-label="${hasUnsavedAutomation() ? "自动入队规则，有未保存草稿" : "自动入队规则"}" title="定时 / 数量触发入队">${icon("clock")}<span>自动</span>${state.schedules.length ? `<small>${state.schedules.length}</small>` : ""}<small class="cq-draft-indicator" data-draft-kind="schedule" ${hasUnsavedAutomation() ? "" : "hidden"}>未保存</small></button>
+            <span class="cq-handoff-hover-area" title="${escapeHtml(handoffHoverText(handoffButtonHint))}">
+              <button type="button" class="cq-tool cq-handoff-now ${handoffRunning ? "cq-tool-active" : ""}"
+                data-action="handoff-now" aria-label="${handoffRunning ? "取消本次上下文接力" : "立即接力到同一原生项目的新对话"}"
+                data-handoff-hint="${escapeHtml(handoffButtonHint)}"
+                title="${escapeHtml(handoffHoverText(handoffButtonHint))}"
+                ${(handoffRunning ? canCancelHandoff : canHandoffNow) &&
+                  !pendingUiActions.has("handoff-now") ? "" : 'disabled'}>
+                ${icon("handoff")}<span>${handoffRunning ?
+                  handoffCancelling ? "取消中" : "取消接力" : "接力"}</span></button>
+            </span>
             <button type="button" class="cq-tool ${settingsOpen && queueExpanded ? 'cq-tool-active' : ''}"
-              data-action="toggle-settings" aria-label="${hasUnsavedSettings() || hasUnsavedCooldown() ? "队列设置，有未保存修改" : "队列设置"}" title="队列设置">${icon("settings")}<span>设置</span><small class="cq-draft-indicator" data-draft-kind="settings" ${hasUnsavedSettings() || hasUnsavedCooldown() ? "" : "hidden"}>未保存</small></button>
+              data-action="toggle-settings" aria-label="${hasQueueDraft() ? "队列设置，有未保存的图文任务草稿" : hasUnsavedSettings() || hasUnsavedCooldown() ? "队列设置，有未保存修改" : "队列设置"}" title="队列设置">${icon("settings")}<span>设置</span><small class="cq-draft-indicator" data-draft-kind="settings" ${hasUnsavedSettings() || hasUnsavedCooldown() ? "" : "hidden"}>未保存</small><small class="cq-draft-indicator" data-draft-kind="queue" ${hasQueueDraft() || editingTask ? "" : "hidden"}>图文草稿</small></button>
             <button type="button" class="cq-tool cq-icon-only" data-action="toggle-queue" title="${queueExpanded ? '收起队列' : '展开队列'}" aria-label="${queueExpanded ? '收起队列' : '展开队列'}">${icon(queueExpanded ? "arrowUp" : "arrowDown")}</button>
           </div>
         </div>
@@ -1833,7 +2416,8 @@
       const target = [...root.querySelectorAll("button[data-action]")]
         .find((item) => item.dataset.action === focusedButton.action &&
           (item.dataset.id || "") === focusedButton.id &&
-          (item.dataset.filter || "") === focusedButton.filter);
+          (item.dataset.filter || "") === focusedButton.filter &&
+          (item.dataset.page || "") === focusedButton.page);
       target?.focus({preventScroll:true});
     }
     const list = root.querySelector(".cq-list");
@@ -1850,12 +2434,20 @@
   async function onAction(button) {
     const action = button.dataset.action;
     const id = button.dataset.id;
+    if (action === "preview-completion-sound") {
+      if (!await playCompletionSound(true)) {
+        notification = "浏览器暂时不允许播放声音，请确认标签页未静音，并点击试听再试。";
+        render();
+      }
+      return;
+    }
     if (action === "dismiss-feedback") {
       actionFeedback = null;
       render();
       return;
     }
     const guardedKeyEarly = ["pin-task", "delete-task", "delete-schedule",
+      "handoff-now",
       "toggle-schedule", "save-task"].includes(action)
       ? `${action}:${id || editingTask}` : null;
     // Reject a duplicate before opening a second confirmation dialog.
@@ -1939,6 +2531,53 @@
         cooldownSaving = false;
         render();
       }
+      return;
+    }
+    if (action === "save-handoff") {
+      const enabled = root.querySelector("#cq-handoff-enabled")?.checked === true;
+      const intervalMinutes = root.querySelector("#cq-handoff-minutes")?.value;
+      await rpc("SET_HANDOFF", {enabled,intervalMinutes});
+      showActionFeedback(enabled ? `已启用自动上下文接力 · 每 ${intervalMinutes} 分钟` :
+        "已关闭自动上下文接力");
+      render();
+      return;
+    }
+    if (action === "handoff-now") {
+      if (pendingUiActions.has("handoff-now")) return;
+      pendingUiActions.add("handoff-now");
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      try {
+        if (state.handoff && !["idle","completed"].includes(state.handoff.phase)) {
+          const pauseAfter = state.handoff.phase === "failed" &&
+            state.tasks.some((task) => task.status === "pending");
+          await rpc("CANCEL_HANDOFF",{pauseAfter});
+          showActionFeedback(state.handoff?.cancelRequested
+            ? "已请求终止接力：等当前总结安全结束后停止，不会跳转新对话"
+            : pauseAfter
+              ? "已取消失败的接力并暂停队列，确认任务后可继续"
+              : "本次接力已取消，原队列保留");
+        } else {
+          await rpc("HANDOFF_NOW");
+          showActionFeedback("已启动接力：当前回复完成后生成总结，并在同项目新对话继续（队列可为空）");
+        }
+      } finally {
+        pendingUiActions.delete("handoff-now");
+        render();
+      }
+      return;
+    }
+    if (action === "cancel-handoff") {
+      if (!confirm("取消本次接力？\n\n若交接消息已发送且状态不明，将拒绝自动撤回以保护任务。定时规则设置不变。")) return;
+      const pauseAfter = state.handoff?.phase === "failed" &&
+        state.tasks.some((task) => task.status === "pending");
+      await rpc("CANCEL_HANDOFF",{pauseAfter});
+      showActionFeedback(state.handoff?.cancelRequested
+        ? "已请求停止：当前总结结束后退出，不会跳转"
+        : pauseAfter
+          ? "已取消失败的接力并暂停队列；请检查待发送任务，确认后再点击继续"
+          : "已取消接力，原队列继续使用");
+      render();
       return;
     }
     if (["favorite-task", "save-current-favorite", "enqueue-favorite",
@@ -2088,6 +2727,23 @@
       root.querySelector('[data-action="toggle-diagnostics"]')?.focus();
       return;
     }
+    if (action === "toggle-auto-advanced") {
+      autoAdvancedOpen = !autoAdvancedOpen;
+      try { localStorage.setItem(AUTO_ADVANCED_STORAGE_KEY, autoAdvancedOpen ? "1" : "0"); }
+      catch { /* Keep the current view even if storage is blocked. */ }
+      render();
+      root.querySelector('[data-action="toggle-auto-advanced"]')?.focus({preventScroll:true});
+      return;
+    }
+    if (action === "show-settings-page") {
+      const nextPage = button.dataset.page;
+      if (!["cooldown", "general", "background", "diagnostics"].includes(nextPage)) return;
+      settingsPage = nextPage;
+      if (nextPage === "diagnostics") diagnosticsOpen = true;
+      render();
+      root.querySelector(`.cq-settings-tabs [data-page="${nextPage}"]`)?.focus({preventScroll:true});
+      return;
+    }
     notification = "";
     if (action === "toggle-queue-paused") {
       actionFeedback = null;
@@ -2133,7 +2789,7 @@
     if (action === "cancel-queue-composer") {
       if (queueSubmissionInProgress) return;
       if (hasQueueDraft() && !confirm(
-        "图文草稿尚未保存，确定放弃已输入的文字和选中的图片？\n\n取消后可继续编辑，或者点击「图文」暂时收起并保留草稿。"
+        "图文草稿尚未保存，确定放弃已输入的文字和选中的图片？\n\n取消后可继续编辑，也可在「设置 → 队列与自动」重新打开并继续编辑。"
       )) return;
       queueDraftRevision++;
       queueComposerOpen = false; queueDraft = ""; queueImages = [];
@@ -2219,7 +2875,9 @@
       resetSettingsDraft();
       resetCooldownDraft();
       render();
-      root.querySelector("#cq-max-pending")?.focus();
+      root.querySelector(settingsPage === "cooldown" ? "#cq-send-cooldown" :
+        settingsPage === "general" ? "#cq-max-pending" :
+        `.cq-settings-tabs [data-page="${settingsPage}"]`)?.focus();
       return;
     }
     if (action === "toggle-settings") {
@@ -2610,6 +3268,20 @@
   });
 
   root.addEventListener("change", (event) => {
+    if (event.target.id === "cq-completion-sound") {
+      const enabled = event.target.checked;
+      const previous = completionSoundEnabled;
+      completionSoundEnabled = enabled;
+      if (enabled) unlockCompletionAudio();
+      void Promise.resolve().then(async () => {
+        await chrome.storage.local.set({ [COMPLETION_SOUND_KEY]: enabled });
+      }).catch((error) => {
+        completionSoundEnabled = previous;
+        render();
+        showError(error);
+      });
+      return;
+    }
     if (event.target.id === "cq-favorite-category") {
       const value = event.target.value;
       if (value !== "" && value !== "__none__" &&
@@ -2951,6 +3623,18 @@
   });
 
   root.addEventListener("keydown", (event) => {
+    const settingsTab = event.target.closest?.('.cq-settings-tabs [role="tab"]');
+    if (settingsTab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      event.stopPropagation();
+      const tabs = [...root.querySelectorAll('.cq-settings-tabs [role="tab"]')];
+      const current = tabs.indexOf(settingsTab);
+      if (current < 0) return;
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 :
+        (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[next].click();
+      return;
+    }
     if (event.target.id === "cq-rule-search" && !event.isComposing &&
         event.keyCode !== 229 && event.key === "Escape" &&
         (scheduleSearch || scheduleFilter !== "all" ||
@@ -3050,7 +3734,13 @@
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local" || !changes["cq.state.v2"]) return;
+    if (area !== "local") return;
+    if (changes[COMPLETION_SOUND_KEY] &&
+        typeof changes[COMPLETION_SOUND_KEY].newValue === "boolean") {
+      completionSoundEnabled = changes[COMPLETION_SOUND_KEY].newValue;
+      if (settingsOpen) render();
+    }
+    if (!changes["cq.state.v2"]) return;
     const store = changes["cq.state.v2"].newValue;
     if (Array.isArray(store?.favorites)) favoriteItems = store.favorites;
     if (store?.settings) {
@@ -3065,6 +3755,8 @@
     const updated = store?.conversations?.[sessionKey];
     if (!updated) { render(); return; }
     state = updated;
+    clearCompletionIfWorkQueued();
+    syncStoredCompletion();
     if (!countRateDirty) resetCountRateDraft();
     if (!cooldownDraftDirty) resetCooldownDraft();
     legacyUnboundCount = store.legacyUnbound?.tasks.length || store.legacyUnbound?.schedules.length || 0;
@@ -3558,14 +4250,6 @@
       .some((element) => !root.contains(element) && element.getClientRects().length > 0);
   }
 
-  function isNativeStopButton(button) {
-    if (!button || root.contains(button)) return false;
-    const testId = button.getAttribute("data-testid") || "";
-    const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
-    return /(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
-      /stop (generating|response)|停止(生成|回复|回答)/i.test(label);
-  }
-
   function isNativeContinueButton(button) {
     if (!button || root.contains(button)) return false;
     const label = button.getAttribute("aria-label") || button.getAttribute("title") || button.innerText || "";
@@ -3632,10 +4316,13 @@
     let editor = null;
     try {
       if (!boundHere() || state.halted) throw new Error("当前对话已切换或用户已停止回复");
+      const internalHandoff = ["handoff_summary","handoff_intro"].includes(task.kind);
+      const composerReady = isVisible(controls().voice) ||
+        (internalHandoff && handoffComposerReady(conversationSnapshot()));
       editor = getEditor();
       if (!editor || normalize(editorText(editor)) || controls().stop ||
-          !isVisible(controls().voice) || hasComposerAttachments(editor)) {
-        throw new Error("语音模式按钮尚未就绪或输入框被占用，稍后再发");
+          !composerReady || hasComposerAttachments(editor)) {
+        throw new Error("原生输入框或回复结束信号尚未就绪，稍后再发");
       }
       if (task.text) insertText(editor, task.text);
       if (task.images?.length) {
@@ -3651,6 +4338,16 @@
       }
       if (!isVisible(send) || controls().stop || !boundHere() || state.halted) {
         throw new Error("发送按钮不可用或对话已停止，拒绝自动发送");
+      }
+      if (task.kind === "handoff_summary" && state.handoff?.cancelRequested) {
+        // A cancellation arrived while the native editor was being prepared.
+        // We have not clicked Send: safely release the special queue row.
+        if (normalize(editorText(editor)) === normalize(task.text)) {
+          clearComposerText(editor,task.text);
+        }
+        await rpc("RELEASE_CLAIM",{id:task.id});
+        notification = "已取消本轮接力，没有发送总结";
+        return;
       }
       if (task.images?.length && nativeAttachmentCount(editor) < task.images.length) {
         throw new Error("图片预览消失，已阻止发送");
@@ -3694,7 +4391,26 @@
     }
   }
 
+  async function navigateForHandoff(voiceReady, snapshot) {
+    const handoff = state?.handoff;
+    if (handoff?.phase !== "opening" || handoff.cancelRequested || !boundHere()) return false;
+    // The expected destination is produced by the background from the
+    // current project's URL, never from untrusted AI-generated summary text.
+    const url = new URL(handoff.projectUrl || "",location.href);
+    if (url.origin !== location.origin ||
+        !/^\/g\/g-p-[a-zA-Z0-9-]+\/project$/.test(url.pathname)) return false;
+    if (!(voiceReady || handoffComposerReady(snapshot)) ||
+        composerActionInProgress || workInProgress ||
+        hasComposerAttachments(getEditor())) return false;
+    await rpc("HANDOFF_NAVIGATE",{userCount:conversationSnapshot().userCount});
+    if (state?.handoff?.phase !== "navigating") return false;
+    location.assign(url.href); // Same Edge tab, never a new background tab.
+    return true;
+  }
+
   async function heartbeat() {
+    // Track the native square Stop button even for chats without a queue.
+    setTabRunning(tabGenerationRunning());
     if (heartbeatInProgress || !state) return;
     heartbeatInProgress = true;
     try {
@@ -3705,9 +4421,14 @@
         // A route change is a different conversation; no stale unread marker
         // or pending completion from the previous chat may carry over.
         clearTabRedDot();
+        clearTabCompleted();
+        queueCompletionPending = false;
+        completionSoundPlayed = false;
         lastReplySnapshot = null;
         replyCompletionWatch = null;
         resetVoiceReadiness();
+        handoffComposerIdleSince = 0;
+        handoffReplyProbe = null;
         const snapshot = conversationSnapshot();
         await rpc("HELLO", { lastUserText: snapshot.lastUserText });
         render();
@@ -3723,12 +4444,33 @@
 
       if (!boundHere()) return;
       const snapshot = conversationSnapshot();
+      if (snapshot.userCount > 0 && !state.firstSeenAt) {
+        await rpc("HELLO", {
+          lastUserText:snapshot.lastUserText,userCount:snapshot.userCount,
+        });
+        updateHandoffHover();
+      }
+      const firstMessageAt = nativeFirstMessageAt(snapshot.firstUserElement);
+      if (firstMessageAt && (!state.firstMessageAt || firstMessageAt < state.firstMessageAt)) {
+        // This is a metadata-only observation; it must never enqueue a task
+        // or guess the date when ChatGPT doesn't expose one.
+        await rpc("OBSERVE_FIRST_MESSAGE_AT",{firstMessageAt});
+        updateHandoffHover();
+      }
       reportPagePulse(snapshot);
       if (composerActionInProgress) return;
       // One native Voice Mode readiness signal governs BOTH ordinary queue
       // dispatch, scheduled task delivery, and the tab unread indicator.
       const voiceReady = updateVoiceReadiness(snapshot);
       observeReplyCompleted(snapshot, voiceReady);
+      if (await navigateForHandoff(voiceReady,snapshot)) return;
+      if (queueCompletionPending && voiceReady) {
+        markTabCompletedIfDrained(voiceReady);
+        queueCompletionPending = false;
+        if (!state?.activeTaskId && !state?.steeringTaskId && !state?.halted) {
+          await rpc("REPLY_COMPLETED", { viewed: isTabViewed() });
+        }
+      }
       const idle = updateIdle(snapshot, voiceReady);
       const active = state.tasks.find((item) => item.id === state.activeTaskId);
 
@@ -3775,20 +4517,49 @@
       }
 
       if (active?.status === "waiting") {
-        if (readyToComplete(active, voiceReady)) {
+        const handoffEvidence = handoffCompletionEvidence(active,snapshot);
+        const waveformComplete = readyToComplete(active, voiceReady);
+        // Even with the traditional Voice proof, do not immediately parse a
+        // partially hydrated handoff document. Give the actual assistant
+        // reply a moment to settle and to render its start/end boundaries.
+        const summaryStillLoading = active.kind === "handoff_summary" &&
+          !state.handoff?.cancelRequested && waveformComplete &&
+          !(handoffEvidence.replyStableMs >= 1800 &&
+            (handoffEvidence.newerAssistant || clock() - voiceReadySince >= 15000));
+        if (handoffEvidence.ready || waveformComplete && !summaryStillLoading) {
           await rpc("FINISHED", {
             id: active.id,
+            viewed: isTabViewed(),
             voiceReady: true,
             voiceStableMs: clock() - voiceReadySince,
             editorEmpty: Boolean(getEditor() && !normalize(editorText(getEditor()))),
             busy: snapshot.busy,
+            ...(handoffEvidence.ready ? {
+              handoffReady:true, handoffNativeIdle:true,
+              handoffResponseConfirmed:handoffEvidence.responseConfirmed,
+              handoffIdleStableMs:handoffEvidence.idleStableMs,
+              handoffReplyStableMs:handoffEvidence.replyStableMs,
+            } : {}),
+            ...(active.kind === "handoff_summary" ? {userCount:snapshot.userCount} : {}),
+            ...(active.kind === "handoff_summary"
+              ? {
+                handoffSummary: handoffEvidence.summary ||
+                  extractHandoffReply(snapshot,state?.handoff?.requestId).text,
+                handoffLastUserText:snapshot.lastUserText,
+              } : {}),
           });
           render();
         }
         return;
       }
 
-      if (state.queuePaused || active || !idle ||
+      const handoffNeedsDispatch = state.handoff?.phase === "due" ||
+        Boolean(state.handoffSourceKey &&
+          state.tasks.some((task) => task.kind === "handoff_intro" &&
+            task.status === "pending"));
+      const dispatchReady = idle ||
+        (handoffNeedsDispatch && handoffComposerReady(snapshot));
+      if (state.queuePaused || active || !dispatchReady ||
           (temporaryNewChat() && snapshot.userCount > 0)) return;
       if (clock() - lastClaimAttempt < 1800) return;
       lastClaimAttempt = clock();
@@ -3796,6 +4567,8 @@
         ready: true,
         userCount: snapshot.userCount,
         lastUserId: snapshot.lastUserId,
+        assistantCount:snapshot.assistantCount,
+        lastAssistantId:snapshot.lastAssistantId,
       });
       if (claimed.dispatch) {
         render();
@@ -3810,11 +4583,16 @@
 
   async function init() {
     try {
+      await loadCompletionSoundPreference();
       const snapshot = conversationSnapshot();
+      setTabRunning(tabGenerationRunning());
       resetVoiceReadiness();
       lastReplySnapshot = snapshot;
       clearTabRedDot();
-      await rpc("HELLO", { lastUserText: snapshot.lastUserText });
+      await rpc("HELLO", {
+        lastUserText:snapshot.lastUserText,userCount:snapshot.userCount,
+      });
+      acknowledgeViewedTab();
       try { await favoriteRpc("GET_FAVORITES"); }
       catch (error) { console.warn("[ChatQueue] 收藏夹加载失败", error); }
       render();

@@ -45,7 +45,7 @@ const state = {
   ],
 };
 window.chrome = {
-  runtime:{onMessage:{addListener(){}},async sendMessage(message) {
+  runtime:{getManifest(){return {version:"9.8.7"};},onMessage:{addListener(){}},async sendMessage(message) {
     requests.push(message.type);
     if (message.type === "SET_COMPACT_VIEW") state.compactView=message.enabled;
     return {ok:true,state,sessionKey:"draft:1",settings:{maxPending:100}};
@@ -73,6 +73,13 @@ setTimeout(async()=>{
       q('[data-filter="pending"] span')?.textContent==="3" &&
       q('[data-filter="active"] span')?.textContent==="1" &&
       q('[data-filter="review"] span')?.textContent==="2";
+    result.versionBadge=q('.cq-toolbar > .cq-version-badge')?.textContent==="v9.8.7" &&
+      q('.cq-toolbar')?.lastElementChild?.classList.contains('cq-version-badge') &&
+      q('.cq-version-badge')?.getAttribute('aria-label')==="插件版本 9.8.7";
+    result.handoffActionSafeguard=q('[data-action="handoff-now"]')?.disabled===true &&
+      q('[data-action="handoff-now"]')?.textContent.includes("接力") &&
+      q('[data-action="handoff-now"]')?.getAttribute("title")?.includes("原生项目") &&
+      !requests.includes("HANDOFF_NOW");
     result.defaultDraggable=q('[data-task-id="p1"]')?.draggable===true &&
       q('[data-task-id="a"]')?.draggable===false;
     result.originalOrder=rows().join(",")==="a,p1,p2,e,p3,i";
@@ -243,10 +250,11 @@ setTimeout(async()=>{
     q('[data-action="toggle-queue"]').click();
     q('[data-action="toggle-queue"]').click();
     result.emptyQueue=!!q(".cq-empty") &&
-      q(".cq-empty").textContent.includes("Enter 入队") &&
+      q(".cq-empty").textContent.includes("按 Enter") &&
+      q(".cq-empty").textContent.includes("加入队列") &&
       !q(".cq-queue-tools");
   } catch (error) {result.error=error.stack || error.message;}
-  result.ok=["counts","defaultDraggable","originalOrder","stableSearchInput",
+  result.ok=["counts","handoffActionSafeguard","defaultDraggable","originalOrder","stableSearchInput",
     "pendingFilter",
     "activeFilter","reviewFilter","reviewReason","expandReviewReason",
     "collapseReviewReason","errorTextSearch",

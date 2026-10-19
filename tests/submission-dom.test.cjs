@@ -78,6 +78,10 @@ function finish(type, lostAcknowledgement=false) {
 const wait = (ms) => new Promise(resolve => setTimeout(resolve,ms));
 const root = () => document.querySelector("#cq-extension-root");
 const click = action => {
+  if (action === "toggle-queue-composer") {
+    if (!root().querySelector('[data-action="toggle-queue-composer"]')) click("toggle-settings");
+    root().querySelector('[data-action="show-settings-page"][data-page="general"]').click();
+  }
   const node = root().querySelector('[data-action="'+action+'"]');
   if (!node) throw new Error("missing button: "+action);
   node.click();
