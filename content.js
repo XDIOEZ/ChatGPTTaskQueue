@@ -3888,33 +3888,85 @@
     return [...captured.files];
   }
 
-  async function clearNativeComposerImages(editor, files) {
+  // ChatGPT can place the native remove button inside a file chip or beside
+  // a thumbnail. Only search the native composer, never the extension panel.
+  const NATIVE_PREVIEW_SELECTORS = [
+    '[data-testid="file-chip"]',
+    '[data-testid="composer-attachment-preview"]',
+    '[data-testid="attachment-preview"]',
+    '[data-testid="image-file-thumbnail"]',
+    '[data-testid="file-upload-preview"]',
+    '[data-testid="composer-upload-preview"]',
+    'img[src^="blob:"], img[src^="data:image/"]',
+  ];
+
+  function nativeAttachmentPreviews(editor) {
+    const form = editor?.closest("form");
+    if (!form) return [];
+    for (const selector of NATIVE_PREVIEW_SELECTORS) {
+      const visible = [...form.querySelectorAll(selector)]
+        .filter((element) => element.getClientRects().length > 0 && !root.contains(element));
+      if (visible.length) return visible;
+    }
+    return [];
+  }
+
+  function nativeImageRemoveButton(preview, form) {
+    // A global "Remove" or "Clear" search could delete unrelated user content.
+    // Stop before reaching the form: only a thumbnail's local card may qualify.
+    for (let node = preview, depth = 0; node && node !== form && depth < 5;
+         node = node.parentElement, depth++) {
+      const buttons = [...node.querySelectorAll('button, [role="button"]')]
+        .filter((button) => isVisible(button) && !root.contains(button) &&
+          button !== controls().send);
+      const explicit = buttons.filter((button) => {
+        const label = [button.getAttribute("aria-label"), button.getAttribute("title"),
+          button.getAttribute("data-testid")].filter(Boolean).join(" ");
+        return /(remove|delete|移除|删除|移去|移走)/i.test(label) &&
+          !/(all|全部|所有)/i.test(label);
+      });
+      if (explicit.length === 1) return explicit[0];
+      if (explicit.length > 1) return null;
+      // Some cards use only an unlabeled × button. Never infer removal from
+      // a generic button; the icon must belong to a single local thumbnail.
+      const icons = buttons.filter((button) => /^[×✕✖✗]$/.test(button.textContent.trim()) ||
+        Boolean(button.querySelector('svg.lucide-x, svg[data-lucide="x"]')));
+      if (icons.length === 1 &&
+          node.querySelectorAll('img[src^="blob:"], img[src^="data:image/"]').length <= 1) {
+        return icons[0];
+      }
+      if (icons.length > 1) return null;
+    }
+    return null;
+  }
+
+  async function clearNativeComposerImages(editor, files, submittedText) {
     const form = editor?.closest("form");
     if (!form) return false;
-    const chipSelector = [
-      '[data-testid="file-chip"]', '[data-testid="attachment-preview"]',
-      '[data-testid="composer-attachment-preview"]',
-      '[data-testid="image-file-thumbnail"]', '[data-testid="file-upload-preview"]',
-    ].join(",");
-    const removeSelector = [
-      'button[aria-label*="Remove"]', 'button[aria-label*="remove"]',
-      'button[aria-label*="删除"]', 'button[aria-label*="移除"]',
-      'button[data-testid*="remove"]',
-    ].join(",");
-    // Only use explicit file-chip removal actions, not Send or Clear All.
+    const captured = nativeComposerImages;
+    const originalUrl = location.href;
     for (let i = 0; i < files.length; i++) {
-      const chips = [...form.querySelectorAll(chipSelector)]
-        .filter((chip) => chip.getClientRects().length > 0);
-      const remove = chips.flatMap((chip) => [...chip.querySelectorAll(removeSelector)])
-        .find((button) => isVisible(button));
+      // Abort if the user edits text, adds images, or switches conversations
+      // while the persisted attachment previews are being cleared.
+      if (!editor.isConnected || sessionKey !== captured?.sessionKey ||
+          location.href !== originalUrl || nativeComposerImages !== captured ||
+          normalize(editorText(editor)) !== normalize(submittedText) ||
+          files.some((file, index) => captured.files[index] !== file) ||
+          nativeAttachmentCount(editor) !== files.length - i ||
+          nativeUploadBusy(editor)) return false;
+      const preview = nativeAttachmentPreviews(editor)[0];
+      const remove = preview && nativeImageRemoveButton(preview, form);
       if (!remove) break;
       const before = nativeAttachmentCount(editor);
       remove.click();
       for (let wait = 0; wait < 10 && nativeAttachmentCount(editor) >= before; wait++) {
         await sleep(80);
       }
+      if (nativeAttachmentCount(editor) !== before - 1) return false;
     }
-    const cleared = nativeAttachmentCount(editor) === 0;
+    const cleared = editor.isConnected && nativeComposerImages === captured &&
+      sessionKey === captured?.sessionKey && location.href === originalUrl &&
+      nativeAttachmentCount(editor) === 0;
     if (cleared) {
       for (const input of form.querySelectorAll('input[type="file"]')) input.value = "";
       nativeComposerImages = null;
@@ -3923,22 +3975,7 @@
   }
 
   function nativeAttachmentCount(editor) {
-    const form = editor?.closest("form");
-    if (!form) return 0;
-    // Detect both ChatGPT file chips and image previews, never extension thumbnails.
-    for (const selector of [
-      '[data-testid="file-chip"]',
-      '[data-testid="composer-attachment-preview"]',
-      '[data-testid="attachment-preview"]',
-      '[data-testid="image-file-thumbnail"]',
-      '[data-testid="file-upload-preview"]',
-      'img[src^="blob:"], img[src^="data:image/"]',
-    ]) {
-      const elements = [...form.querySelectorAll(selector)]
-        .filter((element) => element.getClientRects().length > 0);
-      if (elements.length) return elements.length;
-    }
-    return 0;
+    return nativeAttachmentPreviews(editor).length;
   }
 
   function nativeUploadBusy(editor) {
@@ -4084,7 +4121,7 @@
       render();
       return;
     }
-    const imagesCleared = files.length ? await clearNativeComposerImages(editor, files) : true;
+    const imagesCleared = files.length ? await clearNativeComposerImages(editor, files, text) : true;
     const textCleared = !text?.trim() || clearComposerText(editor, text);
     if (!imagesCleared || !textCleared) {
       notification = "任务和图片已保存，但原生输入框未完全清空；请清除残留的附件/文字，避免重复发送。";
@@ -4353,6 +4390,8 @@
         throw new Error("图片预览消失，已阻止发送");
       }
       resetVoiceReadiness();
+      handoffComposerIdleSince = 0;
+      handoffReplyProbe = null;
       clicked = true;
       send.click();
       // No five-second DOM/user-message confirmation phase. The only automatic

@@ -61,6 +61,29 @@ function addChip(file) {
   chip.append(name,remove);
   form.append(chip);
 }
+// Some ChatGPT layouts render an image thumbnail with a sibling close button,
+// not a data-testid="file-chip" wrapper. The queue must clear those too.
+function addThumbnail(file, buttonType="title") {
+  const card = document.createElement("div");
+  card.className = "native-thumbnail-card";
+  const imageSlot = document.createElement("div");
+  const image = document.createElement("img");
+  image.src = "data:image/png;base64," + png;
+  imageSlot.append(image);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  if (buttonType === "title") remove.title = "移除图片";
+  else if (buttonType === "icon") remove.textContent = "×";
+  else remove.setAttribute("aria-label","发送");
+  remove.onclick = () => card.remove();
+  card.append(imageSlot,remove);
+  form.append(card);
+}
+function chooseThumbnail(file, buttonType) {
+  choose([file]);
+  form.querySelectorAll('[data-testid="file-chip"]').forEach(chip => chip.remove());
+  addThumbnail(file,buttonType);
+}
 upload.addEventListener("change", () => {
   for (const file of upload.files) addChip(file);
   // Emulate ChatGPT React uploader clearing the native input after selection.
@@ -226,6 +249,35 @@ setTimeout(async () => {
       editor.value === "图片保存时写入的新草稿" &&
       form.querySelectorAll('[data-testid="file-chip"]').length === 2 &&
       sent === 0;
+
+    // Wait for the preceding deferred save's finally handler to release the
+    // composer lock before starting a different upload.
+    await wait(160);
+    form.querySelectorAll('[data-testid="file-chip"]').forEach(chip=>chip.remove());
+    editor.value = "缩略图旁边的移除按钮";
+    chooseThumbnail(make("thumbnail-title.png"),"title");
+    flags.thumbnailEnterBlocked = press();
+    await waitUntil(() => enqueued.length === previous+2 &&
+      !form.querySelector('.native-thumbnail-card') && !editor.value);
+    flags.thumbnailRemovedAfterQueue = enqueued.length === previous+2 &&
+      enqueued.at(-1).images[0].name === "thumbnail-title.png" &&
+      !form.querySelector('.native-thumbnail-card') && editor.value === "";
+
+    editor.value = "图标叉号的图片预览";
+    chooseThumbnail(make("thumbnail-icon.png"),"icon");
+    flags.iconEnterBlocked = press();
+    await waitUntil(() => enqueued.length === previous+3 &&
+      !form.querySelector('.native-thumbnail-card') && !editor.value);
+    flags.iconThumbnailRemoved = enqueued.length === previous+3 &&
+      enqueued.at(-1).images[0].name === "thumbnail-icon.png" &&
+      !form.querySelector('.native-thumbnail-card') && editor.value === "";
+
+    editor.value = "无移除按钮时不能误点发送";
+    chooseThumbnail(make("keep.png"),"unsafe");
+    flags.unknownEnterBlocked = press();
+    await waitUntil(() => enqueued.length === previous+4);
+    flags.unknownActionPreserved = enqueued.length === previous+4 &&
+      !!form.querySelector('.native-thumbnail-card') && sent === 0;
   } catch (error) {
     flags.error = error.stack || error.message;
   }
@@ -243,7 +295,10 @@ setTimeout(async () => {
     "safeRetryDedupe","mismatchBlocked",
     "mismatchKept","nonImageBlocked","nonImageKept",
     "pendingUploadBlocked","pendingUploadKept",
-    "nativeSaveWasDeferred","changedNativeDraftPreserved"]
+    "nativeSaveWasDeferred","changedNativeDraftPreserved",
+    "thumbnailEnterBlocked","thumbnailRemovedAfterQueue",
+    "iconEnterBlocked","iconThumbnailRemoved",
+    "unknownEnterBlocked","unknownActionPreserved"]
     .every((key) => flags[key] === true);
   document.body.dataset.check = JSON.stringify(flags);
 }, 300);
