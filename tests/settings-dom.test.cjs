@@ -195,6 +195,18 @@ setTimeout(async () => {
       root.querySelector("#cq-auto-advanced")?.hidden === false &&
       root.querySelector("#cq-count-rate-enabled")?.getClientRects().length > 0 &&
       !!root.querySelector("#cq-handoff-enabled") && !!root.querySelector("#cq-auto-open");
+    const expandedArea = root.querySelector("#cq-auto-advanced");
+    const advancedStyle = getComputedStyle(expandedArea);
+    flags.advancedBoundaries = parseFloat(advancedStyle.borderTopWidth) >= 2 &&
+      advancedStyle.backgroundColor !== getComputedStyle(root.querySelector(".cq-scheduler")).backgroundColor &&
+      getComputedStyle(root.querySelector(".cq-auto-advanced .cq-count-rate-panel"))
+        .borderBottomStyle === "solid" &&
+      getComputedStyle(root.querySelector(".cq-auto-advanced .cq-handoff-panel"))
+        .borderBottomStyle === "solid";
+    document.documentElement.classList.add("dark");
+    flags.advancedDarkBoundary = getComputedStyle(expandedArea).borderTopColor !==
+      getComputedStyle(expandedArea).backgroundColor;
+    document.documentElement.classList.remove("dark");
     flags.localRateControls = root.querySelector("#cq-count-rate-enabled")?.checked === false &&
       root.querySelector("#cq-count-rate-minutes")?.value === "10" &&
       root.querySelector("#cq-count-rate-max")?.value === "3" &&
@@ -314,6 +326,7 @@ setTimeout(async () => {
        "defaultValuesInitially", "defaultValuesSaved", "newTaskUsesDefaults",
        "reopeningCreationUsesDefaults", "editPreservesOwnCount",
        "autoAdvancedDefaultCollapsed", "autoAdvancedOpens", "autoAdvancedCloses",
+       "advancedBoundaries", "advancedDarkBoundary",
        "autoAdvancedPreservesSettings",
       "localRateControls", "savedConversationRate", "rateStatusVisible",
       "rateOnListView", "rateOnCreateView", "quotaCountdown",

@@ -1047,6 +1047,33 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   overflow-wrap: anywhere;
 }
 
+/* Keep advanced automation settings visually separate from rule creation. */
+#cq-extension-root .cq-auto-advanced {
+  margin-top: 15px;
+  padding: 12px 12px 10px;
+  border: 1px solid color-mix(in srgb, var(--cq-text) 30%, var(--cq-border));
+  border-top: 2px solid color-mix(in srgb, var(--cq-accent) 70%, var(--cq-border));
+  border-radius: 9px;
+  background: var(--cq-bg);
+}
+#cq-extension-root .cq-auto-advanced .cq-count-rate-panel {
+  margin: 0;
+  padding: 0 0 13px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--cq-text) 30%, var(--cq-border));
+}
+#cq-extension-root .cq-auto-advanced .cq-handoff-panel {
+  margin: 0;
+  padding: 13px 0;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--cq-text) 30%, var(--cq-border));
+  border-radius: 0;
+}
+#cq-extension-root .cq-auto-advanced > .cq-switch {
+  margin-top: 0;
+  padding-top: 10px;
+}
+
 #cq-extension-root .cq-image-zone {
   margin: 8px 0;
   padding: 8px;

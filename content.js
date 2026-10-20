@@ -2198,7 +2198,6 @@
                   <button type="button" class="cq-save" data-action="save-schedule">${editingSchedule ? "保存" : "添加任务"}</button>
                 </div>
               </div>
-              <p class="cq-repeat-hint">${scheduleModeDraft === "count" ? "数量不足时按自动任务轮流补队，每轮各任务最多一条；统计含发送中和等待回复的任务。多规则建议使用相同阈值。" : "间隔到期自动入队一条。"} -1 无限 · 0 单次 · N 再重复 N 次</p>
               ` : `<div class="cq-section-title">当前自动任务 <span>筛选与排序仅影响显示，不改变入队顺序</span></div>
                 ${renderScheduleControls()}
                 <div class="cq-schedule-results" aria-label="当前自动任务列表">${renderSchedules()}</div>`}
