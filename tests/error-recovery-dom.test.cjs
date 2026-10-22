@@ -19,7 +19,8 @@ test("ChatGPT 传输错误恢复语音按钮后自动跳过失败项继续发送
 }, () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cq-error-recovery-"));
   try {
-    const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+    const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
+      .replace(/\r\n/g, "\n");
     const boundGuard = "if (!state || !sessionKey || !validUrl(location.href)) return false;";
     const end = "  void init();\n})();";
     assert.ok(source.includes(boundGuard) && source.includes(end));

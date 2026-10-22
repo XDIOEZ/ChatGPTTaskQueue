@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ChatGPT 队列总览</title>
   <link rel="stylesheet" href="dashboard.css">
+  <script src="debug-export.js" defer></script>
   <script src="dashboard.js" defer></script>
 </head>
 <body>
@@ -29,6 +30,13 @@
         <button id="refresh" type="button" title="立即刷新所有对话状态" aria-label="立即刷新">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14-5L4 8M4 3v5h5M4 13a8 8 0 0 0 14 5l2-2m0 5v-5h-5"/></svg>
         </button>
+      </div>
+      <div class="debug-export-row">
+        <button id="export-debug-json" type="button" class="debug-export-button"
+          title="导出本地接力诊断 JSON；队列面板未出现或后台暂不可用时也可使用">
+          导出 DEBUG JSON
+        </button>
+        <span id="debug-export-status" class="debug-export-status" role="status" aria-live="polite">仅保存到本地</span>
       </div>
     </header>
     <section class="stats" aria-label="所有对话汇总，点击统计可筛选对话">

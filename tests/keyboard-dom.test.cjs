@@ -61,7 +61,14 @@ sendButton.addEventListener("click", () => {
 editor.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.altKey ||
       event.isComposing || event.keyCode === 229 || event.defaultPrevented) return;
-  if (document.querySelector("#picker")) { pickerSelections++; return; }
+  const picker = document.querySelector("#picker");
+  if (picker && picker.getClientRects().length &&
+      !picker.closest('[hidden], [inert], [aria-hidden="true"]') &&
+      getComputedStyle(picker).visibility === "visible" &&
+      Number(getComputedStyle(picker).opacity) > 0) {
+    pickerSelections++;
+    return;
+  }
   nativeKeyCount++;
   sendButton.click(); // Simulate ChatGPT's own native keyboard send.
 });
@@ -74,7 +81,23 @@ window.chrome = {
         state.tasks.push({id:"queued-" + (state.tasks.length + 1),
           text:message.text,status:"pending"});
       }
-      return {ok:true,sessionKey:"draft:1",state,settings:{
+      let dispatch;
+      if (message.type === "STEER_PROMPT_CLAIM") {
+        const task = {id:"shortcut-guide",text:message.text,status:"steering",
+          steerFromComposer:true,steerBaselineUserCount:message.userCount,
+          steerBaselineUserId:message.lastUserId};
+        state.tasks.push(task);
+        state.steeringTaskId = task.id;
+        dispatch = {id:task.id,text:task.text,needsPause:true};
+      }
+      if (message.type === "STEER_CLICKED") {
+        state.tasks.find(task => task.id === message.id).status = "steering_wait";
+      }
+      if (message.type === "STEER_CONFIRM") {
+        state.tasks = state.tasks.filter(task => task.id !== message.id);
+        state.steeringTaskId = null;
+      }
+      return {ok:true,sessionKey:"draft:1",state,dispatch,settings:{
         maxPending:100,protectBackground:true,
         defaultIntervalMinutes:30,defaultRepeatCount:-1,
       }};
@@ -96,7 +119,7 @@ setTimeout(async () => {
   try {
     flags.nativeArrow = sendButton.getClientRects().length > 0 &&
       sendButton.getAttribute("data-testid") === "send-button";
-    flags.enterHint = document.querySelector(".cq-enter-action")?.textContent === "入队";
+    flags.noShortcutHints = !document.querySelector(".cq-shortcuts");
     editor.value = "空队列先入队";
     flags.emptyEnterPrevented = press();
     await delay(120);
@@ -109,6 +132,8 @@ setTimeout(async () => {
     await delay(120);
     flags.secondEnteredQueue = state.tasks.length === 2 &&
       state.tasks[1].text === "第二条也入队" && sent.length === 0;
+    const queuedSteer = document.querySelector('[data-action="steer-task"][data-id="queued-2"]');
+    flags.steerUnlockedAfterQueue = !!queuedSteer && !queuedSteer.disabled;
 
     editor.value = "Ctrl 即时发送";
     flags.ctrlPrevented = press({ctrlKey:true});
@@ -136,7 +161,38 @@ setTimeout(async () => {
     document.body.appendChild(picker);
     flags.popupNotBlocked = !press() && pickerSelections === 1 &&
       sent.length === 2;
+    picker.setAttribute("aria-hidden", "true");
+    editor.value = "隐藏候选框不能拦截队列回车";
+    flags.hiddenPickerEnterPrevented = press();
+    await delay(130);
+    flags.hiddenPickerEnqueued = state.tasks.at(-1)?.text === "隐藏候选框不能拦截队列回车" &&
+      editor.value === "" && sent.length === 2 && pickerSelections === 1;
+    picker.removeAttribute("aria-hidden");
+    picker.style.opacity = "0";
+    editor.value = "透明候选框也不能拦截回车";
+    flags.transparentPickerEnterPrevented = press();
+    await delay(130);
+    flags.transparentPickerEnqueued = state.tasks.at(-1)?.text === "透明候选框也不能拦截回车" &&
+      editor.value === "" && sent.length === 2 && pickerSelections === 1;
+    picker.style.opacity = "";
+    const popupDialog = document.createElement("div");
+    popupDialog.setAttribute("role", "dialog");
+    popupDialog.append(picker);
+    document.body.append(popupDialog);
+    editor.value = "正在选择斜杠命令";
+    flags.dialogPickerNotBlocked = !press() && pickerSelections === 2 &&
+      sent.length === 2 && editor.value === "正在选择斜杠命令";
+    popupDialog.remove();
     picker.remove();
+    const unrelated = document.createElement("aside");
+    unrelated.innerHTML = '<div role="listbox">侧栏候选菜单</div>';
+    document.body.appendChild(unrelated);
+    editor.value = "侧栏候选不应该抢走回车";
+    flags.unrelatedPickerEnterPrevented = press();
+    await delay(130);
+    flags.unrelatedPickerEnqueued = state.tasks.at(-1)?.text === "侧栏候选不应该抢走回车" &&
+      editor.value === "" && sent.length === 2;
+    unrelated.remove();
 
     editor.value = "按住回车重复事件不应再入队";
     const beforeRepeat = state.tasks.length;
@@ -174,6 +230,36 @@ setTimeout(async () => {
     flags.manualButtonWorks = sent.length === 3 &&
       sent[2] === "手动点击箭头仍可发送";
 
+    // A running reply must take the durable immediate-steering path rather
+    // than priority ENQUEUE, while retaining the existing queue order.
+    state.activeTaskId = state.tasks[0].id;
+    state.tasks[0].status = "waiting";
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.dataset.testid = "stop-button";
+    stop.setAttribute("aria-label", "Stop generating");
+    stop.textContent = "Stop";
+    let stopCount = 0;
+    stop.addEventListener("click", () => { stopCount++; });
+    document.querySelector("#composer").appendChild(stop);
+    const beforeBusyRequests = requests.length;
+    const beforeBusyIds = state.tasks.map(task => task.id).join(",");
+    editor.value = "生成中立即补充指令";
+    flags.busyCtrlPrevented = press({ctrlKey:true});
+    await delay(600);
+    const busyRequests = requests.slice(beforeBusyRequests);
+    flags.busyCtrlAtomicClaim = busyRequests.some(message => message.type === "STEER_PROMPT_CLAIM") &&
+      !busyRequests.some(message => message.type === "ENQUEUE");
+    flags.busyCtrlDirectSend = sent.length === 4 && sent[3] === "生成中立即补充指令" &&
+      editor.value === "" && stopCount === 0;
+    flags.busyCtrlQueuePreserved = state.tasks.map(task => task.id).join(",") === beforeBusyIds &&
+      state.steeringTaskId === null && nativeKeyCount === 0;
+    const restoredSteer = document.querySelector('[data-action="steer-task"][data-id="queued-2"]');
+    flags.steerUnlockedAfterBusyCtrl = !!restoredSteer && !restoredSteer.disabled;
+    stop.remove();
+    state.tasks[0].status = "pending";
+    state.activeTaskId = null;
+
     // The current ChatGPT composer can be ProseMirror/contenteditable instead
     // of a textarea. Keyboard capture must work on nested inline elements.
     const oldEditor = document.querySelector("#prompt-textarea");
@@ -192,19 +278,25 @@ setTimeout(async () => {
     await delay(140);
     flags.richQueued = state.tasks.length === beforeRich + 1 &&
       state.tasks.at(-1).text === "富文本输入框也入队" &&
-      sent.length === 3 && nativeKeyCount === beforeNative;
-    flags.staticHint = document.querySelector(".cq-enter-action")?.textContent === "入队";
+      sent.length === 4 && nativeKeyCount === beforeNative;
+    flags.noShortcutHintsAfterEdit = !document.querySelector(".cq-shortcuts");
   } catch (error) {
     flags.error = error.stack || error.message;
   }
-  flags.ok = ["nativeArrow","enterHint","emptyEnterPrevented","emptyEnteredQueue",
-    "emptyNeverSent","queuedEnterPrevented","secondEnteredQueue",
+  flags.ok = ["nativeArrow","noShortcutHints","emptyEnterPrevented","emptyEnteredQueue",
+    "emptyNeverSent","queuedEnterPrevented","secondEnteredQueue","steerUnlockedAfterQueue",
     "ctrlPrevented","ctrlSent","metaPrevented","metaSent",
     "nativeStillBlocked","shiftLeftToEditor","imeLeftToEditor",
-    "popupNotBlocked","repeatPrevented","repeatIgnored","emptyPrevented",
+    "popupNotBlocked","hiddenPickerEnterPrevented","hiddenPickerEnqueued",
+    "transparentPickerEnterPrevented","transparentPickerEnqueued",
+    "dialogPickerNotBlocked",
+    "unrelatedPickerEnterPrevented","unrelatedPickerEnqueued",
+    "repeatPrevented","repeatIgnored","emptyPrevented",
     "emptyNoSend","attachmentPrevented","attachmentPreserved",
     "unavailableCtrlPrevented","unavailableCtrlPreservesDraft",
-    "manualButtonWorks","richPrevented","richQueued","staticHint"]
+    "manualButtonWorks","busyCtrlPrevented","busyCtrlAtomicClaim","busyCtrlDirectSend",
+    "busyCtrlQueuePreserved","steerUnlockedAfterBusyCtrl",
+    "richPrevented","richQueued","noShortcutHintsAfterEdit"]
       .every((key) => flags[key] === true);
   document.body.dataset.keyboard = JSON.stringify(flags);
 }, 280);

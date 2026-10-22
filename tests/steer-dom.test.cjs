@@ -11,9 +11,9 @@ const path = require("node:path");
 const os = require("node:os");
 const { spawnSync } = require("node:child_process");
 
-const chromePath = process.platform === "win32"
+const chromePath = process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-  : "/usr/bin/google-chrome";
+  : "/usr/bin/google-chrome");
 
 test("队列引导按钮真实 Chrome DOM：提前发送、不重复、不可用时回队列、保留草稿", {
   skip: !fs.existsSync(chromePath) && "Chrome is not installed",
@@ -57,6 +57,6 @@ test("队列引导按钮真实 Chrome DOM：提前发送、不重复、不可用
     assert.equal(flags.unsupportedSteerClean, true);
     assert.equal(flags.steerPreservesDraft, true);
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 12, retryDelay: 250 });
   }
 });

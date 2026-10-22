@@ -37,6 +37,7 @@ let sent = 0;
 let failNextAck = false;
 let deferNextAck = false;
 let releaseDeferredAck = null;
+let nativeRemoveClicks = 0;
 const processedRequests = new Set();
 let storedRequests = [];
 const state = {
@@ -74,8 +75,21 @@ function addThumbnail(file, buttonType="title") {
   remove.type = "button";
   if (buttonType === "title") remove.title = "移除图片";
   else if (buttonType === "icon") remove.textContent = "×";
+  else if (buttonType === "hover") {
+    remove.setAttribute("aria-label","Remove attachment");
+    remove.style.opacity = "0";
+    remove.style.pointerEvents = "none";
+  } else if (buttonType === "close") remove.setAttribute("aria-label","Close");
+  else if (buttonType === "close-zh") remove.title = "关闭";
+  else if (buttonType === "svg-x") {
+    remove.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">'+
+      '<path d="M6 6L18 18M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
+  } else if (buttonType === "disabled") {
+    remove.setAttribute("aria-label","Remove attachment");
+    remove.disabled = true;
+  }
   else remove.setAttribute("aria-label","发送");
-  remove.onclick = () => card.remove();
+  remove.onclick = () => { nativeRemoveClicks++; card.remove(); };
   card.append(imageSlot,remove);
   form.append(card);
 }
@@ -306,6 +320,154 @@ setTimeout(async () => {
     flags.sharedGroupProtected = enqueued.length === previous+5 &&
       enqueued.at(-1).images.length === 2 &&
       group.querySelectorAll("img").length === 2 && sent === 0;
+
+    // A file picker inside another writing block must not poison the native
+    // composer's image snapshot and block an unrelated plain-text Enter.
+    group.remove();
+    await wait(160);
+    const otherForm = document.createElement("form");
+    otherForm.innerHTML = '<input type="file" accept="image/png">';
+    otherForm.setAttribute("data-testid","writing-block-editor");
+    document.querySelector("main").append(otherForm);
+    const foreignInput=otherForm.querySelector('input[type="file"]');
+    const foreignFiles=new DataTransfer();
+    foreignFiles.items.add(make("foreign.png"));
+    foreignInput.files=foreignFiles.files;
+    foreignInput.dispatchEvent(new Event("change",{bubbles:true}));
+    otherForm.remove();
+    const beforeForeign=enqueued.length;
+    editor.value="其他表单的图片不影响普通入队";
+    flags.foreignFileEnterIntercepted=press();
+    await waitUntil(()=>enqueued.length===beforeForeign+1 && editor.value==="");
+    flags.foreignFileDidNotPoisonComposer=enqueued.length===beforeForeign+1 &&
+      enqueued.at(-1).text==="其他表单的图片不影响普通入队" &&
+      enqueued.at(-1).images.length===0 && sent===0;
+
+    // An async ENQUEUE acknowledgement must not erase a user's later edit,
+    // even if they retype exactly the same text while storage is pending.
+    await wait(160);
+    editor.value="相同内容也是新的用户草稿";
+    releaseDeferredAck=null;
+    deferNextAck=true;
+    const beforeSameText=enqueued.length;
+    flags.sameTextEnterIntercepted=press();
+    await waitUntil(()=>typeof releaseDeferredAck==="function" &&
+      enqueued.length===beforeSameText+1);
+    editor.dispatchEvent(new InputEvent("input",{
+      bubbles:true,inputType:"insertText",data:"同样的文字"
+    }));
+    releaseDeferredAck?.();
+    await wait(240);
+    flags.sameTextAfterSavePreserved=editor.value==="相同内容也是新的用户草稿" &&
+      enqueued.length===beforeSameText+1 &&
+      enqueued.at(-1).text==="相同内容也是新的用户草稿" && sent===0;
+
+    // ChatGPT can swap its composer while ENQUEUE is awaiting storage.
+    // The old editor may remain connected; do not clear it just because
+    // its text still matches the saved queue row.
+    await wait(160);
+    editor.value="原输入框仍有未发送草稿";
+    releaseDeferredAck=null;
+    deferNextAck=true;
+    const beforeSwap=enqueued.length;
+    flags.composerSwapEnterIntercepted=press();
+    await waitUntil(()=>typeof releaseDeferredAck==="function" &&
+      enqueued.length===beforeSwap+1);
+    const newerForm=document.createElement("form");
+    newerForm.innerHTML='<textarea id="prompt-textarea">新编辑器的独立草稿</textarea>';
+    form.before(newerForm);
+    releaseDeferredAck?.();
+    await wait(240);
+    flags.swappedEditorsBothPreserved=enqueued.length===beforeSwap+1 &&
+      editor.value==="原输入框仍有未发送草稿" &&
+      newerForm.querySelector("textarea").value==="新编辑器的独立草稿" &&
+      sent===0;
+    newerForm.remove();
+
+    // Explicit single-card remove/close controls may be invisible until
+    // hover. Generic SVG X controls require visible, unambiguous geometry.
+    await wait(160);
+    for(const kind of ["hover","close","close-zh","svg-x"]){
+      editor.value="清理兼容图片按钮 "+kind;
+      chooseThumbnail(make("remove-"+kind+".png"),kind);
+      const before=enqueued.length,clicks=nativeRemoveClicks;
+      flags[kind+"Intercepted"]=press();
+      await waitUntil(()=>enqueued.length===before+1 && editor.value==="" &&
+        !form.querySelector('.native-thumbnail-card'));
+      flags[kind+"AttachmentCleaned"]=enqueued.length===before+1 &&
+        enqueued.at(-1).images.length===1 && editor.value==="" &&
+        !form.querySelector('.native-thumbnail-card') && nativeRemoveClicks===clicks+1 && sent===0;
+      await wait(100);
+    }
+
+    editor.value="多图删除时正文不变的程序事件";
+    choose([make("reset-first.png"),make("reset-second.png")]);
+    let resetInputs=0;
+    for(const chip of form.querySelectorAll('[data-testid="file-chip"]')){
+      chip.querySelector("button").onclick=()=>{
+        chip.remove();resetInputs++;
+        editor.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"deleteContentBackward"}));
+      };
+    }
+    const beforeReset=enqueued.length;
+    press();
+    await waitUntil(()=>enqueued.length===beforeReset+1 && editor.value==="" &&
+      !form.querySelector('[data-testid="file-chip"]'));
+    flags.unchangedInputDoesNotAbortMultiImageCleanup=resetInputs===2 &&
+      enqueued.length===beforeReset+1 && enqueued.at(-1).images.length===2 &&
+      !form.querySelector('[data-testid="file-chip"]') && editor.value==="" && sent===0;
+
+    await wait(160);
+    editor.value="附件清理期间的真实编辑必须保留";
+    choose([make("edit-first.png"),make("edit-second.png")]);
+    const editChips=[...form.querySelectorAll('[data-testid="file-chip"]')];
+    editChips[0].querySelector("button").onclick=()=>{
+      editChips[0].remove();
+      // beforeinput is deliberately never exempted, even for a synthetic
+      // event that leaves the original text identical (trusted edits too).
+      editor.dispatchEvent(new InputEvent("beforeinput",{bubbles:true,
+        cancelable:true,inputType:"insertText",data:""}));
+    };
+    const beforeEdit=enqueued.length;
+    press();
+    await waitUntil(()=>enqueued.length===beforeEdit+1);
+    await wait(240);
+    flags.beforeInputPreservesRemainingAttachment=enqueued.length===beforeEdit+1 &&
+      editor.value==="附件清理期间的真实编辑必须保留" &&
+      form.querySelectorAll('[data-testid="file-chip"]').length===1 && sent===0;
+    form.querySelectorAll('[data-testid="file-chip"]').forEach(chip=>chip.remove());
+
+    editor.value="清理前已保存的正文";
+    chooseThumbnail(make("private-edit.png"),"title");
+    const privateCard=form.querySelector('.native-thumbnail-card');
+    privateCard.querySelector("button").onclick=()=>{
+      privateCard.remove();editor.value="清理期间用户写入的新草稿";
+      editor.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"insertText"}));
+    };
+    const beforePrivate=enqueued.length;
+    press();
+    await waitUntil(()=>enqueued.length===beforePrivate+1);
+    await wait(240);
+    flags.changedTextDuringCleanupPreserved=editor.value==="清理期间用户写入的新草稿" &&
+      enqueued.at(-1).text==="清理前已保存的正文" && sent===0;
+
+    editor.value="禁用删除按钮时正文和请求ID都要保留";
+    chooseThumbnail(make("disabled-remove.png"),"disabled");
+    const disabledRemove=form.querySelector('.native-thumbnail-card button');
+    const beforeDisabled=enqueued.length,beforeDisabledTasks=state.tasks.length,clicks=nativeRemoveClicks;
+    press();
+    await waitUntil(()=>enqueued.length===beforeDisabled+1);
+    await wait(240);
+    flags.disabledRemovePreservesWholeDraft=nativeRemoveClicks===clicks &&
+      editor.value==="禁用删除按钮时正文和请求ID都要保留" && disabledRemove.isConnected;
+    const savedRequest=enqueued.at(-1).requestId;
+    disabledRemove.disabled=false;
+    press();
+    await waitUntil(()=>enqueued.length===beforeDisabled+2 && editor.value==="" &&
+      !form.querySelector('.native-thumbnail-card'));
+    flags.cleanupRetryReusesPersistedRequest=enqueued.length===beforeDisabled+2 &&
+      enqueued.at(-1).requestId===savedRequest && state.tasks.length===beforeDisabledTasks+1 &&
+      nativeRemoveClicks===clicks+1 && editor.value==="" && sent===0;
   } catch (error) {
     flags.error = error.stack || error.message;
   }
@@ -327,7 +489,15 @@ setTimeout(async () => {
     "thumbnailEnterBlocked","thumbnailRemovedAfterQueue",
     "iconEnterBlocked","iconThumbnailRemoved",
     "unknownEnterBlocked","unknownActionPreserved",
-    "groupEnterBlocked","sharedGroupProtected"]
+    "groupEnterBlocked","sharedGroupProtected",
+    "foreignFileEnterIntercepted","foreignFileDidNotPoisonComposer",
+    "sameTextEnterIntercepted","sameTextAfterSavePreserved",
+    "composerSwapEnterIntercepted","swappedEditorsBothPreserved",
+    "hoverIntercepted","hoverAttachmentCleaned","closeIntercepted","closeAttachmentCleaned",
+    "close-zhIntercepted","close-zhAttachmentCleaned","svg-xIntercepted","svg-xAttachmentCleaned",
+    "unchangedInputDoesNotAbortMultiImageCleanup","beforeInputPreservesRemainingAttachment",
+    "changedTextDuringCleanupPreserved","disabledRemovePreservesWholeDraft",
+    "cleanupRetryReusesPersistedRequest"]
     .every((key) => flags[key] === true);
   document.body.dataset.check = JSON.stringify(flags);
 }, 300);

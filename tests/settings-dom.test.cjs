@@ -53,6 +53,15 @@ window.chrome = {
         settings.protectBackground = message.enabled;
       }
       if (message.type === "SET_QUEUE_PAUSED") {
+        if (!message.paused && state.halted) {
+          if (state.haltReason !== "user") {
+            return {ok:false,error:"请先核对异常任务"};
+          }
+          state.halted = false;
+          state.haltReason = null;
+          state.haltAtUserCount = null;
+          state.error = "";
+        }
         state.queuePaused = message.paused;
       }
       if (message.type === "SAVE_COUNT_RATE_LIMIT") {
@@ -96,7 +105,7 @@ setTimeout(async () => {
         !!footer.querySelector('button[data-action="' + action + '"]')) &&
       !footer.querySelector('[data-action="toggle-queue-composer"]') &&
       !root.querySelector(".cq-toolbar .cq-tool") &&
-      !!footer.querySelector(".cq-shortcuts .cq-enter-action");
+      !footer.querySelector(".cq-shortcuts");
     flags.footerBelowContent = footer.getBoundingClientRect().top >=
       top.getBoundingClientRect().bottom - 1;
     flags.pauseAvailable = !!root.querySelector('[data-action="toggle-queue-paused"]');
@@ -110,6 +119,33 @@ setTimeout(async () => {
     flags.pauseReenabled = state.queuePaused === false &&
       !root.querySelector(".cq-status-paused") &&
       root.querySelector('[data-action="toggle-queue-paused"]')?.getAttribute("aria-pressed") === "false";
+    // Native Stop is an independent halt flag. The same footer button must
+    // present "Continue" and clear it, rather than reporting fake success.
+    state.halted = true;
+    state.haltReason = "user";
+    state.haltAtUserCount = 3;
+    state.error = "用户已停止回复";
+    state.tasks = [
+      {id:"stopped",text:"已停止的回复",status:"interrupted"},
+      {id:"pending",text:"下一条任务",status:"pending"},
+    ];
+    root.querySelector('[data-action="toggle-queue"]').click();
+    root.querySelector('[data-action="toggle-queue"]').click();
+    const manualResumeButton = root.querySelector('[data-action="toggle-queue-paused"]');
+    flags.stoppedShowsContinue = manualResumeButton?.textContent.includes("继续") &&
+      manualResumeButton.getAttribute("aria-pressed") === "true" &&
+      root.querySelector(".cq-toolbar")?.textContent.includes("用户已暂停");
+    manualResumeButton.click();
+    await delay(40);
+    flags.stoppedCanResume = state.halted === false &&
+      state.queuePaused === false && state.haltReason === null &&
+      state.error === "" && state.tasks[0].status === "interrupted" &&
+      root.querySelector('[data-action="toggle-queue-paused"]')?.textContent.includes("暂停") &&
+      !root.querySelector(".cq-toolbar")?.textContent.includes("用户已暂停") &&
+      root.querySelector(".cq-notice")?.textContent.includes("已恢复自动发送");
+    state.tasks = [];
+    root.querySelector('[data-action="toggle-queue"]').click();
+    root.querySelector('[data-action="toggle-queue"]').click();
     root.querySelector('[data-action="toggle-settings"]').click();
     const pageVisible = (page) => {
       const element = root.querySelector('#cq-settings-page-' + page);
@@ -194,15 +230,15 @@ setTimeout(async () => {
       ?.getAttribute("aria-expanded") === "true" &&
       root.querySelector("#cq-auto-advanced")?.hidden === false &&
       root.querySelector("#cq-count-rate-enabled")?.getClientRects().length > 0 &&
-      !!root.querySelector("#cq-handoff-enabled") && !!root.querySelector("#cq-auto-open");
+      !root.querySelector("#cq-handoff-enabled") && !!root.querySelector("#cq-auto-open") &&
+      !!root.querySelector('.cq-bottom-actions [data-action="toggle-handoff"]');
     const expandedArea = root.querySelector("#cq-auto-advanced");
     const advancedStyle = getComputedStyle(expandedArea);
     flags.advancedBoundaries = parseFloat(advancedStyle.borderTopWidth) >= 2 &&
       advancedStyle.backgroundColor !== getComputedStyle(root.querySelector(".cq-scheduler")).backgroundColor &&
       getComputedStyle(root.querySelector(".cq-auto-advanced .cq-count-rate-panel"))
         .borderBottomStyle === "solid" &&
-      getComputedStyle(root.querySelector(".cq-auto-advanced .cq-handoff-panel"))
-        .borderBottomStyle === "solid";
+      !root.querySelector(".cq-auto-advanced .cq-handoff-panel");
     document.documentElement.classList.add("dark");
     flags.advancedDarkBoundary = getComputedStyle(expandedArea).borderTopColor !==
       getComputedStyle(expandedArea).backgroundColor;
@@ -319,6 +355,7 @@ setTimeout(async () => {
   }
     flags.ok = ["statusOnlyAtTop", "actionsAtBottom", "footerBelowContent",
       "pauseAvailable", "pauseActive", "pauseReenabled",
+      "stoppedShowsContinue", "stoppedCanResume",
       "collapsedActions", "reopenFromFooter", "crashReviewNotice",
       "crashReviewKeepsPending", "open", "saved", "settingsTabbed", "generalOnly",
         "settingsDraftAcrossTabs", "settingsKeyboard", "backgroundOnly", "diagnosticsOnly",
@@ -340,16 +377,18 @@ setTimeout(async () => {
 
     const result = spawnSync(browser, [
       "--headless=new", "--disable-gpu", "--disable-extensions", "--no-first-run",
+      "--disable-default-apps", "--disable-background-networking",
+      "--no-default-browser-check",
       `--user-data-dir=${path.join(dir, "profile")}`,
       "--virtual-time-budget=2000", "--dump-dom",
       `file:///${path.join(dir, "index.html").replace(/\\/g, "/")}`,
-    ], { encoding: "utf8", timeout: 20000, maxBuffer: 6e6 });
+    ], { encoding: "utf8", timeout: 30000, maxBuffer: 6e6 });
     assert.equal(result.status, 0, result.stderr || "Chrome failed");
     const match = result.stdout.match(/data-check="([^"]+)"/);
     assert.ok(match, "Chrome did not execute the settings test");
     const flags = JSON.parse(match[1].replace(/&quot;/g, '"'));
     assert.equal(flags.ok, true, JSON.stringify(flags));
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 12, retryDelay: 250 });
   }
 });

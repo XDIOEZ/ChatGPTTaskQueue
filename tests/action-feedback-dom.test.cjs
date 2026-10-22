@@ -45,6 +45,7 @@ const confirms=[];
 const confirmationResponses=[];
 let holdToggle=false;
 let failedToggle=false;
+let failedDelete=false;
 let releaseToggle=null;
 window.confirm=message=>{
  confirms.push(message);
@@ -53,6 +54,10 @@ window.confirm=message=>{
 window.chrome={
  runtime:{onMessage:{addListener(){}},async sendMessage(message) {
    requests.push(message);
+   if(message.type==="DELETE_TASK" && failedDelete) {
+     failedDelete=false;
+     return {ok:false,error:"模拟删除失败"};
+   }
    if(message.type==="TOGGLE_SCHEDULE" && failedToggle) {
      failedToggle=false;
      return {ok:false,error:"模拟规则修改失败"};
@@ -128,6 +133,47 @@ setTimeout(async()=>{
     receipt().includes("队列任务已删除") &&
     document.activeElement?.dataset.taskId==="a";
 
+  const deleteConfirmationKey="cq.deleteTask.confirmedAt.v1";
+  const deleteWindowMs=24*60*60*1000;
+  const firstApprovedAt=Number(localStorage.getItem(deleteConfirmationKey));
+  const confirmedCount=confirms.length;
+  flags.confirmationStored=firstApprovedAt>0 &&
+    Date.now()-firstApprovedAt<deleteWindowMs && confirmedCount===2;
+  state.tasks.push({id:"c",text:"24小时内免确认删除",status:"pending"});
+  q('[data-action="toggle-queue"]').click();
+  q('[data-action="toggle-queue"]').click();
+  q('[data-action="delete-task"][data-id="c"]').click();
+  await wait(65);
+  flags.quietDelete=state.tasks.length===1 &&
+    count("DELETE_TASK")===2 && confirms.length===confirmedCount &&
+    Number(localStorage.getItem(deleteConfirmationKey))===firstApprovedAt;
+
+  // An expired approval prompts again. A cancellation does not renew it.
+  localStorage.setItem(deleteConfirmationKey,String(Date.now()-deleteWindowMs));
+  state.tasks.push({id:"d",text:"确认超时后待删除",status:"pending"});
+  q('[data-action="toggle-queue"]').click();
+  q('[data-action="toggle-queue"]').click();
+  confirmationResponses.push(false);
+  q('[data-action="delete-task"][data-id="d"]').click();
+  flags.expiredPrompts=state.tasks.length===2 &&
+    count("DELETE_TASK")===2 && confirms.length===confirmedCount+1 &&
+    Number(localStorage.getItem(deleteConfirmationKey))<=Date.now()-deleteWindowMs;
+
+  // Even an accepted confirmation cannot suppress the next dialog if RPC fails.
+  failedDelete=true;
+  confirmationResponses.push(true);
+  q('[data-action="delete-task"][data-id="d"]').click();
+  await wait(65);
+  flags.failedDeleteNeedsConfirm=state.tasks.length===2 &&
+    count("DELETE_TASK")===3 && confirms.length===confirmedCount+2 &&
+    Number(localStorage.getItem(deleteConfirmationKey))<=Date.now()-deleteWindowMs;
+  confirmationResponses.push(true);
+  q('[data-action="delete-task"][data-id="d"]').click();
+  await wait(65);
+  flags.retryDeleteConfirmed=state.tasks.length===1 &&
+    count("DELETE_TASK")===4 && confirms.length===confirmedCount+3 &&
+    Date.now()-Number(localStorage.getItem(deleteConfirmationKey))<deleteWindowMs;
+
   q('[data-action="edit-task"][data-id="a"]').click();
   const draft=q("#cq-edit-task-input");
   draft.value="经过编辑后的待办";
@@ -139,9 +185,11 @@ setTimeout(async()=>{
 
   q('[data-action="toggle-scheduler"]').click();
   confirmationResponses.push(false,true);
+  const confirmationsBeforeRule=confirms.length;
   q('[data-action="delete-schedule"][data-id="r2"]').click();
   flags.cancelPreservesRule=state.schedules.length===2 &&
-    count("DELETE_SCHEDULE")===0 && confirms.at(-1)?.includes("此前已经入队");
+    count("DELETE_SCHEDULE")===0 && confirms.at(-1)?.includes("此前已经入队") &&
+    confirms.length===confirmationsBeforeRule+1;
   const delRule=q('[data-action="delete-schedule"][data-id="r2"]');
   delRule.focus();
   delRule.click();
@@ -182,6 +230,8 @@ setTimeout(async()=>{
  } catch(error) {flags.error=error.stack || error.message;}
  flags.ok=["initiallyEmpty","pinnedWithReceipt","visibleWhenCollapsed",
    "dismissNoRpc","cancelPreservesTask","deleteTaskConfirmed",
+   "confirmationStored","quietDelete","expiredPrompts",
+   "failedDeleteNeedsConfirm","retryDeleteConfirmed",
    "editFeedback","cancelPreservesRule","deleteRuleConfirmed",
    "busyMarked","busySurvivesRefresh","duplicateSuppressed","toggleReceipt",
    "errorReplacesReceipt"].every(key=>flags[key]===true);

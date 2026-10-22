@@ -129,6 +129,7 @@
   function render() {
     refreshCategoryOptions();
     const visible = visibleFavorites();
+    const previousEditorId = list.querySelector(".favorite-editor")?.dataset.id || null;
     document.getElementById("favorite-count").textContent = favorites.length;
     document.getElementById("pinned-count").textContent =
       `★ 置顶 ${favorites.filter((item) => item.pinned === true).length}`;
@@ -183,6 +184,15 @@
           field.setSelectionRange(editFocus.start,editFocus.end);
         }
       }
+    }
+    // Only animate when an editor is newly opened; ordinary list refreshes
+    // must not flash or disturb a focused input/caret.
+    if (editingId && editingId !== previousEditorId &&
+        !window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+      list.querySelector(".favorite-editor")?.animate?.([
+        {opacity:0.5,transform:"translateY(5px)"},
+        {opacity:1,transform:"translateY(0)"},
+      ],{duration:180,easing:"ease-out"});
     }
   }
 

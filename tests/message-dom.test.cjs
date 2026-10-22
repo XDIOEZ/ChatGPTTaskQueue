@@ -20,16 +20,16 @@ test("原生 Voice 按钮是唯一完成信号，不依赖回复正文或消息�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cq-voice-only-"));
   try {
     const content = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
-    const marker = "  void init();\n})();";
-    assert.ok(content.includes(marker));
-    const injected = content.replace(marker, `  window.__cqVoiceOnly = {
+    const marker = /  void init\(\);\r?\n\}\)\(\);/;
+    assert.match(content, marker);
+    const injected = content.replace(marker, (original) => `  window.__cqVoiceOnly = {
       snapshot: conversationSnapshot,
       ready: updateVoiceReadiness,
       complete: readyToComplete,
       reset: resetVoiceReadiness,
       forceStable() { voiceReadySince = Date.now() - 2200; },
     };
-    ${marker}`);
+    ${original}`);
     fs.writeFileSync(path.join(dir, "content.js"), injected);
     fs.writeFileSync(path.join(dir, "index.html"), `<!doctype html>
 <html><head><meta charset="utf-8"><title>ChatGPT DOM test</title></head><body>
@@ -81,6 +81,50 @@ setTimeout(() => {
   document.getElementById('thinking').textContent='思考了 1234s';
   document.getElementById('conversation').innerHTML='';
   flags.virtualizationIgnored = h.ready(h.snapshot()) === true && h.complete(task,true);
+
+  // Current ChatGPT uses semantic search units instead of message-author
+  // wrappers. The assistant role on its heading must not count as a turn.
+  const conversation=document.getElementById('conversation');
+  conversation.innerHTML=
+    '<div data-talvt-turn-state="complete">' +
+      '<div data-chatgpt-search-message-ids="native-user-id">' +
+        '<div data-content-search-unit-key="fallback-turn-0:0:user">' +
+          '<div data-user-message-bubble="true">新对话首条队列消息</div>' +
+        '</div></div>' +
+      '<div data-content-search-unit-key="fallback-turn-0:6:assistant">' +
+        '<h4 data-conversation-role="assistant">ChatGPT 说：</h4>' +
+        '<div data-chatgpt-selection-message-id="native-assistant-id">' +
+          '<div data-markdown-text-style="assistant-message">本轮回复已经完成</div>' +
+        '</div><button aria-label="复制">复制</button>' +
+      '</div>' +
+    '</div>';
+  const nativeSnapshot=h.snapshot();
+  flags.currentLayoutTurns=nativeSnapshot.userCount===1 && nativeSnapshot.assistantCount===1 &&
+    nativeSnapshot.lastRole==='assistant';
+  flags.currentLayoutUser=nativeSnapshot.lastUserText==='新对话首条队列消息' &&
+    nativeSnapshot.lastUserId==='native-user-id';
+  flags.currentLayoutAssistant=nativeSnapshot.lastAssistantText==='本轮回复已经完成' &&
+    nativeSnapshot.lastAssistantId==='native-assistant-id' &&
+    !nativeSnapshot.lastAssistantText.includes('ChatGPT 说');
+  const bubble=conversation.querySelector('[data-user-message-bubble]');
+  const authored='交接正文里保留“显示更多”这几个字。'+ '目标、约束和下一步操作。'.repeat(24);
+  bubble.innerHTML='<div data-search-result-target=""></div>' +
+    '<button type="button" aria-expanded="false">显示更多</button>' +
+    '<button type="button" aria-label="复制消息">复制消息</button>';
+  bubble.firstElementChild.textContent=authored;
+  const folded=h.snapshot();
+  flags.foldedUserBodyOnly=folded.lastUserText===authored && folded.lastUserFolded===true;
+  bubble.firstElementChild.textContent=authored.slice(0,200)+'…';
+  const preview=h.snapshot();
+  flags.foldedPreviewAnnotated=preview.lastUserText===authored.slice(0,200)+'…' &&
+    preview.lastUserFolded===true;
+  bubble.querySelector('button').remove();
+  flags.foldFlagNeedsNativeControl=h.snapshot().lastUserFolded===false;
+  const content=bubble.querySelector('[data-search-result-target]');
+  content.removeAttribute('data-search-result-target');
+  const fallback=h.snapshot();
+  flags.foldedFallbackStillExcludesControls=!fallback.lastUserText.includes('复制消息');
+  conversation.innerHTML='';
 
   stop.style.display='';
   flags.stopPrevents = h.ready(h.snapshot()) === false;

@@ -10,7 +10,7 @@ const {spawnSync} = require("node:child_process");
 const browser=process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "/usr/bin/google-chrome");
 
-test("真实 Chrome：自动规则筛选、图片名搜索、下次到期排序、中文输入法及窄栏适配",{
+test("真实 Chrome：精简自动任务列表，保留任务操作、长文、图片及窄栏适配",{
   skip:!fs.existsSync(browser) && "Chrome is not installed",
 },()=>{
   const folder=fs.mkdtempSync(path.join(os.tmpdir(),"cq-rule-manager-"));
@@ -63,19 +63,14 @@ window.chrome={
 const q=selector=>document.querySelector("#cq-extension-root "+selector);
 const rows=()=>[...document.querySelectorAll("#cq-extension-root .cq-schedule-item")]
   .map(row=>row.dataset.scheduleId);
-const clickFilter=value=>q('[data-action="filter-schedules"][data-filter="'+value+'"]').click();
-const change=(id,value)=>{
-  const control=q("#"+id);
-  control.value=value;
-  control.dispatchEvent(new Event("change",{bubbles:true}));
-};
-const search=value=>{
-  const element=q("#cq-rule-search");
-  element.focus();
-  element.value=value;
-  element.dispatchEvent(new Event("input",{bubbles:true}));
-};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const waitUntil=async predicate=>{
+  for(let i=0;i<60;i++) {
+    if(predicate()) return true;
+    await wait(50);
+  }
+  return Boolean(predicate());
+};
 </script><script src="./content.js"></script>
 <script>
 setTimeout(async()=>{
@@ -83,78 +78,16 @@ setTimeout(async()=>{
  try {
   q('[data-action="toggle-scheduler"]').click();
   flags.defaultOrder=rows().join(",")==="t1,t2,t3,t4,t5";
-  flags.counter=q(".cq-rule-result-count")?.textContent.includes("5/5") &&
-    q('[data-filter="enabled"] span')?.textContent==="3" &&
-    q('[data-filter="disabled"] span')?.textContent==="2";
+  flags.controlsRemoved=!q(".cq-rule-tools") && !q("#cq-rule-search") &&
+    !q("#cq-rule-kind") && !q("#cq-rule-sort") &&
+    !q('[data-action="filter-schedules"]') &&
+    // Only the redundant top-level *list* title was removed. The separate
+    // count-rate settings panel legitimately has its own section heading.
+    !q(".cq-scheduler > .cq-section-title");
   flags.ruleStatusBadges=q('[data-schedule-id="t2"] .cq-rule-state')
     ?.textContent.includes("已停用") &&
     q('[data-schedule-id="t3"] .cq-rule-state')?.textContent.includes("运行中") &&
     !!q(".cq-count-rate-panel") && !!q("#cq-auto-open");
-  clickFilter("enabled");
-  flags.enabledOnly=rows().join(",")==="t1,t3,t4" &&
-    q('[data-filter="enabled"]').getAttribute("aria-pressed")==="true" &&
-    document.activeElement?.dataset.filter==="enabled";
-  clickFilter("disabled");
-  flags.disabledOnly=rows().join(",")==="t2,t5";
-  clickFilter("all");
-  change("cq-rule-kind","time");
-  flags.timeOnly=rows().join(",")==="t1,t4,t5" &&
-    document.activeElement?.id==="cq-rule-kind";
-  change("cq-rule-kind","count");
-  flags.countOnly=rows().join(",")==="t2,t3";
-  change("cq-rule-kind","all");
-
-  const input=q("#cq-rule-search");
-  input.focus();
-  input.value="needle";
-  input.setSelectionRange(3,3);
-  input.dispatchEvent(new Event("input",{bubbles:true}));
-  flags.searchImageByName=rows().join(",")==="t3" &&
-    q("#cq-rule-search")===input &&
-    input.selectionStart===3 &&
-    document.activeElement===input &&
-    q(".cq-rule-result-count")?.textContent.includes("1/5");
-  flags.resetVisible=!!q('[data-action="reset-schedule-filters"]');
-  search("没有对应规则");
-  flags.noMatches=rows().length===0 &&
-    !!q('[data-action="reset-schedule-filters"]') &&
-    q(".cq-schedule-results")?.textContent.includes("没有符合条件");
-  q('[data-action="reset-schedule-filters"]').click();
-  flags.reset=rows().join(",")==="t1,t2,t3,t4,t5" &&
-    q("#cq-rule-search")?.value==="" &&
-    document.activeElement?.id==="cq-rule-search";
-  clickFilter("enabled");
-  search("最快");
-  const esc=q("#cq-rule-search");
-  const escape=new KeyboardEvent("keydown",{
-    key:"Escape",bubbles:true,cancelable:true,
-  });
-  esc.dispatchEvent(escape);
-  flags.escapeResets=escape.defaultPrevented &&
-    rows().join(",")==="t1,t2,t3,t4,t5" &&
-    q("#cq-rule-search")?.value==="" &&
-    document.activeElement?.id==="cq-rule-search" &&
-    q('[data-action="filter-schedules"][data-filter="all"]')
-      ?.getAttribute("aria-pressed")==="true";
-
-  const ime=q("#cq-rule-search");
-  ime.focus();
-  ime.dispatchEvent(new CompositionEvent("compositionstart",{bubbles:true,data:"截图"}));
-  ime.value="截图";
-  ime.dispatchEvent(new InputEvent("input",{bubbles:true,isComposing:true,data:"截图"}));
-  window.storageChanged?.({"cq.state.v2":{newValue:{conversations:{"draft:1":state}}}},"local");
-  flags.imeKeepsInput=q("#cq-rule-search")===ime &&
-    document.activeElement===ime && rows().length===5;
-  ime.dispatchEvent(new CompositionEvent("compositionend",{bubbles:true,data:"截图"}));
-  flags.imeUpdatesAfterCommit=rows().join(",")==="t3" &&
-    q("#cq-rule-search").value==="截图" &&
-    document.activeElement?.id==="cq-rule-search";
-  search("");
-
-  change("cq-rule-sort","next");
-  flags.nextDueOrder=rows().join(",")==="t4,t1,t3,t2,t5" &&
-    document.activeElement?.id==="cq-rule-sort" &&
-    state.schedules.map(s=>s.id).join(",")==="t1,t2,t3,t4,t5";
   flags.disabledActions=q('[data-schedule-id="t2"] [data-action="toggle-schedule"]')
     ?.getAttribute("aria-label")==="启用此自动任务";
   q('[data-schedule-id="t2"] [data-action="toggle-schedule"]').click();
@@ -169,19 +102,16 @@ setTimeout(async()=>{
   flags.editView=q("#cq-schedule-draft")?.value==="中期时间规则" &&
     !q(".cq-schedule-results");
   q('[data-action="cancel-edit-schedule"]').click();
-  flags.filterAndSortSurviveEdit=q("#cq-rule-sort")?.value==="next" &&
-    rows().join(",")==="t4,t1,t2,t3,t5";
-  change("cq-rule-sort","original");
+  flags.listSurvivesEdit=rows().join(",")==="t1,t2,t3,t4,t5";
 
   state.schedules[0].text="长期任务 " + "多行巡检 ".repeat(60) +
     "末尾专用关键字needle <img src=x onerror=alert(1)>";
   q('[data-action="show-schedule-create"]').click();
   q('[data-action="show-schedule-list"]').click();
-  search("关键字needle");
   const preview=q('[data-schedule-id="t1"] .cq-task-text');
   const shortLength=preview?.textContent.length || 0;
-  flags.longRuleSearch=rows().join(",")==="t1" &&
-    preview?.querySelector("mark")?.textContent==="关键字needle" &&
+  flags.longRulePreview=rows().join(",")==="t1,t2,t3,t4,t5" &&
+    !preview?.querySelector("mark") &&
     shortLength < state.schedules[0].text.length;
   q('[data-schedule-id="t1"] [data-action="toggle-schedule-text"]').click();
   const expanded=q('[data-schedule-id="t1"] .cq-task-text');
@@ -195,7 +125,6 @@ setTimeout(async()=>{
     ?.textContent.length===shortLength &&
     q('[data-schedule-id="t1"] [data-action="toggle-schedule-text"]')
       ?.getAttribute("aria-expanded")==="false";
-  search("");
 
   for(let i=0;i<70;i++) {
     state.schedules.push({id:"extra-"+i,text:"额外规则 "+i,mode:"time",
@@ -206,26 +135,85 @@ setTimeout(async()=>{
   flags.largeListScrollable=q(".cq-schedule-results")?.scrollHeight >
     q(".cq-schedule-results")?.clientHeight &&
     rows().length===75;
-  search("额外规则 69");
-  flags.largeSearch=rows().join(",")==="extra-69" &&
-    q(".cq-rule-result-count")?.textContent.includes("1/75");
-  search("");
-
   document.querySelector("main").style.width="330px";
   await wait(80);
   flags.narrowNoOverflow=q(".cq-inline").scrollWidth<=q(".cq-inline").clientWidth+2 &&
-    q(".cq-rule-search-row").getBoundingClientRect().width<=328;
-  flags.narrowControlsAccessible=!!q("#cq-rule-kind") &&
-    !!q("#cq-rule-sort") && !!q("#cq-rule-search");
- } catch(error) {flags.error=error.stack || error.message;}
- flags.ok=["defaultOrder","counter","ruleStatusBadges","enabledOnly",
-   "disabledOnly","timeOnly","countOnly","searchImageByName",
-   "resetVisible","noMatches","reset","escapeResets","imeKeepsInput",
-   "imeUpdatesAfterCommit","nextDueOrder","disabledActions",
-   "toggleStillWorks","noUnintendedDispatch","editView",
-   "filterAndSortSurviveEdit","longRuleSearch","longRuleExpand",
-   "longRuleCollapse","largeListScrollable","largeSearch",
-   "narrowNoOverflow","narrowControlsAccessible"]
+    q(".cq-schedule-results").getBoundingClientRect().width<=328;
+  flags.narrowControlsRemoved=!q("#cq-rule-kind") &&
+    !q("#cq-rule-sort") && !q("#cq-rule-search");
+
+  // Images are added straight to the automatic-task textbox. No independent
+  // dashed upload row should remain, including in the narrow layout.
+  q('[data-action="show-schedule-create"]').click();
+  const composer=q('.cq-inline-image-composer[data-image-zone="schedule"]');
+  const editor=q("#cq-schedule-draft");
+  flags.imageInsideEditor=!!composer && composer.contains(editor) &&
+    composer.contains(q("#cq-schedule-images")) &&
+    !q('.cq-image-zone[data-image-zone="schedule"]') &&
+    !q('.cq-scheduler .cq-image-hint') &&
+    editor.placeholder.includes("拖入") &&
+    getComputedStyle(composer).borderStyle==="solid";
+  flags.imageNarrowFits=composer.scrollWidth<=composer.clientWidth+2 &&
+    getComputedStyle(q(".cq-composer-image-button")).position==="absolute";
+  editor.value="依据截图排查游戏问题";
+  editor.dispatchEvent(new Event("input",{bubbles:true}));
+  const png="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lSkAAAAASUVORK5CYII=";
+  const binary=Uint8Array.from(atob(png),ch=>ch.charCodeAt(0));
+  const attachment=name=>new File([binary],name,{type:"image/png"});
+  const transfer=file=>{
+    const value=new DataTransfer();
+    value.items.add(file);
+    return value;
+  };
+  const first=transfer(attachment("第一张.png"));
+  const drag=new DragEvent("dragover",{
+    bubbles:true,cancelable:true,dataTransfer:first,
+  });
+  editor.dispatchEvent(drag);
+  flags.imageDropHighlight=drag.defaultPrevented &&
+    composer.classList.contains("cq-image-drag-over") &&
+    getComputedStyle(q(".cq-image-drop-overlay")).display==="grid";
+  const drop=new DragEvent("drop",{
+    bubbles:true,cancelable:true,dataTransfer:first,
+  });
+  editor.dispatchEvent(drop);
+  flags.imageDropped=drop.defaultPrevented && await waitUntil(()=>
+    q(".cq-inline-image-composer .cq-image img")?.getAttribute("src")
+      .startsWith("data:image/jpeg"));
+  flags.imageDraftKept=q(".cq-inline-image-composer .cq-images")?.parentElement===
+    q(".cq-inline-image-composer") &&
+    q("#cq-schedule-draft")?.value==="依据截图排查游戏问题" &&
+    !q(".cq-inline-image-composer.cq-image-drag-over");
+  const second=transfer(attachment("第二张.png"));
+  const paste=new ClipboardEvent("paste",{
+    bubbles:true,cancelable:true,clipboardData:second,
+  });
+  q("#cq-schedule-draft").dispatchEvent(paste);
+  flags.imagePasted=paste.defaultPrevented && await waitUntil(()=>
+    document.querySelectorAll(".cq-inline-image-composer .cq-image").length===2);
+  q('.cq-inline-image-composer [data-action="remove-image"][data-index="0"]').click();
+  flags.imageRemoved=document.querySelectorAll(".cq-inline-image-composer .cq-image").length===1 &&
+    q("#cq-schedule-draft")?.value==="依据截图排查游戏问题";
+  q('[data-action="save-schedule"]').click();
+  flags.imageSubmitted=await waitUntil(()=>calls.some(call=>call.type==="ADD_SCHEDULE")) &&
+    calls.find(call=>call.type==="ADD_SCHEDULE")?.images?.length===1 &&
+    calls.find(call=>call.type==="ADD_SCHEDULE").images[0].name==="第二张.png" &&
+    calls.find(call=>call.type==="ADD_SCHEDULE").images[0].dataUrl.startsWith("data:image/png") &&
+    calls.find(call=>call.type==="ADD_SCHEDULE").text==="依据截图排查游戏问题";
+  flags.saveSettled=await waitUntil(()=>!q("#cq-schedule-draft") &&
+    !!q(".cq-schedule-results"));
+  if(flags.saveSettled) {
+    q('[data-schedule-id="t3"] [data-action="edit-schedule"]').click();
+    flags.editImageEmbedded=q(".cq-inline-image-composer .cq-image")?.title===
+      "证据needle截图.png" && !!q(".cq-inline-image-composer [data-action='remove-image']");
+  }
+  } catch(error) {flags.error=error.stack || error.message;}
+ flags.ok=["defaultOrder","controlsRemoved","ruleStatusBadges","disabledActions",
+   "toggleStillWorks","noUnintendedDispatch","editView","listSurvivesEdit",
+   "longRulePreview","longRuleExpand","longRuleCollapse","largeListScrollable",
+   "narrowNoOverflow","narrowControlsRemoved","imageInsideEditor","imageNarrowFits",
+   "imageDropHighlight","imageDropped","imageDraftKept","imagePasted",
+   "imageRemoved","imageSubmitted","saveSettled","editImageEmbedded"]
    .every(key=>flags[key]===true);
  document.body.dataset.check=JSON.stringify(flags);
 },280);
@@ -233,7 +221,7 @@ setTimeout(async()=>{
     const result=spawnSync(browser,[
       "--headless=new","--disable-gpu","--disable-extensions","--no-first-run",
       `--user-data-dir=${path.join(folder,"profile")}`,
-      "--virtual-time-budget=5500","--dump-dom",
+      "--virtual-time-budget=8500","--dump-dom",
       `file:///${path.join(folder,"index.html").replace(/\\/g,"/")}`,
     ],{encoding:"utf8",timeout:26000,maxBuffer:9e6});
     assert.equal(result.status,0,result.stderr || "Chrome failed");

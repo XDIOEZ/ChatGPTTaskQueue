@@ -204,7 +204,12 @@
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true,
         bubbles: true, cancelable: true }));
       await new Promise((resolve) => setTimeout(resolve, 150));
-      const unsupportedPreserved = input.value === '不能中途引导' && fake.sent.length === 2;
+      // While native Stop is visible, Ctrl+Enter must queue the text at the
+      // front rather than interrupt the active reply or discard the draft.
+      const unsupportedPreserved = input.value === '' &&
+        fake.state.tasks.some((task) =>
+          task.text === '不能中途引导' && task.status === 'pending') &&
+        fake.sent.length === 2;
       stopButton.remove();
       sendButton.style.display = '';
 

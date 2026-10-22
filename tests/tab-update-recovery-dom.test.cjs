@@ -58,6 +58,24 @@ setTimeout(async () => {
   document.getElementById('primary').remove();
   await wait(50);
   flags.stopsOnCompletion = document.title === '改名后的会话';
+  const foreignForm=document.createElement('form');
+  foreignForm.innerHTML='<button type="button" aria-label="Stop generating" data-testid="stop-button"></button>';
+  document.querySelector('main').append(foreignForm);
+  const hiddenStream=document.createElement('div');
+  hiddenStream.setAttribute('data-state','streaming');
+  hiddenStream.style.display='none';
+  document.querySelector('main').append(hiddenStream);
+  await wait(70);
+  flags.ignoresUnrelatedStopAndHiddenStream=!spinning();
+  foreignForm.remove();
+  hiddenStream.remove();
+  const fadedStop=document.createElement('button');
+  fadedStop.setAttribute('aria-label','Stop generating');
+  fadedStop.style.opacity='0';
+  document.querySelector('main form').append(fadedStop);
+  await wait(70);
+  flags.ignoresTransparentStop=!spinning();
+  fadedStop.remove();
 
   // When the refreshed content script eventually takes over, the temporary
   // observer and timer must retire without leaving stale title prefixes.
@@ -68,6 +86,29 @@ setTimeout(async () => {
   await wait(60);
   flags.handsOffToNewVersion = !window.__cqDeferredTabSpinner;
   root.remove();
+
+  // During a pending update a new-style composer may have no legacy editor
+  // id and no data-chatgpt-composer form marker. The passive tab indicator
+  // must still recognize its label-free square Stop action.
+  const form = document.querySelector('main form');
+  const modernEditor = document.createElement('div');
+  modernEditor.setAttribute('data-composer-markdown','');
+  modernEditor.setAttribute('role','textbox');
+  modernEditor.setAttribute('contenteditable','true');
+  form.querySelector('#prompt-textarea').replaceWith(modernEditor);
+  form.removeAttribute('data-chatgpt-composer');
+  const modernStop = document.createElement('button');
+  modernStop.type = 'button';
+  modernStop.innerHTML = '<svg class="icon-primary-action"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25"/></svg>';
+  form.append(modernStop);
+  modernStop.style.pointerEvents='none';
+  installDeferredTabSpinner('${version}');
+  flags.modernComposerBusyVisible = spinning();
+  flags.unclickableStopStillSpins=spinning();
+  modernStop.remove();
+  await wait(60);
+  flags.modernComposerIdleCleared = !spinning();
+  window.__cqDeferredTabSpinner?.stop?.();
 
   // Older installed content scripts also display their own running state.
   // The update helper must never start a competing spinner for them.

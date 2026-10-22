@@ -43,6 +43,13 @@ setTimeout(() => {
     flags.hiddenDraftProtected=probe().reason==="plugin_hidden_unsaved_draft";
     root.removeAttribute("data-cq-unsaved-draft");
     flags.hiddenDraftCleared=probe().safe;
+    // The panel can be detached during a native composer transition; the
+    // document-level marker must still block an extension-update reload.
+    root.remove();
+    document.documentElement.dataset.cqUnsavedDraft="true";
+    flags.detachedPanelDraftProtected=probe().reason==="plugin_hidden_unsaved_draft";
+    document.documentElement.removeAttribute("data-cq-unsaved-draft");
+    document.body.append(root);
     editor.value="我还没发送的草稿";
     flags.textProtected=probe().reason==="unsent_text";
     editor.value="";
@@ -113,6 +120,40 @@ setTimeout(() => {
     form.appendChild(stop);
     flags.generatingProtected=probe().reason==="generating";
     stop.remove();
+    stop.style.opacity="0";
+    form.append(stop);
+    flags.transparentStopIgnored=probe().safe && probe().voiceReady;
+    stop.remove();
+    stop.style.opacity="";
+    stop.style.pointerEvents="none";
+    form.append(stop);
+    flags.unclickableStopStillBusy=probe().reason==="generating";
+    stop.remove();
+    stop.style.pointerEvents="";
+    const foreignForm=document.createElement("form");
+    foreignForm.innerHTML='<button type="button" data-testid="stop-button" aria-label="Stop generating"></button>'+
+      '<button type="button" aria-label="Start Voice"></button>';
+    document.querySelector("main").prepend(foreignForm);
+    flags.otherFormStopIgnored=probe().safe;
+    voice.style.visibility="hidden";
+    flags.otherFormVoiceIgnored=probe().safe && !probe().voiceReady;
+    voice.style.visibility="";
+    foreignForm.remove();
+    voice.style.opacity="0";
+    flags.transparentVoiceNotReady=probe().safe && !probe().voiceReady;
+    voice.style.opacity="";
+    voice.style.pointerEvents="none";
+    flags.unclickableVoiceNotReady=probe().safe && !probe().voiceReady;
+    voice.style.pointerEvents="";
+    form.style.opacity="0";
+    flags.transparentComposerNotReady=probe().reason==="composer_not_ready";
+    form.style.opacity="";
+    const message=document.createElement("section");
+    message.setAttribute("data-message-author-role","assistant");
+    message.innerHTML='<button type="button" data-testid="stop-button"></button>';
+    document.querySelector("main").prepend(message);
+    flags.messageStopIgnored=probe().safe;
+    message.remove();
 
     voice.setAttribute("data-testid","microphone-button");
     voice.setAttribute("aria-label","Start dictation");
@@ -124,21 +165,74 @@ setTimeout(() => {
     const extensionInput=document.createElement("textarea");
     root.appendChild(extensionInput);
     const removed=form.removeChild(editor);
+    const writingBlock=document.createElement("div");
+    writingBlock.setAttribute("data-testid","writing-block-editor");
+    writingBlock.innerHTML='<form><div id="prompt-textarea" contenteditable="true">写作块中的正文</div></form>';
+    document.querySelector("main").prepend(writingBlock);
     const noEditor=probe();
     flags.noComposerProtected=!noEditor.safe &&
       noEditor.reason==="composer_not_ready";
+    flags.writingBlockNotComposer=noEditor.reason==="composer_not_ready";
+
+    const markdownEditor=document.createElement("div");
+    markdownEditor.setAttribute("data-composer-markdown","");
+    markdownEditor.setAttribute("role","textbox");
+    markdownEditor.setAttribute("contenteditable","true");
+    markdownEditor.className="ProseMirror";
+    markdownEditor.innerHTML='<p data-empty-paragraph="true" data-placeholder="询问 ChatGPT"><br></p>';
+    form.setAttribute("data-chatgpt-composer","");
+    form.setAttribute("data-composer-placement","thread");
+    form.setAttribute("data-thread-find-composer","true");
+    form.prepend(markdownEditor);
+    voice.removeAttribute("data-testid");
+    voice.setAttribute("aria-label","开始语音");
+    flags.markdownComposerIdle=probe().safe && probe().voiceReady;
+    voice.style.visibility="hidden";
+    flags.invisibleVoiceNotReady=probe().safe && !probe().voiceReady;
+    voice.style.visibility="";
+    voice.setAttribute("aria-hidden","true");
+    flags.ariaHiddenVoiceNotReady=probe().safe && !probe().voiceReady;
+    voice.removeAttribute("aria-hidden");
+    markdownEditor.textContent="新布局里的未发送草稿";
+    flags.markdownDraftProtected=probe().reason==="unsent_text";
+    const ghost=document.createElement("form");
+    ghost.innerHTML='<div data-composer-markdown role="textbox" contenteditable="true"></div>';
+    form.before(ghost);
+    ghost.setAttribute("aria-hidden","true");
+    flags.ariaHiddenGhostCannotEraseDraft=probe().reason==="unsent_text";
+    ghost.removeAttribute("aria-hidden");
+    ghost.style.visibility="hidden";
+    flags.invisibleGhostCannotEraseDraft=probe().reason==="unsent_text";
+    ghost.remove();
+    markdownEditor.remove();
+    flags.writingBlockStillNotComposer=probe().reason==="composer_not_ready";
+    writingBlock.remove();
+    form.removeAttribute("data-chatgpt-composer");
+    form.removeAttribute("data-composer-placement");
+    form.removeAttribute("data-thread-find-composer");
+    voice.setAttribute("data-testid","voice-mode-button");
+    voice.setAttribute("aria-label","Start Voice");
     form.appendChild(removed);
     extensionInput.remove();
     flags.recoveredIdle=probe().safe && probe().voiceReady;
   } catch(error) {flags.error=error.stack || error.message;}
   flags.ok=["idle","hiddenDraftProtected","hiddenDraftCleared",
+    "detachedPanelDraftProtected","otherFormStopIgnored","otherFormVoiceIgnored",
+    "transparentStopIgnored","unclickableStopStillBusy",
+    "transparentVoiceNotReady","unclickableVoiceNotReady",
+    "transparentComposerNotReady",
+    "messageStopIgnored",
     "textProtected","attachmentProtected",
     "fileInputProtected","uploadProtected","cq-queue-draft",
     "cq-schedule-draft","cq-edit-task-input",
     "imageOnlyPluginDraftProtected","unsavedNumericProtected",
     "unsavedToggleProtected","untouchedSelectDoesNotBlock",
     "changedSelectProtected","generatingProtected",
-    "micNotVoice","noComposerProtected","recoveredIdle"]
+    "micNotVoice","noComposerProtected","writingBlockNotComposer",
+    "markdownComposerIdle","invisibleVoiceNotReady","ariaHiddenVoiceNotReady",
+    "markdownDraftProtected", "ariaHiddenGhostCannotEraseDraft",
+    "invisibleGhostCannotEraseDraft", "writingBlockStillNotComposer",
+    "recoveredIdle"]
     .every(key => flags[key]===true);
   document.body.dataset.update=JSON.stringify(flags);
 },100);

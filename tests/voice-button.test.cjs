@@ -20,7 +20,8 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
 }, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "cq-voice-dom-"));
   try {
-    const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+    const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
+      .replace(/\r\n/g, "\n");
     const guard = "if (!state || !sessionKey || !validUrl(location.href)) return false;";
     const end = "  void init();\n})();";
     assert.ok(source.includes(guard) && source.includes(end));
@@ -170,6 +171,25 @@ test("语音模式按钮控制定时任务连续三轮发送；麦克风、停�
         const h=window.__cqVoiceTest;
         const flags={};
         flags.voiceDetected=!!h.controls().voice;
+        voice.setAttribute('aria-label','启动语音模式');
+        flags.localizedVoiceDetected=h.controls().voice===voice;
+        voice.setAttribute('aria-label','Voice action');
+        voice.setAttribute('title','Open voice mode');
+        flags.voiceTitleFallback=h.controls().voice===voice;
+        voice.setAttribute('aria-label','Start dictation');
+        flags.dictationCannotUseVoiceTitle=!h.controls().voice;
+        voice.setAttribute('aria-label','Start Voice');
+        voice.removeAttribute('title');
+        const hiddenSend=send.cloneNode(true);
+        hiddenSend.id='hidden-send';
+        hiddenSend.style.display='none';
+        send.before(hiddenSend);
+        editor.value='按钮识别检查';
+        editor.dispatchEvent(new Event('input',{bubbles:true}));
+        flags.visibleSendPreferred=h.controls().send===send;
+        editor.value='';
+        editor.dispatchEvent(new Event('input',{bubbles:true}));
+        hiddenSend.remove();
         voice.style.display='none';
         flags.micNotVoice=!h.controls().voice && !!mic.getClientRects().length &&
           h.ready(h.snapshot())===false;

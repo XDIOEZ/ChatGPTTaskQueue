@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ChatGPT 自动对话队列",
   "short_name": "对话队列",
-  "version": "0.49.6",
+  "version": "0.49.55",
   "description": "自动对话队列：持久保存未查看的完成提示，切回对话才清除，并保留网页完成提示音。",
   "minimum_chrome_version": "120",
   "permissions": ["storage", "alarms", "scripting"],
@@ -13,7 +13,7 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["content.js"],
+      "js": ["load-recovery.js", "content.js"],
       "css": ["panel.css"],
       "run_at": "document_idle"
     }

@@ -11,7 +11,7 @@ const browser = process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
   : "/usr/bin/google-chrome");
 
-test("真实 Chrome：队列筛选/搜索高亮/全文展开与输入栏容器宽度适配", {
+test("真实 Chrome：移除队列冗余工具栏，保留状态筛选、长文和响应式布局", {
   skip: !fs.existsSync(browser) && "Chrome is not installed",
 }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cq-ui-dom-"));
@@ -32,6 +32,7 @@ test("真实 Chrome：队列筛选/搜索高亮/全文展开与输入栏容器�
 const initialLongText = "一个很长的队列消息：" + "中".repeat(255) + "needle 最重要的关键字";
 const dangerous = '<img src=x onerror=alert(1)>内容不能变成 HTML';
 const requests = [];
+const dismissed = [];
 const state = {
   key:"draft:1",halted:false,queuePaused:false,compactView:false,activeTaskId:"a",
   steeringTaskId:null,autoOpenTab:false,schedules:[],
@@ -47,6 +48,11 @@ const state = {
 window.chrome = {
   runtime:{getManifest(){return {version:"9.8.7"};},onMessage:{addListener(){}},async sendMessage(message) {
     requests.push(message.type);
+    if (message.type === "DISMISS_WAITING") {
+      dismissed.push(message);
+      state.tasks=state.tasks.filter(task=>task.id!==message.id);
+      state.activeTaskId=null;
+    }
     if (message.type === "SET_COMPACT_VIEW") state.compactView=message.enabled;
     return {ok:true,state,sessionKey:"draft:1",settings:{maxPending:100}};
   }},
@@ -56,12 +62,6 @@ const q=(selector)=>document.querySelector("#cq-extension-root "+selector);
 const rows=()=>[...document.querySelectorAll("#cq-extension-root .cq-list [data-task-id]")]
   .map(element=>element.dataset.taskId);
 const filter=(name)=>q('[data-action="filter-tasks"][data-filter="'+name+'"]').click();
-const search=(value)=>{
-  const input=q("#cq-task-search");
-  input.focus();
-  input.value=value;
-  input.dispatchEvent(new Event("input",{bubbles:true}));
-};
 const wait=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
 </script>
 <script src="./content.js"></script>
@@ -83,21 +83,31 @@ setTimeout(async()=>{
     result.defaultDraggable=q('[data-task-id="p1"]')?.draggable===true &&
       q('[data-task-id="a"]')?.draggable===false;
     result.originalOrder=rows().join(",")==="a,p1,p2,e,p3,i";
-    const searchNode=q("#cq-task-search");
-    searchNode.focus();
-    searchNode.value="截图截图";
-    searchNode.setSelectionRange(2,2);
-    searchNode.dispatchEvent(new Event("input",{bubbles:true}));
-    result.stableSearchInput=q("#cq-task-search")===searchNode &&
-      document.activeElement===searchNode &&
-      searchNode.selectionStart===2 && rows().join(",")==="p2";
-    search("");
+    result.waitingDismissButton=!!q('[data-task-id="a"] [data-action="dismiss-waiting"]') &&
+      !q('[data-task-id="p1"] [data-action="dismiss-waiting"]');
+    const stop=document.createElement("button");
+    stop.type="button";
+    stop.setAttribute("aria-label","停止生成");
+    document.querySelector("form").append(stop);
+    q('[data-action="toggle-queue"]').click();
+    q('[data-action="toggle-queue"]').click();
+    result.generatingCannotDismiss=q('[data-action="dismiss-waiting"]')?.disabled===true;
+    stop.remove();
+    q('[data-action="toggle-queue"]').click();
+    q('[data-action="toggle-queue"]').click();
+    result.idleCanDismiss=q('[data-action="dismiss-waiting"]')?.disabled===false;
+    result.noUnusedTools=!q(".cq-queue-search-row") && !q("#cq-task-search") &&
+      !q(".cq-search-result") && !q("#cq-jump-target") &&
+      !q('[data-action="toggle-compact-view"]');
+    const tools=q(".cq-queue-tools");
+    result.onlyFilterRow=tools?.children.length===1 &&
+      tools.firstElementChild?.classList.contains("cq-filter-row") &&
+      tools.getBoundingClientRect().height<50;
 
     filter("pending");
     result.pendingFilter=rows().join(",")==="p1,p2,p3" &&
       q('[data-filter="pending"]')?.getAttribute("aria-pressed")==="true" &&
-      !q('[data-task-id="p1"]').draggable &&
-      q(".cq-search-result")?.textContent.includes("3/6");
+      !q('[data-task-id="p1"]').draggable;
     filter("active");
     result.activeFilter=rows().join(",")==="a";
     filter("review");
@@ -111,68 +121,10 @@ setTimeout(async()=>{
       q('[data-task-id="e"] .cq-error-toggle').getAttribute("aria-expanded")==="true";
     q('[data-task-id="e"] .cq-error-toggle').click();
     result.collapseReviewReason=!q('[data-task-id="e"] .cq-task-error-detail');
-    search("发送不确定");
-    result.errorTextSearch=rows().join(",")==="e" &&
-      q('[data-task-id="e"] .cq-task-error-detail mark')?.textContent==="发送不确定";
-    search("");
-
-    search("没有这种任务");
-    result.emptySearch=rows().length===0 &&
-      !!q('[data-action="reset-task-filter"]') &&
-      q("#cq-task-search")?.value==="没有这种任务" &&
-      document.activeElement?.id==="cq-task-search";
-    q('[data-action="reset-task-filter"]').click();
-    result.reset=rows().join(",")==="a,p1,p2,e,p3,i" &&
-      q('[data-filter="all"]').getAttribute("aria-pressed")==="true" &&
-      q('[data-task-id="p1"]').draggable===true &&
-      q("#cq-task-search").value==="";
-    filter("pending");
-    search("文本");
-    q("#cq-task-search").dispatchEvent(new KeyboardEvent("keydown",{
-      key:"Escape",bubbles:true,cancelable:true,
-    }));
-    result.escapeResets=rows().join(",")==="a,p1,p2,e,p3,i" &&
-      q('[data-filter="all"]').getAttribute("aria-pressed")==="true" &&
-      q("#cq-task-search").value==="";
-
-    const composing=q("#cq-task-search");
-    composing.focus();
-    composing.dispatchEvent(new CompositionEvent("compositionstart",{
-      bubbles:true,data:"截图",
-    }));
-    composing.value="截图截图";
-    composing.dispatchEvent(new InputEvent("input",{
-      bubbles:true,isComposing:true,inputType:"insertCompositionText",data:"截图",
-    }));
-    // An unrelated background queue update during IME composition must NOT
-    // replace the input or close the native Chinese candidate selection.
-    window.fireStorageChange?.({
-      "cq.state.v2":{newValue:{conversations:{"draft:1":state}}},
-    },"local");
-    result.imeCompositionStable=q("#cq-task-search")===composing &&
-      document.activeElement===composing &&
-      rows().join(",")==="a,p1,p2,e,p3,i";
-    const cancelled=new KeyboardEvent("keydown",{
-      key:"Escape",isComposing:true,bubbles:true,cancelable:true,
-    });
-    composing.dispatchEvent(cancelled);
-    result.imeEscapeProtected=q("#cq-task-search")===composing &&
-      composing.value==="截图截图";
-    composing.dispatchEvent(new CompositionEvent("compositionend",{
-      bubbles:true,data:"截图截图",
-    }));
-    result.imeAppliedAfterCommit=rows().join(",")==="p2" &&
-      q("#cq-task-search")?.value==="截图截图" &&
-      document.activeElement?.id==="cq-task-search";
-    search("");
-
-    search("截图截图");
-    result.imageNameSearch=rows().join(",")==="p2" &&
-      q('[data-task-id="p2"] .cq-image-only')?.textContent.includes("仅图片任务");
-    search("needle");
-    result.longMatch=rows().join(",")==="p1" &&
-      q('[data-task-id="p1"] mark')?.textContent==="needle" &&
-      q(".cq-search-result")?.textContent.includes("1/6");
+    filter("all");
+    result.filterReset=rows().join(",")==="a,p1,p2,e,p3,i" &&
+      q('[data-filter="all"]')?.getAttribute("aria-pressed")==="true" &&
+      q('[data-task-id="p1"]')?.draggable===true;
     const before=q('[data-task-id="p1"] .cq-task-text').textContent.length;
     q('[data-action="toggle-task-text"]').click();
     const expanded=q('[data-task-id="p1"] .cq-task-text');
@@ -181,7 +133,6 @@ setTimeout(async()=>{
     q('[data-action="toggle-task-text"]').click();
     result.collapsedAgain=q('[data-action="toggle-task-text"]')
       .getAttribute("aria-expanded")==="false";
-    search("");
 
     result.xssEscaped=q('[data-task-id="p3"] .cq-task-text')
       ?.textContent.includes('<img src=x onerror=alert(1)>') &&
@@ -189,45 +140,20 @@ setTimeout(async()=>{
     result.statusDoesNotMutate=state.tasks.map(item=>item.id).join(",")==="a,p1,p2,e,p3,i" &&
       !requests.some(type=>["ENQUEUE","REORDER_TASK","PIN_TASK"].includes(type));
 
-    const testStyle=document.createElement("style");
-    testStyle.textContent="#cq-extension-root .cq-list{max-height:85px!important}";
-    document.head.append(testStyle);
-    filter("pending");
-    search("needle");
-    const jump=q("#cq-jump-target");
-    jump.value="review";
-    jump.dispatchEvent(new Event("change",{bubbles:true}));
-    result.jumpReviewClearsFilters=rows().join(",")==="a,p1,p2,e,p3,i" &&
-      q('[data-filter="all"]').getAttribute("aria-pressed")==="true" &&
-      q("#cq-task-search").value==="" &&
-      q('[data-task-id="e"]').classList.contains("cq-jump-target") &&
-      document.activeElement?.dataset.taskId==="e";
-    result.jumpScrollsToTarget=q(".cq-list").scrollTop>0;
-    const jumpActive=q("#cq-jump-target");
-    jumpActive.value="active";
-    jumpActive.dispatchEvent(new Event("change",{bubbles:true}));
-    result.jumpActive=q('[data-task-id="a"]').classList.contains("cq-jump-target") &&
-      document.activeElement?.dataset.taskId==="a";
-    testStyle.remove();
-
     const comfortableHeight=q('[data-task-id="p1"]').getBoundingClientRect().height;
-    q('[data-action="toggle-compact-view"]').click();
-    await wait(100);
-    result.compactSaved=state.compactView===true &&
-      q('[data-action="toggle-compact-view"]')?.getAttribute("aria-pressed")==="true" &&
-      q(".cq-inline") && q("#cq-extension-root")===null &&
-      document.querySelector("#cq-extension-root").classList.contains("cq-compact-view") &&
-      requests.includes("SET_COMPACT_VIEW");
-    result.compactFitsMore=q('[data-task-id="p1"]').getBoundingClientRect().height <
+    // Old conversations may still have a compact preference; keep rendering it
+    // without exposing the removed density toggle.
+    state.compactView=true;
+    q('[data-action="toggle-queue"]').click();
+    q('[data-action="toggle-queue"]').click();
+    result.legacyCompact=q('[data-task-id="p1"]').getBoundingClientRect().height <
       comfortableHeight &&
       getComputedStyle(q('[data-task-id="p2"] .cq-image')).width==="38px";
+    result.noCompactControl=!q('[data-action="toggle-compact-view"]');
+    state.compactView=false;
     q('[data-action="toggle-queue"]').click();
     q('[data-action="toggle-queue"]').click();
-    result.compactSurvivesRerender=document.querySelector("#cq-extension-root")
-      .classList.contains("cq-compact-view");
-    q('[data-action="toggle-compact-view"]').click();
-    await wait(100);
-    result.comfortableRestored=state.compactView===false &&
+    result.comfortableRestored=
       !document.querySelector("#cq-extension-root").classList.contains("cq-compact-view");
 
     document.querySelector("main").style.width="340px";
@@ -244,7 +170,24 @@ setTimeout(async()=>{
     await wait(80);
     result.wideRestoresLabels=getComputedStyle(
       q('.cq-tool[data-action="queue-composer"] span')).display!=="none" &&
-      q(".cq-search-field").getBoundingClientRect().width>130;
+      !q(".cq-queue-search-row");
+
+    const originalTasks=state.tasks.slice();
+    state.tasks=state.tasks.filter(task=>task.status!=="pending");
+    filter("pending");
+    result.emptyFilter=rows().length===0 && !!q('[data-action="reset-task-filter"]');
+    q('[data-action="reset-task-filter"]').click();
+    result.resetFilterFocus=q('[data-filter="all"]')?.getAttribute("aria-pressed")==="true" &&
+      document.activeElement?.id==="cq-filter-all" &&
+      rows().join(",")==="a,e,i";
+    state.tasks=originalTasks;
+    filter("all");
+
+    q('[data-action="dismiss-waiting"]').click();
+    await wait(80);
+    result.dismissWaiting=dismissed.length===1 && dismissed[0].id==="a" &&
+      dismissed[0].userRequested===true && dismissed[0].nativeBusy===false &&
+      !q('[data-task-id="a"]') && state.activeTaskId===null;
 
     state.tasks.splice(0);
     q('[data-action="toggle-queue"]').click();
@@ -254,19 +197,14 @@ setTimeout(async()=>{
       q(".cq-empty").textContent.includes("加入队列") &&
       !q(".cq-queue-tools");
   } catch (error) {result.error=error.stack || error.message;}
-  result.ok=["counts","handoffActionSafeguard","defaultDraggable","originalOrder","stableSearchInput",
-    "pendingFilter",
-    "activeFilter","reviewFilter","reviewReason","expandReviewReason",
-    "collapseReviewReason","errorTextSearch",
-    "emptySearch","reset","escapeResets","imeCompositionStable",
-    "imeEscapeProtected",
-    "imeAppliedAfterCommit","imageNameSearch",
-    "longMatch","expandedLongText","collapsedAgain","xssEscaped",
-    "statusDoesNotMutate","jumpReviewClearsFilters","jumpScrollsToTarget",
-    "jumpActive","compactSaved","compactFitsMore",
-    "compactSurvivesRerender","comfortableRestored",
-    "containerResponsive","noHorizontalOverflow",
-    "wideRestoresLabels","emptyQueue"].every(key=>result[key]===true);
+  result.ok=["counts","handoffActionSafeguard","defaultDraggable","originalOrder",
+    "waitingDismissButton","generatingCannotDismiss","idleCanDismiss","dismissWaiting",
+    "noUnusedTools","onlyFilterRow","pendingFilter","activeFilter","reviewFilter",
+    "reviewReason","expandReviewReason","collapseReviewReason","filterReset",
+    "expandedLongText","collapsedAgain","xssEscaped","statusDoesNotMutate",
+    "legacyCompact","noCompactControl","comfortableRestored",
+    "containerResponsive","noHorizontalOverflow","wideRestoresLabels",
+    "emptyFilter","resetFilterFocus","emptyQueue"].every(key=>result[key]===true);
   document.body.dataset.check=JSON.stringify(result);
 },300);
 </script></body></html>`);

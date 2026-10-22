@@ -6,6 +6,81 @@ importScripts("image-store.js", "handoff.js");
 // envelope is shared, but task dispatch and scheduler state are per-chat.
 const STORAGE_KEY = "cq.state.v2";
 const LEGACY_KEY = "cq.state.v1";
+const HANDOFF_DEBUG_KEY = "cq.handoffDebug.v1";
+const HANDOFF_DEBUG_MAX_RUNS = 12;
+const HANDOFF_DEBUG_MAX_EVENTS = 80;
+const HANDOFF_DEBUG_PHASES = new Set([
+  "queued","due","summarizing","opening","navigating","bootstrapping","failed","completed",
+]);
+const HANDOFF_DEBUG_SIGNALS = new Set([
+  "page_wait","native_send_click","navigation_start","navigation_committed",
+  "send_uncertain","new_chat_pending",
+  "send_prepare","send_reuse","send_wait","send_gate_blocked","claim_release",
+  "send_ack","send_exception","adoption_probe","adoption_expand",
+  "completion_probe","dispatch_blocked","claim_result",
+  "input_start","input_complete","input_failed","send_ready","adoption_result",
+]);
+const HANDOFF_DEBUG_REASONS = new Set([
+  "none","editor_missing","editor_has_text","attachments_present",
+  "native_busy","native_stop","voice_not_ready","assistant_not_new",
+  "reply_not_stable","waiting_native_reply","waiting_chat_id",
+  "waiting_project_page","page_not_ready","transport_error",
+  "native_send_unconfirmed","other_blocker",
+  "scope_changed","task_not_owned","composer_not_ready","send_not_ready",
+  "editor_replaced","composer_edited","text_mismatch","attachments_mismatch",
+  "upload_busy","claim_released","claim_release_failed","ack_failed","send_exception",
+  "prepared_document","adoption_wait","adoption_folded","completion_wait","dispatch_blocked",
+  "claim_empty","claim_rejected","claim_exception","claim_acquired",
+  "target_exists_shell","target_has_work","owner_mismatch","project_mismatch","source_missing",
+  "source_phase","token_mismatch","destination_mismatch","intro_missing","message_mismatch",
+  "user_count_mismatch","adopted","ready","cache_mismatch","adoption_ambiguous",
+]);
+const HANDOFF_DEBUG_DETAIL_BOOLEANS = new Set([
+  "scopeCurrent","boundHere","editorConnected","editorCurrent","editorPresent",
+  "sendVisible","voiceVisible","stopVisible","nativeBusy","composerEdited",
+  "textMatches","hasAttachments","uploadBusy","reuseDocument","resumeCandidate","sourceBound",
+  "activeMatches","halted","queuePaused","sendPresent","sendDisabled","composerChanged",
+  "trustedEdited","clicked","preparedMatch","exactTextMatches","lastUserFolded",
+  "newerAssistant","responseConfirmed","firstUserOnly","targetShell","adopted","usedTolerance",
+]);
+const HANDOFF_DEBUG_DETAIL_NUMBERS = new Set([
+  "textChars","expectedChars","attachmentCount","expectedAttachmentCount","waitMs",
+  "userCount","assistantCount","elapsedMs","editorChars","editorNormalizedChars",
+  "taskChars","taskNormalizedChars","voiceStableMs","idleStableMs","replyStableMs",
+  "sendWaitMs","navigationEpoch","claimedEpoch","inputElapsedMs","inputParagraphs",
+  "commonPrefixChars","commonSuffixChars","expectedDifferenceChars","editorDifferenceChars",
+  "expectedControlChars","editorControlChars",
+  "extraTextChars","targetSystemHistoryCount","targetBusinessHistoryCount",
+]);
+const HANDOFF_DEBUG_DETAIL_ENUMS = {
+  gate:new Set(["prepare","reuse","wait","final_click","release","ack","adoption",
+    "completion","dispatch","export","claim","final_send","wait_send","input","arm"]),
+  inputMethod:new Set(["paste","html","nativeValue"]),
+  textDifferenceKind:new Set(["equal","whitespace","format_controls","content"]),
+  targetBlocker:new Set(["none","owner","linked","tasks","schedules","active","paused",
+    "submissions","history","configuration","queue_history","metadata","unknown_field"]),
+  stage:new Set(["none","probe","before_claim","after_claim","before_insert","after_insert",
+    "waiting_send","before_click","after_click","before_release","after_release",
+    "before_ack","after_ack","before_expand","after_expand"]),
+  taskKind:new Set(["none","normal","handoff_summary","handoff_intro"]),
+  taskStatus:new Set(["none","pending","dispatching","waiting","steering","steering_wait",
+    "done","error","interrupted"]),
+  dispatchBlockedReason:new Set(["none","halted","paused","active_task","steering",
+    "owner_mismatch","target_mismatch","not_ready","busy_handoff","retry_wait","no_pending",
+    "cooldown","resume_handoff_mismatch"]),
+  route:new Set(["project","chat","other"]),
+  sessionKind:new Set(["draft","chat","none"]),
+  handoffPhase:new Set([...HANDOFF_DEBUG_PHASES,"idle","none"]),
+};
+const HANDOFF_DEBUG_CRITICAL_SIGNALS = new Set([
+  "native_send_click","navigation_start","navigation_committed","send_ack",
+  "send_exception","claim_release","send_gate_blocked","send_prepare","send_reuse",
+  "input_start","input_complete","input_failed","send_ready",
+]);
+const HANDOFF_DEBUG_PROBE_SIGNALS = new Set([
+  "page_wait","send_wait","adoption_probe","completion_probe","dispatch_blocked",
+  "new_chat_pending","claim_result","adoption_result",
+]);
 const ALARM_NAME = "cq.scheduler";
 const PROTECTED_TABS_KEY = "cq.protectedTabs.v1";
 const UPDATE_REFRESH_KEY = "cq.updateRefresh.v1";
@@ -43,8 +118,8 @@ const pagePulses = new Map();
 const DASHBOARD_EVENT_TYPES = new Set([
   "manual_enqueue", "auto_count", "auto_time", "claim", "sent", "finished",
   "deferred", "send_failed", "timeout", "steer_timeout",
-  "task_edited", "task_deleted", "task_pinned", "task_reordered",
-  "steer_claim", "steer_clicked", "steer_cancel", "steer_confirm",
+  "task_edited", "task_deleted", "waiting_dismissed", "task_pinned", "task_reordered",
+  "steer_claim", "steer_pausing", "steer_clicked", "steer_cancel", "steer_confirm",
   "steer_uncertain", "state_inconsistent", "tab_revived",
   "tab_reopened", "tab_owner_rebound", "tab_reopen_failed",
     "user_stopped", "user_resumed", "auto_recovered", "failed_skipped",
@@ -53,7 +128,7 @@ const DASHBOARD_EVENT_TYPES = new Set([
   "queue_resumed", "rate_limit_updated", "backup_restored",
     "send_cooldown_updated", "handoff_due", "handoff_manual", "handoff_setting",
     "handoff_summary", "handoff_new_chat", "handoff_completed",
-    "handoff_received", "handoff_failed", "handoff_cancelled",
+    "handoff_received", "handoff_failed", "handoff_cancelled", "handoff_retry",
 ]);
 const UPDATE_REFRESH_STABLE_MS = 1800;
 // Keep the configurable cap bounded: chrome.storage.local has a shared quota.
@@ -86,11 +161,13 @@ const TAB_REVIVE_BACKOFF_MS = 2 * 60 * 1000;
 const IMAGE_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const WAIT_TIMEOUT_MS = 45 * 60 * 1000;
 const DISPATCH_TIMEOUT_MS = 90 * 1000;
+const HANDOFF_PREPARE_TIMEOUT_MS = 10 * 60 * 1000;
 const STEER_RESERVE_TIMEOUT_MS = 60 * 1000;
 const STEER_CONFIRM_TIMEOUT_MS = 2 * 60 * 1000;
 
 let serial = Promise.resolve();
 let updateRefreshInProgress = null;
+const loadRecoveryInstallations = new Map();
 // A discarded tab may remain flagged as such while Chrome processes reload().
 // Throttle wake attempts so the minute alarm cannot repeatedly reload it.
 const recentTabRevives = new Map();
@@ -143,7 +220,7 @@ function blankSession(key, url = null, tabId = null) {
 
 function blankStore() {
   return {
-    version: 2, conversations: {}, legacyUnbound: null, favorites: [],
+    version: 2, conversations: {}, handoffQueues: {}, legacyUnbound: null, favorites: [],
     settings: {
       maxPending: DEFAULT_PENDING_LIMIT,
       protectBackground: true,
@@ -163,6 +240,52 @@ function chatKey(url) {
 
 function resolveKey(url, tabId) {
   return chatKey(url) || (safeUrl(url) && Number.isInteger(tabId) ? `draft:${tabId}` : null);
+}
+
+function isProjectOverview(url) {
+  const normal = safeUrl(url);
+  return Boolean(normal &&
+    /^\/g\/g-p-[a-zA-Z0-9-]+(?:\/project)?$/.test(new URL(normal).pathname));
+}
+
+function draftProjectId(url) {
+  const normal = safeUrl(url);
+  if (!normal) return null;
+  const match = new URL(normal).pathname.match(/^\/g\/(g-p-[a-zA-Z0-9-]+)(?:\/project|\/c\/[a-zA-Z0-9-]+)?$/);
+  return match ? CQHandoff.normalizeProjectId(match[1]) : null;
+}
+
+function sameDraftScope(firstUrl, secondUrl) {
+  const first = safeUrl(firstUrl);
+  const second = safeUrl(secondUrl);
+  if (!first || !second || new URL(first).origin !== new URL(second).origin) return false;
+  const projectId = draftProjectId(first);
+  const nextProjectId = draftProjectId(second);
+  return projectId || nextProjectId ? Boolean(projectId && projectId === nextProjectId) : first === second;
+}
+
+function draftCanAdoptChat(draft, url) {
+  const first = safeUrl(draft?.url);
+  const second = safeUrl(url);
+  if (!first || !second || new URL(first).origin !== new URL(second).origin) return false;
+  return draftProjectId(first) === draftProjectId(second);
+}
+
+function canDiscardProjectDraft(state) {
+  return Boolean(state && isProjectOverview(state.url) && !state.handoffSourceKey &&
+    !state.activeTaskId && !state.steeringTaskId && !handoffBusy(state) &&
+    !state.tasks.some((task) => ["dispatching","waiting","steering","steering_wait"].includes(task.status)));
+}
+
+async function discardDepartedProjectDraft(store, tabId, nextUrl = null) {
+  const key = `draft:${tabId}`;
+  const draft = store.conversations[key];
+  if (!draft?.projectVisitId || !canDiscardProjectDraft(draft) ||
+      nextUrl && isProjectOverview(nextUrl) && sameDraftScope(draft.url, nextUrl)) return false;
+  delete store.conversations[key];
+  await saveStore(store);
+  await cleanupUnusedImages(store);
+  return true;
 }
 
 function convertLegacy(old) {
@@ -198,6 +321,11 @@ async function readStore() {
       // startup image prune would permanently erase every existing image.
       throw new Error("检测到不兼容或损坏的队列存档，已停止读写以保护原有任务和图片；请先备份或使用匹配版本");
     }
+    if (saved.handoffQueues != null && (typeof saved.handoffQueues !== "object" ||
+        Array.isArray(saved.handoffQueues))) {
+      throw new Error("接力缓存格式异常，已保留原存档，请导出 DEBUG 后处理");
+    }
+    if (maintainHandoffQueues(saved)) await saveStore(saved);
     return saved;
   }
   const result = blankStore();
@@ -212,7 +340,524 @@ async function readStore() {
 }
 
 async function saveStore(store) {
+  maintainHandoffQueues(store);
   await chrome.storage.local.set({ [STORAGE_KEY]: store });
+  // Diagnostic persistence is best effort and independent of queue commits.
+  // A full debug store must NEVER block sending or roll back a task.
+  try { await observeHandoffDebugStore(store); }
+  catch (error) { console.warn("[ChatQueue] 接力调试记录未能保存", error); }
+}
+
+// Strictly metadata-only tracing: no prompt, summary, images, URL, user text,
+// raw error string or handoff token is copied to this separate local store.
+function handoffDebugVersion(value) {
+  return typeof value === "string" && /^\d{1,4}(?:\.\d{1,4}){2,3}$/.test(value) ? value : "unknown";
+}
+
+function handoffDebugBackendVersion() {
+  return handoffDebugVersion(chrome.runtime.getManifest().version);
+}
+
+function handoffDebugDetails(value) {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > 96) {
+    throw new Error("接力调试详情无效");
+  }
+  const details = {};
+  for (const key of Object.keys(value).sort()) {
+    const item = value[key];
+    const valid = HANDOFF_DEBUG_DETAIL_BOOLEANS.has(key) ? typeof item === "boolean" :
+      HANDOFF_DEBUG_DETAIL_NUMBERS.has(key) ? Number.isFinite(item) && item >= 0 && item <= 1_000_000_000 :
+      Object.hasOwn(HANDOFF_DEBUG_DETAIL_ENUMS,key) ? HANDOFF_DEBUG_DETAIL_ENUMS[key].has(item) :
+      key === "contentVersion" && handoffDebugVersion(item) !== "unknown";
+    if (!valid) throw new Error("接力调试详情包含不支持的字段或值");
+    details[key] = item;
+  }
+  return details;
+}
+
+function handoffDebugReason(message) {
+  const value = String(message || "");
+  for (const [pattern,code] of [
+    [/接力缓存|交接缓存|队列 ID/, "cache_mismatch"],
+    [/总结为空|没有获取到 AI 的交接总结/, "summary_empty"],
+    [/总结过短/, "summary_too_short"],[/总结过长/, "summary_too_long"],
+    [/尚未确认本轮回复完整结束|下一条完整助手回复/, "reply_not_confirmed"],
+    [/原生输入框|发送按钮不可用|语音按钮/, "composer_not_ready"],
+    [/额外用户消息|新的用户消息|交接记录已过期/, "source_changed"],
+    [/新对话地址|无法确认已进入|新对话入口/, "chat_not_confirmed"],
+    [/项目不匹配|项目归属|同项目|当前项目|项目新对话.*不一致|归属/, "project_mismatch"],
+    [/开场|接收交接/, "intro_not_confirmed"],
+    [/超时|长时间/, "timeout"],[/发送中断|发送状态|状态不确定/, "send_uncertain"],
+    [/队列|不完整/, "queue_conflict"],
+  ]) if (pattern.test(value)) return code;
+  return value ? "other_failure" : "none";
+}
+
+function handoffDebugSnapshot(store, state) {
+  const handoff = state.handoff;
+  const cache = store.handoffQueues?.[state.key];
+  const introState = store.conversations[handoff?.destinationKey];
+  const summary = state.tasks.find(task => task.kind === "handoff_summary");
+  const intro = introState?.tasks?.find(task => task.kind === "handoff_intro");
+  const active = state.tasks.find(task => task.id === state.activeTaskId);
+  const destinationActive = introState?.tasks?.find(task => task.id === introState.activeTaskId);
+  const elapsed = (startedAt) => Number.isFinite(startedAt)
+    ? Math.min(1_000_000_000,Math.max(0,Date.now()-startedAt)) : 0;
+  const taskKind = task => !task ? "none" :
+    ["handoff_summary","handoff_intro"].includes(task.kind) ? task.kind : "normal";
+  const taskStatus = task => HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus.has(task?.status) ? task.status : "none";
+  return {
+    phase:handoff.phase,
+    summaryStatus:taskStatus(summary),
+    introStatus:taskStatus(intro),
+    destination:handoff.destinationKey
+      ? introState?.key?.startsWith("chat:") ? "chat"
+        : introState?.key?.startsWith("draft:") ? "draft" : "not_found"
+      : "none",
+    summaryChars:typeof handoff.summary === "string" ? handoff.summary.length : 0,
+    pendingTasks:state.tasks.filter(task => task.status === "pending" &&
+      task.kind !== "handoff_summary").length,
+    halted:state.halted === true,
+    queuePaused:state.queuePaused === true,
+    reason:handoff.phase === "failed" ? handoffDebugReason(handoff.error) : "none",
+    sourceTaskCount:state.tasks.length,
+    destinationTaskCount:introState?.tasks?.length || 0,
+    sourceScheduleCount:state.schedules.length,
+    sourceEnabledScheduleCount:state.schedules.filter(rule => rule.enabled === true).length,
+    destinationScheduleCount:introState?.schedules?.length || 0,
+    destinationEnabledScheduleCount:introState?.schedules?.filter(rule => rule.enabled === true).length || 0,
+    sourceActiveKind:taskKind(active),sourceActiveStatus:taskStatus(active),
+    destinationActiveKind:taskKind(destinationActive),destinationActiveStatus:taskStatus(destinationActive),
+    destinationHalted:introState?.halted === true,
+    destinationQueuePaused:introState?.queuePaused === true,
+    ownerChainMatches:Boolean(introState && introState.tabId === state.tabId),
+    cacheFound:Boolean(cache),
+    cacheIdentityMatches:Boolean(handoffQueueFor(store,state)),
+    cacheDestinationMatches:Boolean(introState && handoffQueueFor(store,state,introState)),
+    cachedScheduleCount:Array.isArray(cache?.schedules) ? cache.schedules.length : 0,
+    cachedEnabledScheduleCount:Array.isArray(cache?.schedules)
+      ? cache.schedules.filter(rule => rule.enabled === true).length : 0,
+    cachedTaskCount:Array.isArray(cache?.tasks) ? cache.tasks.length : 0,
+    destinationRecorded:Boolean(cache?.observedChatKey),
+    destinationConfirmed:Boolean(introState?.key?.startsWith("chat:") && cache?.confirmedChatKey === introState.key),
+    phaseElapsedMs:elapsed(handoff.changedAt),
+    summaryDispatchElapsedMs:elapsed(summary?.claimedAt),
+    summaryWaitElapsedMs:elapsed(summary?.sentAt),
+    introDispatchElapsedMs:elapsed(intro?.claimedAt),
+    introWaitElapsedMs:elapsed(intro?.sentAt),
+    dispatchBudgetMs:dispatchTimeoutBudget(destinationActive || active),
+    summaryDispatchBudgetMs:dispatchTimeoutBudget(summary),
+    introDispatchBudgetMs:dispatchTimeoutBudget(intro),replyBudgetMs:WAIT_TIMEOUT_MS,
+    entryBudgetMs:60*60_000,bootstrapBudgetMs:60*60_000,
+  };
+}
+
+function handoffDebugStateSignature(snapshot) {
+  return JSON.stringify(Object.fromEntries(Object.entries(snapshot)
+    .filter(([key]) => !key.endsWith("ElapsedMs"))));
+}
+
+async function handoffDebugData() {
+  const saved = (await chrome.storage.local.get(HANDOFF_DEBUG_KEY))[HANDOFF_DEBUG_KEY];
+  return [1,2].includes(saved?.version) && Array.isArray(saved.runs)
+    ? {...saved,version:2,runs:saved.runs.filter(run => run && typeof run === "object" &&
+        !Array.isArray(run)).slice(0,HANDOFF_DEBUG_MAX_RUNS)} : {version:2,runs:[]};
+}
+
+function handoffDebugRun(data, sourceKey, mode = "automatic", phase = "due") {
+  const previous = data.runs.find(run => run.sourceKey === sourceKey);
+  // A terminal result is still the SAME handoff when the user subsequently
+  // acknowledges/cancels it. A fresh queued command starts a fresh run.
+  if (previous && (previous.status === "running" || !["due","queued"].includes(phase))) return previous;
+  const run = {
+    id:crypto.randomUUID(),sourceKey,startedAt:Date.now(),mode,
+    status:"running",phase,signature:"",events:[],
+    createdBackendVersion:handoffDebugBackendVersion(),lastBackendVersion:handoffDebugBackendVersion(),
+  };
+  data.runs.unshift(run);
+  data.runs = data.runs.slice(0,HANDOFF_DEBUG_MAX_RUNS);
+  return run;
+}
+
+function handoffDebugPush(run, event) {
+  run.createdBackendVersion ||= "unknown";
+  run.lastBackendVersion = handoffDebugBackendVersion();
+  run.events.push({at:Date.now(),...event,backendVersion:handoffDebugBackendVersion()});
+  while (run.events.length > HANDOFF_DEBUG_MAX_EVENTS) {
+    const oldProbe = run.events.findIndex((item,index) => index > 0 &&
+      index < run.events.length-1 && HANDOFF_DEBUG_PROBE_SIGNALS.has(item.kind) &&
+      !(item.kind === "claim_result" && item.reason === "claim_acquired"));
+    // Retain the opening state and important send transitions before dropping
+    // old probes. If all events are important, preserve a head and recent tail.
+    run.events.splice(oldProbe >= 0 ? oldProbe : Math.min(16,run.events.length-2),1);
+  }
+}
+
+function handoffDebugSignalDuplicate(run, event) {
+  if (HANDOFF_DEBUG_CRITICAL_SIGNALS.has(event.kind) ||
+      event.kind === "claim_result" && event.reason === "claim_acquired") return false;
+  const signature = JSON.stringify({kind:event.kind,phase:event.phase,reason:event.reason,
+    route:event.route || "other",details:event.details || {}});
+  return run.events.some(previous => Date.now()-previous.at < 30000 &&
+    JSON.stringify({kind:previous.kind,phase:previous.phase,reason:previous.reason,
+      route:previous.route || "other",details:previous.details || {}}) === signature);
+}
+
+function handoffDebugClaimSnapshot(state, url) {
+  if (!state) return {stateFound:false};
+  const active = state.tasks.find(task => task.id === state.activeTaskId);
+  const pending = state.tasks.find(task => task.status === "pending");
+  const kind = task => !task ? "none" : ["handoff_summary","handoff_intro"].includes(task.kind) ? task.kind : "normal";
+  const status = task => HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus.has(task?.status) ? task.status : "none";
+  const retryWaitMs = Number.isFinite(pending?.retryNotBefore)
+    ? Math.min(1_000_000_000,Math.max(0,pending.retryNotBefore-Date.now())) : 0;
+  const cooldown = sendCooldownUntil(state);
+  return {stateFound:true,route:isProjectOverview(url) ? "project" : chatKey(url) ? "chat" : "other",
+    sessionKind:state.key?.startsWith("draft:") ? "draft" : "chat",
+    halted:state.halted === true,queuePaused:state.queuePaused === true,
+    hasActiveTask:Boolean(state.activeTaskId),hasSteeringTask:Boolean(state.steeringTaskId),
+    activeKind:kind(active),activeStatus:status(active),nextKind:kind(pending),nextStatus:status(pending),
+    pendingTasks:state.tasks.filter(task => task.status === "pending").length,
+    retryWaitMs,cooldownRemainingMs:cooldown ? Math.min(1_000_000_000,Math.max(0,cooldown-Date.now())) : 0};
+}
+
+function handoffDebugClaimEvent(store, observation) {
+  if (!observation) return null;
+  const {state,sender,url,dispatch,blockedReason} = observation;
+  const source = handoffDebugSource(store,sender,url);
+  if (!source) return null;
+  const task = dispatch ? state.tasks.find(item => item.id === dispatch.id) :
+    state.tasks.find(item => item.status === "pending");
+  const details = {gate:"claim",taskKind:!task ? "none" :
+    ["handoff_summary","handoff_intro"].includes(task.kind) ? task.kind : "normal",
+    taskStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus.has(task?.status) ? task.status : "none",
+    dispatchBlockedReason:HANDOFF_DEBUG_DETAIL_ENUMS.dispatchBlockedReason.has(blockedReason) ? blockedReason : "none",
+    boundHere:targetMatches(state,sender,url),activeMatches:Boolean(dispatch && state.activeTaskId === dispatch.id),
+    halted:state.halted === true,queuePaused:state.queuePaused === true};
+  return {source,event:{kind:"claim_result",reason:dispatch ? "claim_acquired" : "claim_empty",
+    phase:source.handoff.phase,route:isProjectOverview(url) ? "project" : "chat",details}};
+}
+
+async function recordHandoffDebugClaim(store, observation) {
+  const claim = handoffDebugClaimEvent(store,observation);
+  if (!claim) return;
+  const data = await handoffDebugData();
+  const run = data.runs.find(item => item.sourceKey === claim.source.key) ||
+    handoffDebugRun(data,claim.source.key,claim.source.handoff.manualRequested ? "manual" : "automatic",claim.source.handoff.phase);
+  if (handoffDebugSignalDuplicate(run,claim.event)) return;
+  handoffDebugPush(run,claim.event);
+  await chrome.storage.local.set({[HANDOFF_DEBUG_KEY]:data});
+}
+
+async function recordHandoffDebugAdoption(store, observation, sender, url, message, adopted) {
+  const source = observation?.source;
+  if (!source?.handoff) return;
+  const data = await handoffDebugData();
+  const run = data.runs.find(item => item.sourceKey === source.key) ||
+    handoffDebugRun(data,source.key,source.handoff.manualRequested ? "manual" : "automatic",source.handoff.phase);
+  const details = {gate:"adoption",targetShell:observation.targetShell === true,adopted,
+    targetBlocker:observation.targetBlocker || "none",
+    targetSystemHistoryCount:observation.targetSystemHistoryCount || 0,
+    targetBusinessHistoryCount:observation.targetBusinessHistoryCount || 0,
+    textChars:typeof message.lastUserText === "string" ? message.lastUserText.length : 0,
+    expectedChars:observation.active?.text?.length || 0,
+    textMatches:CQHandoff.textMatch(observation.active?.text,message.lastUserText).matches,
+    usedTolerance:CQHandoff.textMatch(observation.active?.text,message.lastUserText).usedTolerance,
+    extraTextChars:CQHandoff.textMatch(observation.active?.text,message.lastUserText).extraChars};
+  if (Number.isInteger(message.userCount) && message.userCount >= 0) details.userCount = message.userCount;
+  const event = {kind:"adoption_result",reason:observation.reason,
+    phase:source.handoff.phase,route:"chat",details};
+  if (!handoffDebugSignalDuplicate(run,event)) {
+    handoffDebugPush(run,event);
+    await chrome.storage.local.set({[HANDOFF_DEBUG_KEY]:data});
+  }
+}
+
+function handoffDebugAdoptionMetadata(store, sender, url) {
+  const project = CQHandoff.projectId(url);
+  const candidates = Object.values(store.conversations).filter(state =>
+    project && chatKey(state.url) && state.tabId === sender.tab?.id && CQHandoff.projectId(state.url) === project &&
+    ["navigating","bootstrapping","failed"].includes(state.handoff?.phase));
+  return {candidateCount:candidates.length,candidates:candidates.slice(0,12).map(source => {
+    const destination = store.conversations[source.handoff.destinationKey];
+    const check = handoffAdoptionCandidate(store,sender,url,source.handoff.destinationKey);
+    const cache = store.handoffQueues?.[source.key];
+    const intro = destination?.tasks.find(task => task.kind === "handoff_intro");
+    return {phase:source.handoff.phase,sourceTaskCount:source.tasks.length,
+      sourceScheduleCount:source.schedules.length,
+      sourceEnabledScheduleCount:source.schedules.filter(rule => rule.enabled === true).length,
+      destination:destination?.key?.startsWith("draft:") ? "draft" : destination ? "chat" : "not_found",
+      destinationTaskCount:destination?.tasks.length || 0,
+      introStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus.has(intro?.status) ? intro.status : "none",
+      reason:check.reason,targetShell:check.targetShell === true,parked:destination?.parkedDraft === true,
+      targetBlocker:check.targetBlocker || "none",
+      targetSystemHistoryCount:check.targetSystemHistoryCount || 0,
+      targetBusinessHistoryCount:check.targetBusinessHistoryCount || 0,
+      cacheFound:Boolean(cache),cacheIdentityMatches:Boolean(handoffQueueFor(store,source)),
+      cachedScheduleCount:cache?.schedules?.length || 0,cachedTaskCount:cache?.tasks?.length || 0,
+      destinationRecorded:Boolean(cache?.observedChatKey)};
+  })};
+}
+
+async function observeHandoffDebugStore(store) {
+  const sources = Object.entries(store.conversations).filter(([,state]) => {
+    if (!chatKey(state.url) || !state.handoff || state.handoffSourceKey) return false;
+    if (HANDOFF_DEBUG_PHASES.has(state.handoff.phase)) {
+      return !["failed","completed"].includes(state.handoff.phase) ||
+        Number.isFinite(state.handoff.changedAt) &&
+        Date.now()-state.handoff.changedAt < 5*60_000;
+    }
+    const last = state.history?.at(-1);
+    return state.handoff.phase === "idle" && last?.type === "handoff_cancelled" &&
+      Number.isFinite(last.at) && Date.now()-last.at < 5*60_000;
+  });
+  if (!sources.length) return;
+  const data = await handoffDebugData();
+  let changed = false;
+  for (const [sourceKey,state] of sources) {
+    const snapshot = handoffDebugSnapshot(store,state);
+    const signature = handoffDebugStateSignature(snapshot);
+    const previous = data.runs.find(run => run.sourceKey === sourceKey);
+    if (previous?.signature === signature) continue;
+    // A source can hand off again after completion or explicit cancellation.
+    const run = handoffDebugRun(data,sourceKey,
+      state.handoff.manualRequested ? "manual" : "automatic",snapshot.phase);
+    run.signature = signature;
+    const failureAcknowledged = run.status === "failed" &&
+      snapshot.phase === "idle";
+    if (!failureAcknowledged) run.phase = snapshot.phase;
+    if (state.handoff.destinationKey?.startsWith("chat:")) {
+      run.destinationKey = state.handoff.destinationKey;
+    }
+    const status = snapshot.phase === "failed" ? "failed" :
+      snapshot.phase === "completed" ? "completed" :
+      snapshot.phase === "idle" ? "cancelled" : "running";
+    if (status !== "running") run.endedAt = Date.now();
+    if (!failureAcknowledged) run.status = status;
+    handoffDebugPush(run,{kind:"state",...snapshot});
+    changed = true;
+  }
+  if (changed) await chrome.storage.local.set({[HANDOFF_DEBUG_KEY]:data});
+}
+
+function handoffDebugSource(store, sender, url) {
+  if (!Number.isInteger(sender.tab?.id) ||
+      sender.frameId != null && sender.frameId !== 0 || !safeUrl(url)) return null;
+  const project = CQHandoff.projectId(url);
+  if (!project) return null;
+  const direct = store.conversations[chatKey(url)];
+  if (direct?.handoff && !direct.handoffSourceKey &&
+      direct.tabId === sender.tab.id && HANDOFF_DEBUG_PHASES.has(direct.handoff.phase) &&
+      direct.handoff.phase !== "completed") return direct;
+  return Object.values(store.conversations).filter(state =>
+    chatKey(state.url) && state.tabId === sender.tab.id &&
+    CQHandoff.projectId(state.url) === project &&
+    state.handoff && HANDOFF_DEBUG_PHASES.has(state.handoff.phase) &&
+    state.handoff.phase !== "completed")
+    .sort((a,b) => (b.handoff.changedAt || 0)-(a.handoff.changedAt || 0))[0] || null;
+}
+
+async function appendHandoffDebugSignal(message, sender) {
+  if (!HANDOFF_DEBUG_SIGNALS.has(message.event) ||
+      !HANDOFF_DEBUG_REASONS.has(message.reason)) {
+    throw new Error("接力调试事件无效");
+  }
+  const requested = safeUrl(message.url);
+  const current = safeUrl(sender.tab?.url);
+  if (!requested || current && current !== requested ||
+      sender.url && new URL(sender.url).origin !== new URL(requested).origin) {
+    throw new Error("接力调试来源不匹配");
+  }
+  const details = handoffDebugDetails(message.details);
+  try {
+    const store = await readStore();
+    const source = handoffDebugSource(store,sender,requested);
+    if (!source) return {ok:true,recorded:false};
+    const data = await handoffDebugData();
+    const run = data.runs.find(item => item.sourceKey === source.key) ||
+      handoffDebugRun(data,source.key,source.handoff.manualRequested ? "manual" : "automatic",source.handoff.phase);
+    if (source.handoff.phase === "failed") run.status = "failed";
+    const event = {kind:message.event,phase:source.handoff.phase,reason:message.reason,
+      route:isProjectOverview(requested) ? "project" : chatKey(requested) ? "chat" : "other",
+      ...(Object.keys(details).length ? {details} : {})};
+    if (handoffDebugSignalDuplicate(run,event)) return {ok:true,recorded:false};
+    handoffDebugPush(run,event);
+    await chrome.storage.local.set({[HANDOFF_DEBUG_KEY]:data});
+    return {ok:true,recorded:true};
+  } catch (error) {
+    console.warn("[ChatQueue] 接力页面诊断暂时无法记录",error);
+    return {ok:true,recorded:false,diagnosticsUnavailable:true};
+  }
+}
+
+function handoffDebugManagerSender(sender) {
+  const dashboard = chrome.runtime.getURL(DASHBOARD_PAGE);
+  return typeof chrome.runtime.id === "string" && sender.id === chrome.runtime.id &&
+    (sender.frameId == null || sender.frameId === 0) &&
+    [dashboard,dashboard+"?view=full"].includes(sender.url) &&
+    (!sender.tab?.url || sender.tab.url === sender.url);
+}
+
+function handoffDebugVisibleSnapshot(value) {
+  const result = {};
+  const enums = {
+    phase:HANDOFF_DEBUG_DETAIL_ENUMS.handoffPhase,
+    summaryStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus,introStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus,
+    sourceActiveKind:HANDOFF_DEBUG_DETAIL_ENUMS.taskKind,destinationActiveKind:HANDOFF_DEBUG_DETAIL_ENUMS.taskKind,
+    sourceActiveStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus,destinationActiveStatus:HANDOFF_DEBUG_DETAIL_ENUMS.taskStatus,
+    destination:new Set(["none","chat","draft","not_found"]),
+  };
+  const numbers = ["summaryChars","pendingTasks","sourceTaskCount","destinationTaskCount",
+    "sourceScheduleCount","sourceEnabledScheduleCount","destinationScheduleCount",
+    "destinationEnabledScheduleCount","phaseElapsedMs","summaryDispatchElapsedMs","summaryWaitElapsedMs",
+    "introDispatchElapsedMs","introWaitElapsedMs","dispatchBudgetMs","summaryDispatchBudgetMs",
+    "introDispatchBudgetMs","replyBudgetMs","entryBudgetMs","bootstrapBudgetMs",
+    "cachedScheduleCount","cachedEnabledScheduleCount","cachedTaskCount"];
+  for (const [key,allowed] of Object.entries(enums)) if (allowed.has(value?.[key])) result[key] = value[key];
+  for (const key of numbers) if (Number.isFinite(value?.[key]) && value[key] >= 0 && value[key] <= 1_000_000_000) result[key] = value[key];
+  for (const key of ["halted","queuePaused","destinationHalted","destinationQueuePaused","ownerChainMatches",
+      "cacheFound","cacheIdentityMatches","cacheDestinationMatches","destinationRecorded","destinationConfirmed"]) {
+    if (typeof value?.[key] === "boolean") result[key] = value[key];
+  }
+  return result;
+}
+
+function handoffDebugVisibleEvent(event) {
+  if (!event || !["state","rpc_error",...HANDOFF_DEBUG_SIGNALS].includes(event.kind)) return null;
+  const visible = {kind:event.kind,backendVersion:handoffDebugVersion(event.backendVersion),
+    ...handoffDebugVisibleSnapshot(event)};
+  if (Number.isFinite(event.at) && event.at >= 0) visible.at = event.at;
+  const reasons = new Set([...HANDOFF_DEBUG_REASONS,"summary_empty","summary_too_short","summary_too_long",
+    "reply_not_confirmed","source_changed","project_mismatch","chat_not_confirmed","intro_not_confirmed",
+    "timeout","send_uncertain","queue_conflict","other_failure"]);
+  visible.reason = reasons.has(event.reason) ? event.reason : "other_failure";
+  if (HANDOFF_DEBUG_ERROR_ACTIONS.has(event.action)) visible.action = event.action;
+  if (HANDOFF_DEBUG_DETAIL_ENUMS.route.has(event.route)) visible.route = event.route;
+  try {
+    const details = handoffDebugDetails(event.details);
+    if (Object.keys(details).length) visible.details = details;
+  } catch { /* Old/corrupt diagnostic payloads are not exported as raw text. */ }
+  return visible;
+}
+
+function handoffDebugVisibleRun(run) {
+  const visible = {createdBackendVersion:handoffDebugVersion(run.createdBackendVersion),
+    lastBackendVersion:handoffDebugVersion(run.lastBackendVersion),
+    events:(Array.isArray(run.events) ? run.events : []).slice(-HANDOFF_DEBUG_MAX_EVENTS)
+      .map(handoffDebugVisibleEvent).filter(Boolean)};
+  if (["automatic","manual"].includes(run.mode)) visible.mode = run.mode;
+  if (["running","failed","completed","cancelled"].includes(run.status)) visible.status = run.status;
+  if (HANDOFF_DEBUG_DETAIL_ENUMS.handoffPhase.has(run.phase)) visible.phase = run.phase;
+  for (const key of ["startedAt","endedAt"]) if (Number.isFinite(run[key]) && run[key] >= 0) visible[key] = run[key];
+  return visible;
+}
+
+function handoffDebugReportSource(store, sender, url) {
+  const key = chatKey(url);
+  const direct = key && store.conversations[key];
+  if (direct && !direct.handoffSourceKey && HANDOFF_DEBUG_PHASES.has(direct.handoff?.phase)) return direct;
+  const destination = direct || store.conversations[`draft:${sender.tab?.id}`];
+  const linked = store.conversations[destination?.handoffSourceKey];
+  if (linked?.handoff && destination.tabId === sender.tab?.id && linked.tabId === sender.tab.id &&
+      linked.handoff.destinationKey === destination.key && linked.handoff.token === destination.handoffToken &&
+      CQHandoff.projectId(linked.url) === CQHandoff.projectId(url)) return linked;
+  return isProjectOverview(url) ? handoffDebugSource(store,sender,url) : null;
+}
+
+async function handoffDebugReport(message, sender) {
+  const all = message.all === true;
+  const url = safeUrl(message.url);
+  const key = chatKey(url);
+  if (all ? !handoffDebugManagerSender(sender) :
+      (!url || !key && !isProjectOverview(url) || !Number.isInteger(sender.tab?.id) ||
+       sender.frameId != null && sender.frameId !== 0 ||
+       sender.tab.url && safeUrl(sender.tab.url) !== url ||
+       sender.url && new URL(sender.url).origin !== new URL(url).origin)) {
+    throw new Error("只能从当前对话、项目页或插件管理页读取接力日志");
+  }
+  let data = {version:2,runs:[]};
+  let store = null;
+  let diagnosticsUnavailable = false;
+  try { data = await handoffDebugData(); } catch { diagnosticsUnavailable = true; }
+  try { store = await readStore(); } catch { diagnosticsUnavailable = true; }
+  const source = !all && store ? handoffDebugReportSource(store,sender,url) : null;
+  const currentState = !all && store ? (store.conversations[key] || store.conversations[`draft:${sender.tab.id}`]) : null;
+  const current = {pageType:all ? "manager" : isProjectOverview(url) ? "project" : "chat",
+    sessionKind:currentState?.key?.startsWith("draft:") ? "draft" : key ? "chat" : "none",
+    stateFound:Boolean(currentState),sourceFound:Boolean(source),ownerPageType:"unavailable"};
+  if (!all) current.claimDiagnostic = handoffDebugClaimSnapshot(currentState,url);
+  if (!all && store && key) current.adoption = handoffDebugAdoptionMetadata(store,sender,url);
+  if (all && store) current.conversationCount = Object.keys(store.conversations).length;
+  if (source?.handoff) {
+    Object.assign(current,handoffDebugVisibleSnapshot(handoffDebugSnapshot(store,source)));
+    current.reason = source.handoff.phase === "failed" ? handoffDebugReason(source.handoff.error) : "none";
+    try {
+      const owner = await chrome.tabs.get(source.tabId);
+      current.ownerPageType = isProjectOverview(owner.url) ? "project" : chatKey(owner.url) ? "chat" : "other";
+    } catch { /* Closed owner: keep only its unavailable page category. */ }
+  }
+  const ownerPageTypes = new Map();
+  if (store && all) {
+    try {
+      for (const tab of await chrome.tabs.query({url:["https://chatgpt.com/*","https://chat.openai.com/*"]})) {
+        ownerPageTypes.set(tab.id,isProjectOverview(tab.url) ? "project" : chatKey(tab.url) ? "chat" : "other");
+      }
+    } catch { /* Export stored state even when current tab metadata is unavailable. */ }
+  }
+  const relatedSources = new Set(!all && store && CQHandoff.projectId(url)
+    ? Object.values(store.conversations).filter(item => item.tabId === sender.tab?.id &&
+      CQHandoff.projectId(item.url) === CQHandoff.projectId(url) && item.handoff?.destinationKey &&
+      ["navigating","bootstrapping","failed"].includes(item.handoff.phase)).map(item => item.key) : []);
+  const selected = data.runs.filter(run => all ||
+    key && (run.sourceKey === key || run.destinationKey === key) || source && run.sourceKey === source.key ||
+    relatedSources.has(run.sourceKey))
+    .slice(0,HANDOFF_DEBUG_MAX_RUNS);
+  const runs = selected.map(run => {
+    const visible = handoffDebugVisibleRun(run);
+    const liveSource = store?.conversations[run.sourceKey];
+    const destination = store?.conversations[liveSource?.handoff?.destinationKey];
+    const liveState = destination || liveSource;
+    visible.current = {stateFound:Boolean(liveSource),
+      isLatestForSource:data.runs.find(item => item.sourceKey === run.sourceKey) === run,
+      ownerPageType:all ? ownerPageTypes.get(liveSource?.tabId) || "unavailable" : current.ownerPageType,
+      claimDiagnostic:handoffDebugClaimSnapshot(liveState,liveState?.url)};
+    if (liveSource?.handoff) {
+      Object.assign(visible.current,handoffDebugVisibleSnapshot(handoffDebugSnapshot(store,liveSource)));
+      visible.current.reason = liveSource.handoff.phase === "failed" ? handoffDebugReason(liveSource.handoff.error) : "none";
+    }
+    return visible;
+  });
+  return {ok:true,version:2,backendVersion:handoffDebugBackendVersion(),capturedAt:Date.now(),current,runs,
+    ...(diagnosticsUnavailable ? {diagnosticsUnavailable:true} : {})};
+}
+
+const HANDOFF_DEBUG_ERROR_ACTIONS = new Set([
+  "HANDOFF_NOW","HANDOFF_NAVIGATE","CLAIM","SENT","FINISHED",
+  "HELLO","CANCEL_HANDOFF","RELEASE_CLAIM","HANDOFF_SEND_READY","CONFIRM_HANDOFF","RETRY_UNSENT_HANDOFF",
+]);
+
+async function recordHandoffDebugRpcError(message,sender,error) {
+  if (!HANDOFF_DEBUG_ERROR_ACTIONS.has(message?.type)) return;
+  const url = safeUrl(message.url);
+  const store = await readStore();
+  const source = handoffDebugSource(store,sender,url);
+  if (!source) return;
+  const data = await handoffDebugData();
+  const run = data.runs.find(item=>item.sourceKey === source.key);
+  if (!run) return;
+  const reason = handoffDebugReason(error?.message);
+  if (run.events.some(event => event.kind === "rpc_error" && event.action === message.type &&
+      event.reason === reason && Date.now()-event.at < 30000)) return;
+  handoffDebugPush(run,{
+    kind:"rpc_error",action:message.type,phase:source.handoff.phase,reason,
+  });
+  if (message.type === "CLAIM") {
+    const event = {kind:"claim_result",reason:"claim_rejected",phase:source.handoff.phase,
+      route:isProjectOverview(url) ? "project" : "chat",details:{gate:"claim"}};
+    if (!handoffDebugSignalDuplicate(run,event)) handoffDebugPush(run,event);
+  }
+  await chrome.storage.local.set({[HANDOFF_DEBUG_KEY]:data});
 }
 
 function isDashboardSender(sender) {
@@ -236,13 +881,28 @@ function isFavoritesPageSender(sender) {
     (sender.tab.url == null || sender.tab.url === page);
 }
 
-function favoriteSenderKind(message, sender) {
+async function favoriteSenderKind(message, sender) {
   if (isDashboardSender(sender) || isFavoritesPageSender(sender)) return "manager";
-  const sourceUrl = safeUrl(sender.url || sender.tab?.url);
+  const documentUrl = sender.url ? safeUrl(sender.url) : null;
+  const tabUrl = safeUrl(sender.tab?.url);
+  const requestedUrl = safeUrl(message.url);
   if (!Number.isInteger(sender.tab?.id) || (sender.frameId != null && sender.frameId !== 0) ||
-      !sourceUrl || sourceUrl !== safeUrl(message.url) ||
-      (sender.tab.url && safeUrl(sender.tab.url) !== sourceUrl)) {
+      !requestedUrl || (!documentUrl && !tabUrl) ||
+      (sender.url && !documentUrl) ||
+      (documentUrl && new URL(documentUrl).origin !== new URL(requestedUrl).origin)) {
     throw new Error("只能从 ChatGPT 对话或插件管理页操作收藏夹");
+  }
+  // sender.url identifies the document where the content script was injected.
+  // ChatGPT changes routes via the History API without reloading that document.
+  // Verify the *current* browser tab instead of requiring the original path.
+  if (tabUrl !== requestedUrl) {
+    let liveTabUrl = null;
+    try { liveTabUrl = safeUrl((await chrome.tabs.get(sender.tab.id)).url); }
+    catch { /* Older browsers may omit tab URL access. */ }
+    if (liveTabUrl !== requestedUrl &&
+        (tabUrl || liveTabUrl || documentUrl !== requestedUrl)) {
+      throw new Error("只能从 ChatGPT 对话或插件管理页操作收藏夹");
+    }
   }
   return "chat";
 }
@@ -520,7 +1180,7 @@ async function mergeFavoritesBackup(store, stage) {
 }
 
 async function handleFavoriteMessage(message, sender) {
-  const kind = favoriteSenderKind(message, sender);
+  const kind = await favoriteSenderKind(message, sender);
   const store = await readStore();
   const favorites = favoritesOf(store);
   if (["GET_FAVORITES_BACKUP_META","GET_FAVORITES_BACKUP_IMAGE",
@@ -750,7 +1410,8 @@ function tabBelongsToSession(tab, key) {
 function hasConversationWork(state) {
   return Boolean(state.tasks.length || state.schedules.length ||
     state.activeTaskId || state.steeringTaskId || state.halted ||
-    state.queuePaused || String(state.error || "").trim());
+    state.queuePaused || state.handoff?.enabled === true || handoffBusy(state) ||
+    String(state.error || "").trim());
 }
 
 function canPruneIdleSession(key, state, tabs) {
@@ -819,6 +1480,13 @@ async function dashboardSnapshot() {
   let cleanupEligible = 0;
   const sessions = [];
   for (const [key, state] of Object.entries(store.conversations)) {
+    if (state.parkedDraft) continue;
+    // The project landing page is not a conversation. During an automatic
+    // handoff its internal introduction is temporarily stored under a draft
+    // key, but should never appear as a separate user queue. Keep failed
+    // introductions visible for manual review rather than hiding errors.
+    if (key.startsWith("draft:") && state.handoffSourceKey && !state.halted &&
+        state.tasks.length === 1 && state.tasks[0].kind === "handoff_intro") continue;
     const counts = dashboardCounts(state);
     const related = tabs.filter((tab) => tabBelongsToSession(tab, key));
     if (!tabLookupError && canPruneIdleSession(key, state, tabs)) cleanupEligible++;
@@ -836,6 +1504,7 @@ async function dashboardSnapshot() {
     // sessions with unfinished work, paused state, or an actual browser tab.
     if (!related.length && !counts.pending && !counts.active && !counts.review &&
         !schedules.length && !state.queuePaused && !state.halted &&
+        state.handoff?.enabled !== true && !handoffBusy(state) &&
         state.unreadCompleted !== true) continue;
     const active = state.tasks.find((task) =>
       task.id === state.activeTaskId || task.id === state.steeringTaskId);
@@ -951,6 +1620,7 @@ async function handleDashboardMessage(message, sender) {
   if (state.queuePaused !== message.paused) {
     state.queuePaused = message.paused;
     recordHistory(state, message.paused ? "queue_paused" : "queue_resumed");
+    checkpointHandoffQueue(store,state,false);
     await saveStore(store);
   }
   return {ok:true, dashboard:await dashboardSnapshot()};
@@ -976,33 +1646,107 @@ function safeUrl(input) {
   }
 }
 
+function loadRecoveryEligibleTab(tab) {
+  return Number.isInteger(tab?.id) && tab.status === "complete" &&
+    !tab.discarded && Boolean(chatKey(tab.url));
+}
+
+async function installLoadRecoveryGuardian(tabId) {
+  if (loadRecoveryInstallations.has(tabId)) return loadRecoveryInstallations.get(tabId);
+  const work = (async () => {
+    // Re-read immediately before injection: a queued onUpdated or alarm may
+    // refer to a tab that has already left this conversation or been unloaded.
+    const tab = await chrome.tabs.get(tabId);
+    if (!loadRecoveryEligibleTab(tab)) return false;
+    await chrome.scripting.executeScript({
+      target:{tabId}, files:["load-recovery.js"],
+    });
+    // The guardian itself is idempotent and owns native-error observations,
+    // draft checks and cross-reload backoff. Installation never changes tasks.
+    return true;
+  })().catch((error) => {
+    console.warn("[ChatQueue] 对话错误页恢复守护暂时无法补注入", tabId, error);
+    return false;
+  }).finally(() => { loadRecoveryInstallations.delete(tabId); });
+  loadRecoveryInstallations.set(tabId, work);
+  return work;
+}
+
+async function installLoadRecoveryGuardians(tabId = null) {
+  if (Number.isInteger(tabId)) return installLoadRecoveryGuardian(tabId);
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({url:["https://chatgpt.com/*","https://chat.openai.com/*"]});
+  } catch (error) {
+    console.warn("[ChatQueue] 暂时无法查找待补注入恢复守护的对话页", error);
+    return [];
+  }
+  // Do not enter the serialized queue lock or wait on one tab before starting
+  // the rest. A closed, inaccessible or failing page must not block its peers.
+  return Promise.all(tabs.filter(loadRecoveryEligibleTab)
+    .map((tab) => installLoadRecoveryGuardian(tab.id)));
+}
+
 // This standalone DOM probe runs in already-open ChatGPT tabs *after* the
 // extension updates. Previous content scripts may have been invalidated, so
 // runtime.sendMessage cannot be relied on to inspect those pages.
 function inspectUpdateRefreshSafety() {
-  const editor = document.querySelector(
-    '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]'
-  );
-  let input = editor && !editor.closest("#cq-extension-root")
-    ? (editor.matches('textarea, input, [contenteditable="true"]') ? editor :
-      editor.querySelector('[contenteditable="true"], textarea, input')) : null;
+  const editorSelector = '#prompt-textarea, [data-testid="prompt-textarea"], ' +
+    '[data-testid="composer-input"], [data-composer-markdown][role="textbox"]';
+  const foreignSurface = '#cq-extension-root, [role="dialog"], [aria-modal="true"], aside, [role="menu"], ' +
+    '[data-testid^="conversation-turn-"], [data-message-author-role], ' +
+    '[data-turn="assistant"], [data-turn="user"], [data-conversation-role], ' +
+    '[data-testid="user-message"], [data-testid="message-content"], ' +
+    '[data-testid*="writing-block"], [data-testid*="artifact"], .markdown';
+  const rendered = (element) => {
+    if (!element?.isConnected || !element.getClientRects().length ||
+        element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+    const style = getComputedStyle(element);
+    if (style.visibility !== "visible" || style.contentVisibility === "hidden" ||
+        Number(style.opacity) <= 0.01) return false;
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      const parentStyle = getComputedStyle(parent);
+      if (parentStyle.visibility !== "visible" ||
+          parentStyle.contentVisibility === "hidden" ||
+          Number(parentStyle.opacity) <= 0.01) return false;
+    }
+    return true;
+  };
+  const visible = (element) => rendered(element) && !element.disabled &&
+    (!element.matches('button, [role="button"]') ||
+      getComputedStyle(element).pointerEvents !== "none");
+  const usableInput = (candidate) => Boolean(candidate && candidate.isConnected &&
+    !candidate.closest(foreignSurface) && visible(candidate) &&
+    candidate.matches('textarea, input, [contenteditable="true"]') &&
+    candidate.closest('form, [data-testid="composer"], [data-chatgpt-composer]'));
+  let input = null;
+  for (const editor of document.querySelectorAll(editorSelector)) {
+    const candidate = editor.matches('textarea, input, [contenteditable="true"]') ? editor :
+      editor.querySelector('[contenteditable="true"], textarea, input');
+    if (usableInput(candidate)) {
+      input = candidate;
+      break;
+    }
+  }
+  // Unknown editors are safe to inspect only inside a marked native composer.
+  // A writing block elsewhere in main must never stand in for the prompt.
   if (!input) input = [...document.querySelectorAll(
-    'main [contenteditable="true"], main textarea, form [contenteditable="true"], form textarea'
-  )].find((candidate) => !candidate.closest("#cq-extension-root")) || null;
+    '[data-testid="composer"] [contenteditable="true"], [data-testid="composer"] textarea, ' +
+    '[data-chatgpt-composer] [contenteditable="true"], [data-chatgpt-composer] textarea'
+  )].find(usableInput) || null;
   if (!input || document.readyState === "loading") {
     return { safe: false, voiceReady: false, reason: "composer_not_ready" };
   }
-  const visible = (element) =>
-    element.getClientRects().length > 0 && !element.disabled;
   const form = input.closest("form");
   const text = input.matches("textarea, input") ? input.value : input.innerText;
   if (String(text || "").trim()) {
     return { safe: false, voiceReady: false, reason: "unsent_text" };
   }
   const plugin = document.querySelector("#cq-extension-root");
-  if (plugin?.getAttribute("data-cq-unsaved-draft") === "true") {
-    // A closed editor can still contain a draft in content-script memory.
-    // The new extension must not refresh that old document and erase it.
+  if (plugin?.getAttribute("data-cq-unsaved-draft") === "true" ||
+      document.documentElement?.getAttribute("data-cq-unsaved-draft") === "true") {
+    // A closed editor can still contain a draft in content-script memory,
+    // even when the panel was detached while ChatGPT replaced its composer.
     return { safe: false, voiceReady: false, reason: "plugin_hidden_unsaved_draft" };
   }
   if (plugin && [
@@ -1044,23 +1788,33 @@ function inspectUpdateRefreshSafety() {
   )) {
     return { safe: false, voiceReady: false, reason: "attachments_or_upload" };
   }
-  const buttons = [...document.querySelectorAll("main button, form button")].filter(visible);
+  const composerFrame = input.closest('form, [data-testid="composer"], [data-chatgpt-composer]');
+  const buttons = [...document.querySelectorAll("main button, form button")]
+    .filter((button) => rendered(button) && !button.closest(foreignSurface));
   const stop = buttons.some((button) => {
     const testId = button.getAttribute("data-testid") || "";
     const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
-    if (/(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
-        /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim())) return true;
-    const actionForm = button.closest("form");
-    const composer = actionForm?.matches("[data-chatgpt-composer]") ||
-      actionForm?.querySelector('#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]');
-    return Boolean(composer && [...button.querySelectorAll("svg.icon-primary-action > path")]
-      .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964")));
+    const byId = /(?:^|-)stop-button$|composer-stop-button/i.test(testId);
+    const byLabel = /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim());
+    const buttonFrame = button.closest('form, [data-testid="composer"], [data-chatgpt-composer]');
+    const insideComposer = composerFrame?.contains(button) || buttonFrame?.contains(composerFrame);
+    const floatingStop = !buttonFrame && button.closest("main") &&
+      (byId || (byLabel && /(?:生成|回复|回答|响应|generation|generating|responding|streaming)/i.test(label)));
+    if (!insideComposer && !floatingStop) return false;
+    return Boolean(byId || byLabel || (insideComposer &&
+      [...button.querySelectorAll("svg.icon-primary-action > path")]
+      .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964"))));
   });
-  if (stop || document.querySelector(
-    'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]')) {
+  if (stop || [...document.querySelectorAll(
+    'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]'
+  )].some(visible)) {
     return { safe: false, voiceReady: false, reason: "generating" };
   }
   const voiceReady = buttons.some((button) => {
+    if (!visible(button)) return false;
+    const buttonFrame = button.closest('form, [data-testid="composer"], [data-chatgpt-composer]');
+    if (!composerFrame?.contains(button) && !form?.contains(button) &&
+        !(composerFrame?.parentElement?.contains(button) && !buttonFrame)) return false;
     const testId = (button.getAttribute("data-testid") || "").toLowerCase();
     const label = (button.getAttribute("aria-label") ||
       button.getAttribute("title") || "").trim();
@@ -1106,26 +1860,57 @@ function installDeferredTabSpinner(version) {
   const state = { version, frame: 0, running: false, timer: null };
   window.__cqDeferredTabSpinner = state;
   const frames = ["◴", "◷", "◶", "◵"];
-  const visible = (button) =>
-    button.getClientRects().length > 0 && !button.disabled;
+  const rendered = (element) => {
+    if (!element?.isConnected || !element.getClientRects().length ||
+        element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+    const style = getComputedStyle(element);
+    if (style.visibility !== "visible" || style.contentVisibility === "hidden" ||
+        Number(style.opacity) <= 0.01) return false;
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      const parentStyle = getComputedStyle(parent);
+      if (parentStyle.visibility !== "visible" ||
+          parentStyle.contentVisibility === "hidden" ||
+          Number(parentStyle.opacity) <= 0.01) return false;
+    }
+    return true;
+  };
+  const visible = (element) => rendered(element) && !element.disabled &&
+    (!element.matches('button, [role="button"]') ||
+      getComputedStyle(element).pointerEvents !== "none");
   const busy = () => {
-    const editor = document.querySelector(
-      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid="composer-input"]'
-    );
-    const form = editor?.closest("form") ||
-      document.querySelector("form[data-chatgpt-composer]");
-    const buttons = [...document.querySelectorAll("main button, form button")];
+    const editor = [...document.querySelectorAll(
+      '#prompt-textarea, [data-testid="prompt-textarea"], ' +
+      '[data-testid="composer-input"], [data-composer-markdown][role="textbox"]'
+    )].find((candidate) => visible(candidate) &&
+      candidate.matches('textarea, input, [contenteditable="true"]') &&
+      candidate.closest('form, [data-testid="composer"], [data-chatgpt-composer]') &&
+      !candidate.closest('#cq-extension-root, [role="dialog"], [aria-modal="true"], ' +
+        '[role="menu"], aside, [data-message-author-role], ' +
+        '[data-testid^="conversation-turn-"], [data-testid*="writing-block"], .markdown'));
+    const composer = editor?.closest('form, [data-testid="composer"], [data-chatgpt-composer]') ||
+      [...document.querySelectorAll('[data-testid="composer"], [data-chatgpt-composer]')]
+        .find(visible);
+    const buttons = [...document.querySelectorAll("main button, button[data-testid='stop-button']")];
     return buttons.some((button) => {
-      if (!visible(button)) return false;
+      if (!composer || !rendered(button) || button.closest(
+        '#cq-extension-root, [role="dialog"], [aria-modal="true"], [role="menu"], ' +
+        'aside, [data-message-author-role], [data-testid^="conversation-turn-"], ' +
+        '[data-testid*="writing-block"], .markdown')) return false;
       const testId = button.getAttribute("data-testid") || "";
       const label = button.getAttribute("aria-label") || button.getAttribute("title") || "";
-      if (/(?:^|-)stop-button$|composer-stop-button/i.test(testId) ||
-          /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim())) return true;
-      return Boolean(form?.contains(button) &&
+      const byId = /(?:^|-)stop-button$|composer-stop-button/i.test(testId);
+      const byLabel = /^(?:stop(?:\s+(?:generating|generation|response|responding|streaming))?|停止(?:生成|回复|回答|响应)?|结束生成)$/i.test(label.trim());
+      const buttonFrame = button.closest('form, [data-testid="composer"], [data-chatgpt-composer]');
+      const insideComposer = composer.contains(button) || buttonFrame?.contains(composer);
+      const floatingStop = !buttonFrame && button.closest("main") &&
+        (byId || (byLabel && /(?:生成|回复|回答|响应|generation|generating|responding|streaming)/i.test(label)));
+      if (!insideComposer && !floatingStop) return false;
+      return Boolean(byId || byLabel || (insideComposer &&
         [...button.querySelectorAll("svg.icon-primary-action > path")]
-          .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964")));
-    }) || Boolean(document.querySelector(
-      'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]'));
+          .some((path) => (path.getAttribute("d") || "").startsWith("M4.5 5.75C4.5 5.05964"))));
+    }) || [...document.querySelectorAll(
+      'main [data-testid="generation-in-progress"], main [data-is-streaming="true"], main [data-state="streaming"]'
+    )].some(visible);
   };
   const draw = () => {
     const current = document.title || "ChatGPT";
@@ -1356,13 +2141,58 @@ function sendCooldownUntil(state, now = Date.now()) {
 }
 
 function hasBackgroundWork(state) {
+  if (state.parkedDraft) return false;
   return pendingCount(state) > 0 || state.schedules.some((schedule) => schedule.enabled) ||
-    handoffBusy(state);
+    state.handoff?.enabled === true || handoffBusy(state);
 }
 
 function backgroundProtectionEnabled(store) {
   // Old v2 stores had no setting; make the safe default opt-out.
   return store.settings?.protectBackground !== false;
+}
+
+function tabOwnsConversationWork(store, state, tab) {
+  if (!tab || tab.id !== state.tabId) return false;
+  const url = safeUrl(tab.url);
+  if (!url) return false;
+  if (resolveKey(url, tab.id) === state.key) {
+    return !state.key.startsWith("draft:") || sameDraftScope(state.url, url);
+  }
+  // Keep protection across the native project entry, before its first HELLO
+  // creates the destination draft. This does not transfer dispatch ownership.
+  const handoff = state.handoff;
+  if (handoff?.phase === "navigating" && chatKey(state.url) === state.key &&
+      CQHandoff.projectId(state.url) === CQHandoff.normalizeProjectId(handoff.projectId) &&
+      CQHandoff.projectId(handoff.projectUrl) === CQHandoff.normalizeProjectId(handoff.projectId) &&
+      CQHandoff.isProjectStart(url, handoff.projectId)) return true;
+  const destination = store.conversations[handoff?.destinationKey];
+  if (handoff?.phase === "bootstrapping" && destination &&
+      destination.tabId === tab.id && destination.handoffSourceKey === state.key &&
+      destination.handoffToken === handoff.token &&
+      (CQHandoff.isProjectStart(url, handoff.projectId) ||
+       chatKey(url) === destination.key && CQHandoff.projectId(url) ===
+         CQHandoff.normalizeProjectId(handoff.projectId))) return true;
+  // The first native Send can publish /c/<id> before its user bubble mounts.
+  // Only the already owned draft/token chain may bridge that hydration gap.
+  const pending = pendingHandoffDraftForChat(store, {tab}, url);
+  return pending?.state === state;
+}
+
+async function reviveProtectedDiscardedTab(store, state) {
+  if (!backgroundProtectionEnabled(store) || !hasBackgroundWork(state) ||
+      !Number.isInteger(state.tabId)) return false;
+  let tab;
+  try { tab = await chrome.tabs.get(state.tabId); }
+  catch { return false; } // Reopening closed tabs remains a separate opt-in.
+  if (!tab.discarded || !tabOwnsConversationWork(store, state, tab)) return false;
+  const lastAttempt = recentTabRevives.get(tab.id);
+  if (lastAttempt != null && Date.now() - lastAttempt < TAB_REVIVE_BACKOFF_MS) return false;
+  recentTabRevives.set(tab.id, Date.now());
+  // A discarded page has already lost its document. Reload that same owner,
+  // retaining every durable send status; never replay an uncertain message.
+  await chrome.tabs.reload(tab.id);
+  recordHistory(state, "tab_revived");
+  return true;
 }
 
 async function syncTabProtection(store) {
@@ -1377,7 +2207,7 @@ async function syncTabProtection(store) {
     let tab;
     try { tab = await chrome.tabs.get(state.tabId); }
     catch { continue; }
-    if (resolveKey(tab?.url, tab?.id) !== state.key) continue;
+    if (!tabOwnsConversationWork(store, state, tab)) continue;
     desired.set(String(tab.id), tab);
   }
 
@@ -1563,20 +2393,225 @@ function ownerMatches(session, sender) {
 }
 
 function targetMatches(session, sender, url) {
-  return ownerMatches(session, sender) && session.key === resolveKey(url, sender.tab?.id);
+  return ownerMatches(session, sender) && session.key === resolveKey(url, sender.tab?.id) &&
+    (!session.key.startsWith("draft:") || sameDraftScope(session.url, url));
 }
 
-function adoptNewChat(store, sender, url, lastUserText) {
+// A project conversation ID only exists after ChatGPT accepts its first
+// message. During that SPA redirect the new URL may arrive before the user
+// bubble is hydrated; keep the introduction under its original draft key
+// rather than replacing it with a new, empty conversation state.
+const HANDOFF_OBSERVATION_HISTORY = new Set(["tab_owner_rebound","tab_revived","tab_reopened"]);
+
+function handoffObservationHistory(entry) {
+  return Boolean(entry && HANDOFF_OBSERVATION_HISTORY.has(entry.type) &&
+    plausibleConversationTime(entry.at) &&
+    Object.keys(entry).every(field => ["at","type"].includes(field)));
+}
+
+function sameHandoffDefault(value, expected) {
+  if (value === expected) return true;
+  if (!value || !expected || typeof value !== "object" || typeof expected !== "object" ||
+      Array.isArray(value) !== Array.isArray(expected)) return false;
+  if (Array.isArray(value) && value.length !== expected.length) return false;
+  const keys = Object.keys(value);
+  return keys.length === Object.keys(expected).length &&
+    keys.every(field => Object.hasOwn(expected,field) && sameHandoffDefault(value[field],expected[field]));
+}
+
+function handoffTargetBlocker(state, sender, url) {
+  if (!state || !targetMatches(state,sender,url) || state.parkedDraft ||
+      state.handoffSourceKey || state.handoffToken || state.projectVisitId) {
+    return !state || !targetMatches(state,sender,url) ? "owner" : "linked";
+  }
+  const defaults = blankSession(state.key,state.url,state.tabId);
+  // Background wake/rebind observations do not turn an empty receiving shell
+  // into user-owned work. Every actual task, choice and unknown field still
+  // blocks replacement; compare defaults by value rather than key order.
+  for (const [field,value] of Object.entries(state)) {
+    if (["key","url","tabId"].includes(field)) continue;
+    if (["firstSeenAt","firstMessageAt"].includes(field)) {
+      if (value == null || plausibleConversationTime(value)) continue;
+      return "metadata";
+    }
+    if (field === "unreadCompleted" && typeof value === "boolean") continue;
+    if (field === "history" && Array.isArray(value) && value.every(handoffObservationHistory)) continue;
+    if (["lastTimeScheduleId","lastCountScheduleId"].includes(field) && value == null) continue;
+    if (field === "parkedDraft" && value === false) continue;
+    if (!Object.hasOwn(defaults,field)) return "unknown_field";
+    if (sameHandoffDefault(value,defaults[field])) continue;
+    if (field === "tasks" || field === "schedules") return field;
+    if (["activeTaskId","steeringTaskId"].includes(field)) return "active";
+    if (["halted","queuePaused","error","haltReason","haltAtUserCount"].includes(field)) return "paused";
+    if (field === "recentSubmissions") return "submissions";
+    if (field === "history") return "history";
+    if (["compactView","sendCooldownSeconds","autoOpenTab","countRateLimit","handoff"].includes(field)) {
+      return "configuration";
+    }
+    if (["lastQueueSettledAt","countRateTimes"].includes(field)) return "queue_history";
+    return "metadata";
+  }
+  return "none";
+}
+
+function handoffAdoptionCandidate(store, sender, url, draftKey = `draft:${sender.tab?.id}`) {
+  const tabId = sender.tab?.id;
+  const key = draftKey;
+  const draft = store.conversations[key];
+  const source = store.conversations[draft?.handoffSourceKey];
+  const handoff = source?.handoff;
+  const active = draft?.tasks?.find(task => task.id === draft.activeTaskId);
+  const target = store.conversations[chatKey(url)];
+  const result = {key,state:draft,source,active,targetShell:false,reason:"ready"};
+  if (!draft || !draft.handoffSourceKey || !source || !handoff) result.reason = "source_missing";
+  else if (!Number.isInteger(tabId) || draft.tabId !== tabId || source.tabId !== tabId ||
+      safeUrl(sender.tab?.url) && safeUrl(sender.tab.url) !== url ||
+      target && target.tabId !== tabId) result.reason = "owner_mismatch";
+  else if (!chatKey(url) || !CQHandoff.projectId(url) ||
+      CQHandoff.projectId(url) !== CQHandoff.normalizeProjectId(handoff.projectId) ||
+      CQHandoff.projectId(source.url) !== CQHandoff.projectId(url) ||
+      !sameDraftScope(draft.url,url) ||
+      !CQHandoff.isProjectStart(draft.url,handoff.projectId) ||
+      target && !sameDraftScope(target.url,url)) result.reason = "project_mismatch";
+  else if (handoff.phase !== "bootstrapping" || handoff.cancelRequested) result.reason = "source_phase";
+  else if (!handoff.token || handoff.token !== draft.handoffToken) result.reason = "token_mismatch";
+  else if (handoff.destinationKey !== key) result.reason = "destination_mismatch";
+  else if (!handoffQueueFor(store,source,draft)) result.reason = "cache_mismatch";
+  else if (draft.halted || draft.queuePaused || !active || active.handoffQueueId !== handoff.queueId ||
+      active.kind !== "handoff_intro" || !["dispatching","waiting"].includes(active.status)) result.reason = "intro_missing";
+  else if (target) {
+    result.targetBlocker = handoffTargetBlocker(target,sender,url);
+    result.targetShell = result.targetBlocker === "none";
+    const history = Array.isArray(target.history) ? target.history : [];
+    result.targetSystemHistoryCount = history.filter(handoffObservationHistory).length;
+    result.targetBusinessHistoryCount = history.length-result.targetSystemHistoryCount;
+    result.reason = result.targetShell ? "target_exists_shell" : "target_has_work";
+  }
+  return result;
+}
+
+function handoffAdoptionCandidates(store, sender, url) {
+  const keys = new Set([`draft:${sender.tab?.id}`]);
+  for (const source of Object.values(store.conversations)) {
+    if (source.tabId === sender.tab?.id && CQHandoff.projectId(source.url) === CQHandoff.projectId(url) &&
+        source.handoff?.destinationKey?.startsWith("draft:")) keys.add(source.handoff.destinationKey);
+  }
+  return [...keys].map(key => handoffAdoptionCandidate(store,sender,url,key));
+}
+
+function noteHandoffCreatedChat(store, sender, url) {
+  if (!chatKey(url) || safeUrl(sender.tab?.url) !== safeUrl(url)) return false;
+  const candidate = handoffAdoptionCandidate(store,sender,url);
+  if (!["ready","target_exists_shell"].includes(candidate.reason) || candidate.state.parkedDraft ||
+      !Number.isFinite(candidate.active.sentAt) && !Number.isFinite(candidate.active.sendArmedAt)) return false;
+  const cache = handoffQueueFor(store,candidate.source,candidate.state);
+  if (!cache || cache.observedChatKey) return false;
+  // URL creation is only a provisional observation. It grants no permission
+  // to adopt or inject tasks: the full first message must still match uniquely.
+  cache.observedChatKey = chatKey(url);
+  cache.observedAt = Date.now();
+  return true;
+}
+
+function selectHandoffAdoption(store, sender, url, text, userCount, folded = false, exactText = false) {
+  const candidates = handoffAdoptionCandidates(store,sender,url);
+  const eligible = candidates.filter(item => ["ready","target_exists_shell"].includes(item.reason));
+  const exact = eligible.filter(item => CQHandoff.textMatch(item.active.text,text).matches &&
+    (userCount === 1 || userCount == null && !item.state.parkedDraft &&
+      !store.conversations[chatKey(url)] && !exactText));
+  if (exact.length === 1) return {candidate:exact[0],reason:exact[0].reason,matchCount:1,observation:exact[0]};
+  if (exact.length > 1) return {candidate:null,reason:"adoption_ambiguous",matchCount:exact.length,observation:exact[0]};
+  // Count every acceptable document, including additive variants. Do not
+  // prefer an exact candidate while ignoring another candidate within tolerance.
+  const observation = eligible[0] || candidates.find(item => item.source) || candidates[0];
+  return {candidate:null,reason:eligible.length ? "message_mismatch" : observation?.reason || "source_missing",
+    matchCount:0,observation};
+}
+
+function pendingHandoffDraftForChat(store, sender, url) {
   const nextKey = chatKey(url);
-  const draftKey = `draft:${sender.tab?.id}`;
+  const tabId = sender.tab?.id;
+  if (!nextKey || !Number.isInteger(tabId)) return null;
+  const draftKey = `draft:${tabId}`;
   const draft = store.conversations[draftKey];
+  const active = draft?.tasks?.find((task) => task.id === draft.activeTaskId);
+  // The first project message can change the SPA route before its bubble
+  // mounts. Retain the owned draft until that exact message confirms adoption.
+  if (!store.conversations[nextKey] && draft && !draft.handoffSourceKey && ownerMatches(draft, sender) && active &&
+      ["dispatching","waiting"].includes(active.status) &&
+      isProjectOverview(draft.url) && draftCanAdoptChat(draft, url)) {
+    return {key:draftKey,state:draft,active};
+  }
+  const candidate = handoffAdoptionCandidate(store,sender,url);
+  if (draft?.parkedDraft || !["ready","target_exists_shell"].includes(candidate.reason)) return null;
+  return {key:draftKey,state:draft,active};
+}
+
+function matchesHandoffIntroduction(expected, observed, folded = false) {
+  if (sameMessage(expected, observed)) return true;
+  // ChatGPT folds long user bubbles. Only the FIRST new turn of this
+  // token-verified handoff draft may use an anchored, substantial preview.
+  const full = String(expected || "").replace(/\s+/g," ").trim();
+  let displayed = String(observed || "").replace(/\s+/g," ").trim();
+  // Only a confirmed native folded bubble may add its own preview ellipsis.
+  // Keep all other text intact and retain the substantial anchored prefix.
+  if (folded === true) displayed = displayed.replace(/(?:…|\.\.\.)$/, "").trimEnd();
+  return full.length >= 240 && displayed.length >= 160 &&
+    displayed.length < full.length && full.startsWith(displayed);
+}
+
+function adoptNewChat(store, sender, url, lastUserText, lastUserFolded = false, observation = null, exactText = false, userCount = null) {
+  const nextKey = chatKey(url);
+  const selected = selectHandoffAdoption(store,sender,url,lastUserText,userCount,lastUserFolded,exactText);
+  if (observation && selected.observation) Object.assign(observation,selected.observation,{reason:selected.reason});
+  let draftKey = selected.candidate?.key || `draft:${sender.tab?.id}`;
+  let draft = store.conversations[draftKey];
+  if (!selected.candidate && draft?.handoffSourceKey) return false;
+  if (!selected.candidate && selected.reason === "adoption_ambiguous") return false;
   if (!nextKey || !draft || !ownerMatches(draft, sender)) return false;
   const active = draft.tasks.find((task) => task.id === draft.activeTaskId);
   if (!active || (active.status !== "dispatching" && active.status !== "waiting")) return false;
-  if (!sameMessage(active.text, lastUserText)) return false;
-  if (store.conversations[nextKey]) return false; // Never overwrite an existing chat.
+  if (draft.handoffSourceKey) {
+    if (!selected.candidate) return false;
+    if (store.conversations[nextKey] && userCount !== 1) {
+      if (observation) observation.reason = "user_count_mismatch";
+      return false;
+    }
+    if (!CQHandoff.textMatch(active.text,lastUserText).matches) {
+      if (observation) observation.reason = "message_mismatch";
+      return false;
+    }
+  } else if (!draftCanAdoptChat(draft, url) || !sameMessage(active.text, lastUserText)) return false;
+  if (store.conversations[nextKey] && !draft.handoffSourceKey) return false;
+  const target = store.conversations[nextKey];
+  if (draft.handoffSourceKey) {
+    const source = store.conversations[draft.handoffSourceKey];
+    const cache = handoffQueueFor(store,source,draft);
+    if (!cache) return false;
+    cache.destinationKey = nextKey;
+    cache.confirmedChatKey = nextKey;
+  }
+  // Keep genuine observation timestamps when replacing this metadata shell.
+  for (const field of ["firstSeenAt","firstMessageAt"]) {
+    if (plausibleConversationTime(target?.[field]) &&
+        (!plausibleConversationTime(draft[field]) || target[field] < draft[field])) draft[field] = target[field];
+  }
+  if (active.status === "dispatching") {
+    // Full-document navigation can invalidate the old content script after
+    // native Send but before its SENT RPC. A matching first user turn in the
+    // new conversation is proof the handoff intro was delivered. Mark it
+    // waiting, NEVER put it back in the send queue on a reload.
+    active.status = "waiting";
+    active.sentAt = Date.now();
+  }
   draft.key = nextKey;
   draft.url = safeUrl(url);
+  delete draft.projectVisitId;
+  delete draft.parkedDraft;
+  if (target?.unreadCompleted === true) draft.unreadCompleted = true;
+  if (target?.history?.length) {
+    draft.history = [...draft.history,...target.history].sort((a,b) => a.at-b.at).slice(-HISTORY_LIMIT);
+  }
   store.conversations[nextKey] = draft;
   delete store.conversations[draftKey];
   if (draft.handoffSourceKey) {
@@ -1586,6 +2621,7 @@ function adoptNewChat(store, sender, url, lastUserText) {
       source.handoff.destinationKey = nextKey;
     }
   }
+  if (observation) observation.reason = "adopted";
   return true;
 }
 
@@ -1600,32 +2636,224 @@ function newTask(text, sourceScheduleId = null, images = []) {
   };
 }
 
+// A relay cache is indexed by the original conversation, with an independent
+// per-relay queue ID. It shares the durable envelope with the live queues so
+// restoring rules and consuming the cache can never be separate commits.
+function handoffQueueFor(store, source, destination = null) {
+  const handoff = source?.handoff;
+  const entry = store.handoffQueues?.[source?.key];
+  if (!entry || entry.version !== 1 || !handoff?.queueId ||
+      entry.sourceKey !== source.key || source.key !== chatKey(source.url) ||
+      entry.queueId !== handoff.queueId ||
+      !entry.token || entry.token !== handoff.token ||
+      !entry.projectId || entry.projectId !== CQHandoff.projectId(source.url) ||
+      !Array.isArray(entry.schedules) || !entry.settings ||
+      typeof entry.settings !== "object" || Array.isArray(entry.settings)) return null;
+  if (destination && (destination.handoffCacheKey !== source.key ||
+      destination.handoffSourceKey !== source.key ||
+      destination.handoffQueueId !== entry.queueId || destination.handoffToken !== entry.token ||
+      entry.destinationKey !== destination.key || handoff.destinationKey !== destination.key ||
+      entry.projectId !== CQHandoff.projectId(destination.url))) return null;
+  return entry;
+}
+
+function handoffQueueSettings(source) {
+  const result = {};
+  for (const field of ["queuePaused","compactView","autoOpenTab","sendCooldownSeconds",
+      "countRateLimit","countRateTimes","lastQueueSettledAt","lastTimeScheduleId","lastCountScheduleId"]) {
+    if (source[field] !== undefined) result[field] = source[field];
+  }
+  return JSON.parse(JSON.stringify(result));
+}
+
+function handoffOrdinaryTasks(source) {
+  return JSON.parse(JSON.stringify(source.tasks.filter(task =>
+    !["handoff_summary","handoff_intro"].includes(task.kind))));
+}
+
+function checkpointHandoffTasks(store, source) {
+  const entry = handoffQueueFor(store,source);
+  if (!entry || source.handoffSourceKey) return;
+  const tasks = handoffOrdinaryTasks(source);
+  if (JSON.stringify(tasks) !== JSON.stringify(entry.tasks)) {
+    entry.tasks = tasks;
+    entry.updatedAt = Date.now();
+  }
+}
+
+function checkpointHandoffQueue(store, source, includeSchedules = true) {
+  const entry = handoffQueueFor(store,source);
+  if (!entry || source.handoffSourceKey) return false;
+  const schedules = includeSchedules ? JSON.parse(JSON.stringify(source.schedules)) : entry.schedules;
+  const settings = handoffQueueSettings(source);
+  if (JSON.stringify(entry.schedules) === JSON.stringify(schedules) &&
+      JSON.stringify(entry.settings) === JSON.stringify(settings)) return false;
+  entry.schedules = schedules;
+  entry.settings = settings;
+  entry.updatedAt = Date.now();
+  return true;
+}
+
+function createHandoffQueue(store, source, now = Date.now()) {
+  store.handoffQueues ||= {};
+  store.handoffQueues[source.key] = {
+    version:1,sourceKey:source.key,queueId:source.handoff.queueId,token:source.handoff.token,
+    projectId:CQHandoff.projectId(source.url),destinationKey:null,
+    createdAt:now,updatedAt:now,schedules:JSON.parse(JSON.stringify(source.schedules)),
+    taskSnapshotVersion:1,tasks:handoffOrdinaryTasks(source),
+    settings:handoffQueueSettings(source),
+  };
+}
+
+function checkpointScheduledHandoffQueue(store, source) {
+  const entry = handoffQueueFor(store,source);
+  if (!entry) return;
+  checkpointHandoffQueue(store,source,false);
+  // A scheduler tick can merely prune rate timestamps. It is never evidence
+  // that an absent rule was deliberately deleted. Preserve cached IDs and
+  // advance only the rules the scheduler actually still knows about.
+  const live = new Map(source.schedules.map(rule => [rule.id,rule]));
+  const schedules = entry.schedules.map(rule => live.get(rule.id) || rule);
+  if (JSON.stringify(schedules) !== JSON.stringify(entry.schedules)) {
+    entry.schedules = JSON.parse(JSON.stringify(schedules));
+    entry.updatedAt = Date.now();
+  }
+  const liveTasks = handoffOrdinaryTasks(source);
+  const liveById = new Map(liveTasks.map(task => [task.id,task]));
+  const cachedIds = new Set((entry.tasks || []).map(task => task.id));
+  const tasks = [...(entry.tasks || []).map(task => liveById.get(task.id) || task),
+    ...liveTasks.filter(task => !cachedIds.has(task.id))];
+  if (JSON.stringify(tasks) !== JSON.stringify(entry.tasks)) {
+    entry.tasks = tasks;
+    entry.updatedAt = Date.now();
+  }
+}
+
+function removeHandoffQueue(store, source) {
+  const entry = store.handoffQueues?.[source?.key];
+  if (!entry || entry.sourceKey !== source.key || entry.queueId !== source.handoff?.queueId ||
+      entry.token !== source.handoff?.token) return false;
+  delete store.handoffQueues[source.key];
+  return true;
+}
+
+function bindHandoffQueueDestination(store, source, destination, previousKey = null) {
+  const entry = handoffQueueFor(store,source);
+  if (!entry || entry.destinationKey !== previousKey) {
+    throw new Error("接力缓存归属不一致，已保留自动规则，请取消本轮后重新接力");
+  }
+  destination.handoffCacheKey = source.key;
+  destination.handoffQueueId = entry.queueId;
+  entry.destinationKey = destination.key;
+  if (destination.key.startsWith("chat:")) entry.confirmedChatKey = destination.key;
+}
+
+function maintainHandoffQueues(store) {
+  let changed = false;
+  if (!store.handoffQueues) { store.handoffQueues = {}; changed = true; }
+  // Upgrade only legacy transactions with no cache identity. A modern missing
+  // cache must remain an explicit failure, never silently rebuilt from []
+  // after a transient source-state problem.
+  for (const source of Object.values(store.conversations)) {
+    const handoff = source.handoff;
+    if (source.handoffSourceKey || !chatKey(source.url) || !CQHandoff.projectId(source.url) ||
+        !["queued","due","summarizing","opening","navigating","bootstrapping","failed"].includes(handoff?.phase)) continue;
+    if (!handoff.queueId && !store.handoffQueues[source.key]) {
+      handoff.queueId = id();
+      handoff.token ||= id();
+      for (const task of source.tasks) {
+        if (task.kind === "handoff_summary") task.handoffQueueId = handoff.queueId;
+      }
+      createHandoffQueue(store,source);
+      const destination = store.conversations[handoff.destinationKey];
+      if (destination?.handoffSourceKey === source.key && destination.handoffToken === handoff.token &&
+          source.tabId === destination.tabId && sameDraftScope(source.url,destination.url)) {
+        bindHandoffQueueDestination(store,source,destination);
+        for (const task of destination.tasks) {
+          if (task.kind === "handoff_intro") task.handoffQueueId = handoff.queueId;
+        }
+      }
+      changed = true;
+    }
+    const cache = handoffQueueFor(store,source);
+    if (cache && cache.taskSnapshotVersion == null) {
+      cache.tasks = handoffOrdinaryTasks(source);
+      cache.taskSnapshotVersion = 1;
+      if (cache.destinationKey?.startsWith("chat:")) cache.confirmedChatKey = cache.destinationKey;
+      changed = true;
+    }
+    // Rule edits and automatic refills checkpoint explicitly at their mutation
+    // sites. A generic read/save must never overwrite the cache with a live []
+    // that disappeared while a page or worker was being reattached.
+  }
+  for (const key of Object.keys(store.handoffQueues)) {
+    const source = store.conversations[key];
+    if (!source || (!source.handoff?.queueId && ["idle","completed"].includes(source.handoff?.phase))) {
+      delete store.handoffQueues[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function handoffState(state) {
   return state.handoff || (state.handoff = CQHandoff.defaults());
 }
 
 function handoffBusy(state) {
-  return Boolean(state.handoff && !["idle", "completed"].includes(state.handoff.phase));
+  return Boolean(state.handoff && !["idle", "queued", "completed"].includes(state.handoff.phase));
 }
 
-function maybeRequestHandoff(state, now = Date.now()) {
+function handoffCounts(handoff) {
+  // Older configurations had no quota and remain unlimited after upgrade.
+  const repeatCount = handoff?.repeatCount === -1 ||
+    Number.isInteger(handoff?.repeatCount) && handoff.repeatCount >= 1 &&
+    handoff.repeatCount <= MAX_REPEAT_COUNT ? handoff.repeatCount : -1;
+  const remainingCount = repeatCount === -1 ? -1 :
+    Number.isInteger(handoff?.remainingCount) && handoff.remainingCount >= 0
+      ? Math.min(repeatCount, handoff.remainingCount) : repeatCount;
+  return {repeatCount,remainingCount};
+}
+
+function enqueueHandoff(store, state, trigger, now = Date.now()) {
+  const handoff = handoffState(state);
+  if (state.tasks.some((task) => task.kind === "handoff_summary")) return false;
+  const summary = newTask(CQHandoff.summaryPrompt(handoff.topicTitle));
+  summary.kind = "handoff_summary";
+  summary.handoffTrigger = trigger;
+  state.tasks.push(summary);
+  Object.assign(handoff,handoffCounts(handoff),{
+    phase:"queued",trigger,manualRequested:trigger === "manual",
+    nextAt:null,changedAt:now,queueId:id(),token:id(),
+  });
+  summary.handoffQueueId = handoff.queueId;
+  delete handoff.destinationKey;
+  createHandoffQueue(store,state,now);
+  delete handoff.error;
+  delete handoff.cancelRequested;
+  recordHistory(state,trigger === "manual" ? "handoff_manual" : "handoff_due",summary.id,now);
+  return true;
+}
+
+function maybeRequestHandoff(store, state, now = Date.now()) {
+  if (state.parkedDraft) return false;
   const handoff = state.handoff;
-  if (!handoff?.enabled || !Number.isFinite(handoff.nextAt)) return false;
-  const pending = state.tasks.some((task) => task.status === "pending");
-  // An explicit user-requested handoff may be solely about preserving chat
-  // context: unlike a timer, it must continue even with an empty queue.
-  if (handoff.phase === "due" && !handoff.manualRequested &&
-      !pending && !state.activeTaskId) {
-    handoff.phase = "idle";
-    handoff.nextAt = now + handoff.intervalMinutes * 60_000;
+  if (!handoff || state.handoffSourceKey || !chatKey(state.url) ||
+      !CQHandoff.projectId(state.url)) return false;
+  // Convert an older unsent due state into the same durable queue command.
+  if (handoff.phase === "due") {
+    return enqueueHandoff(store,state,handoff.manualRequested ? "manual" : "automatic",now);
+  }
+  if (!handoff.enabled || handoff.phase !== "idle" ||
+      !Number.isFinite(handoff.nextAt) || now < handoff.nextAt) return false;
+  if (handoffCounts(handoff).remainingCount === 0) {
+    handoff.enabled = false;
+    handoff.nextAt = null;
     return true;
   }
-  if (handoff.phase !== "idle" || now < handoff.nextAt || !pending ||
-      state.halted || !CQHandoff.projectId(state.url)) return false;
-  handoff.phase = "due";
-  handoff.changedAt = now;
-  recordHistory(state, "handoff_due", null, now);
-  return true;
+  // Countdown expiry queues one command even without ordinary pending work.
+  // Pausing only prevents dispatch; it never loses an expired countdown.
+  return enqueueHandoff(store,state,"automatic",now);
 }
 
 function failHandoff(source, reason, now = Date.now()) {
@@ -1638,16 +2866,184 @@ function failHandoff(source, reason, now = Date.now()) {
   return true;
 }
 
+function syncFailedHandoffDestination(store, destination, now = Date.now()) {
+  if (!destination.handoffSourceKey) return false;
+  const source = store.conversations[destination.handoffSourceKey];
+  const handoff = source?.handoff;
+  if (!handoff || handoff.token !== destination.handoffToken ||
+      handoff.destinationKey !== destination.key || source.tabId !== destination.tabId) return false;
+  const intro = destination.tasks.find((task) => task.kind === "handoff_intro");
+  const uncertain = destination.halted &&
+    VOICE_RECOVERABLE_HALTS.has(destination.haltReason) &&
+    intro && ["dispatching","waiting"].includes(intro.status);
+  if (handoff.phase !== "failed" && intro &&
+      !["error","interrupted"].includes(intro.status) && !uncertain) return false;
+  // An intro failure cannot become an ordinary recovered queue: the source
+  // still owns its tasks. Keep both ends visibly failed until explicit review.
+  let changed = false;
+  if (uncertain) {
+    intro.status = "error";
+    intro.error ||= "交接开场发送状态不确定，不会自动重发；请返回原对话核对接力。";
+    changed = true;
+  }
+  const reason = !intro
+    ? "新对话的交接开场记录缺失，无法确认是否已发送；旧队列仍在原对话，请人工核对。"
+    : intro.error || handoff.error || "新对话接收交接中断；旧队列仍在原对话，请人工核对。";
+  changed = failHandoff(source, reason, now) || changed;
+  if (!destination.halted) { destination.halted = true; changed = true; }
+  if (destination.haltReason !== "user" && destination.haltReason !== "failure") {
+    destination.haltReason = "failure";
+    changed = true;
+  }
+  if (intro && ["error","interrupted"].includes(intro.status) &&
+      destination.activeTaskId === intro.id) {
+    destination.activeTaskId = null;
+    changed = true;
+  }
+  if (destination.error !== reason) { destination.error = reason; changed = true; }
+  if (destination.handoff?.phase !== "failed" || destination.handoff?.error !== reason) {
+    destination.handoff = {...(destination.handoff || CQHandoff.defaults()),
+      enabled:false,nextAt:null,phase:"failed",error:reason,changedAt:now};
+    changed = true;
+  }
+  return changed;
+}
+
 function cancelHandoffState(source, now = Date.now()) {
   const current = source.handoff || CQHandoff.defaults();
   const minutes = Number.isInteger(current.intervalMinutes)
     ? current.intervalMinutes : CQHandoff.DEFAULT_MINUTES;
+  const counts = handoffCounts(current);
+  const enabled = current.enabled === true && counts.remainingCount !== 0;
   source.handoff = {
-    enabled:current.enabled === true, intervalMinutes:minutes,
-    nextAt:current.enabled === true ? now + minutes * 60_000 : null,
+    enabled, intervalMinutes:minutes,...counts,
+    nextAt:enabled ? now + minutes * 60_000 : null,
     phase:"idle",
+    ...(current.topicTitle ? {topicTitle:current.topicTitle} : {}),
   };
   recordHistory(source,"handoff_cancelled",null,now);
+}
+
+function clearCancelledHandoffHalt(state) {
+  if (state.activeTaskId || state.steeringTaskId ||
+      state.tasks.some(task => ["error","interrupted"].includes(task.status))) return;
+  if (state.halted && !["failure","timeout","uncertain","state_inconsistent"].includes(state.haltReason)) return;
+  state.halted = false;
+  state.haltReason = null;
+  state.haltAtUserCount = null;
+  state.error = "";
+  state.lastQueueSettledAt = Date.now();
+}
+
+// Cancellation removes only the internal rows of this transaction. The
+// receiving draft is a real queue too: it may now contain ordinary tasks.
+// Never delete that whole session, or leave its token to re-fail on GET.
+function cancelHandoffTransaction(store, state, options = {}) {
+  let source = state;
+  let destination = null;
+  if (state.handoffSourceKey || !state.handoff?.token &&
+      state.tasks.some(task => task.kind === "handoff_intro")) {
+    destination = state;
+    const linked = store.conversations[state.handoffSourceKey];
+    const handoff = linked?.handoff;
+    if (handoff?.token && handoff.token === state.handoffToken &&
+        handoff.queueId === state.handoffQueueId && state.handoffCacheKey === linked.key &&
+        handoff.destinationKey === state.key && linked.tabId === state.tabId) {
+      source = linked;
+    } else {
+      // Older versions cancelled the receiver's local phase but left this
+      // link behind. Explicit cancellation can retire that orphan intro.
+      source = null;
+    }
+  } else if (source.handoff?.destinationKey) {
+    destination = store.conversations[source.handoff.destinationKey] || null;
+    if (destination && (destination.handoffSourceKey !== source.key ||
+        destination.handoffToken !== source.handoff.token || destination.tabId !== source.tabId ||
+        destination.handoffQueueId !== source.handoff.queueId || destination.handoffCacheKey !== source.key)) {
+      destination = null; // A newer/unrelated destination must remain intact.
+    }
+  }
+  const handoff = source?.handoff;
+  const internal = state.tasks.some(task => ["handoff_summary","handoff_intro"].includes(task.kind));
+  if (!destination && !internal && !["queued","due","summarizing","opening","navigating","bootstrapping","failed"]
+      .includes(handoff?.phase)) {
+    return false; // Repeated explicit cancellation is harmless.
+  }
+  const activeSummary = source?.tasks.find(task => task.id === source.activeTaskId &&
+    task.kind === "handoff_summary" && ["dispatching","waiting"].includes(task.status));
+  if (activeSummary) {
+    source.handoff.cancelRequested = true;
+    source.handoff.changedAt = Date.now();
+    return true;
+  }
+  const intros = destination?.tasks.filter(task => task.kind === "handoff_intro") || [];
+  if (intros.some(task => task.status !== "pending") && options.reviewed !== true) {
+    throw new Error("请核对已发送的交接消息后确认取消；不会重新发送该消息");
+  }
+  if (source) {
+    const summaryIds = new Set(source.tasks.filter(task => task.kind === "handoff_summary").map(task => task.id));
+    source.tasks = source.tasks.filter(task => !summaryIds.has(task.id));
+    if (summaryIds.has(source.activeTaskId)) source.activeTaskId = null;
+    const cache = handoffQueueFor(store,source);
+    if (cache) {
+      source.schedules = JSON.parse(JSON.stringify(cache.schedules));
+      if (Array.isArray(cache.tasks)) source.tasks = JSON.parse(JSON.stringify(cache.tasks));
+    }
+    removeHandoffQueue(store,source);
+    cancelHandoffState(source);
+    if (options.pauseAfter === true && source === state) source.queuePaused = true;
+    clearCancelledHandoffHalt(source);
+  }
+  if (destination) {
+    const introIds = new Set(intros.map(task => task.id));
+    destination.tasks = destination.tasks.filter(task => !introIds.has(task.id));
+    if (introIds.has(destination.activeTaskId)) destination.activeTaskId = null;
+    if (introIds.has(destination.steeringTaskId)) destination.steeringTaskId = null;
+    delete destination.handoffSourceKey;
+    delete destination.handoffToken;
+    delete destination.handoffCacheKey;
+    delete destination.handoffQueueId;
+    destination.handoff = {...CQHandoff.defaults(),phase:"idle"};
+    recordHistory(destination,"handoff_cancelled");
+    clearCancelledHandoffHalt(destination);
+  }
+  return false;
+}
+
+// A tab can visit several project composers. Retain the previous visit in
+// storage, outside the live draft slot, instead of blocking the new project
+// or exposing its stale receiving task. Returning restores that exact scope.
+function switchDraftScope(store, tabId, url) {
+  const key = `draft:${tabId}`;
+  const current = store.conversations[key];
+  if (current && sameDraftScope(current.url,url)) return false;
+  let changed = false;
+  const move = (draft,nextKey) => {
+    const oldKey = draft.key;
+    const source = store.conversations[draft.handoffSourceKey];
+    const cache = source && handoffQueueFor(store,source,draft);
+    delete store.conversations[oldKey];
+    draft.key = nextKey;
+    store.conversations[nextKey] = draft;
+    if (source?.handoff?.token && source.handoff.token === draft.handoffToken &&
+        source.handoff.destinationKey === oldKey) {
+      source.handoff.destinationKey = nextKey;
+      if (cache) cache.destinationKey = nextKey;
+    }
+  };
+  if (current) {
+    move(current,`draft:${tabId}:parked:${id()}`);
+    current.parkedDraft = true;
+    changed = true;
+  }
+  const parked = Object.values(store.conversations).find(draft =>
+    draft.parkedDraft === true && draft.tabId === tabId && sameDraftScope(draft.url,url));
+  if (parked) {
+    move(parked,key);
+    delete parked.parkedDraft;
+    changed = true;
+  }
+  return changed;
 }
 
 function timeoutHandoff(state, now = Date.now()) {
@@ -1661,7 +3057,10 @@ function timeoutHandoff(state, now = Date.now()) {
   if (handoff.phase === "opening" && now - handoff.changedAt > 5 * 60_000) {
     return failHandoff(state, "生成总结后未能自动进入新对话，旧队列仍在原对话；可取消交接后继续。", now);
   }
-  if (handoff.phase === "navigating" && now - handoff.changedAt > 5 * 60_000) {
+  // No introduction has been sent in this phase. Give the native project
+  // entry the same recovery window as bootstrap instead of failing while a
+  // discarded/spinning page is being restored by the background/content loop.
+  if (handoff.phase === "navigating" && now - handoff.changedAt > 60 * 60_000) {
     return failHandoff(state, "无法确认已进入项目新对话。请返回原对话取消接力，旧队列仍然保留。", now);
   }
   if (handoff.phase === "bootstrapping" && now - handoff.changedAt > 60 * 60_000) {
@@ -1693,17 +3092,32 @@ function attachProjectHandoff(store, sender, url) {
     return true;
   }
   const draft = blankSession(draftKey, safeUrl(url), tabId);
-  const intro = newTask(CQHandoff.introduction(source.handoff.summary));
+  const intro = newTask(CQHandoff.introduction(source.handoff.summary, source.handoff.topicTitle));
   intro.kind = "handoff_intro";
-  draft.tasks.push(intro);
+  intro.handoffQueueId = source.handoff.queueId;
+  // The first message creates ChatGPT's conversation ID. Place it FIRST;
+  // original tasks stay at the source until the new reply is confirmed.
+  draft.tasks.unshift(intro);
   draft.handoffSourceKey = source.key;
   draft.handoffToken = source.handoff.token;
+  bindHandoffQueueDestination(store,source,draft);
   store.conversations[draftKey] = draft;
   source.handoff.phase = "bootstrapping";
   source.handoff.destinationKey = draftKey;
   source.handoff.changedAt = Date.now();
   recordHistory(source, "handoff_new_chat");
   return true;
+}
+
+function activeProjectHandoffDraft(store, key, sender, url) {
+  const draft = store.conversations[key];
+  const source = store.conversations[draft?.handoffSourceKey];
+  const handoff = source?.handoff;
+  return Boolean(draft && source && handoff && draft.tabId === sender.tab?.id &&
+    CQHandoff.isProjectStart(url, handoff.projectId) &&
+    handoff.phase === "bootstrapping" && handoff.destinationKey === key &&
+    handoff.token === draft.handoffToken && handoffQueueFor(store,source,draft) && draft.tasks.some((task) =>
+      task.kind === "handoff_intro"));
 }
 
 function finishHandoffTransfer(store, destination, task, url) {
@@ -1718,29 +3132,51 @@ function finishHandoffTransfer(store, destination, task, url) {
       destination.tasks.length !== 1 || destination.tasks[0].id !== task.id) {
     throw new Error("无法验证同项目对话接力关系，旧队列保持不变");
   }
+  const cache = handoffQueueFor(store,source,destination);
+  if (!cache || task.handoffQueueId !== cache.queueId) {
+    throw new Error("接力缓存缺失或队列 ID 不匹配，自动规则未迁移；请导出 DEBUG 后核对");
+  }
+  if (cache.confirmedChatKey !== destination.key || !Array.isArray(cache.tasks) ||
+      cache.tasks.some(item => ["dispatching","waiting","steering","steering_wait"].includes(item.status))) {
+    throw new Error("新对话 ID 或待办缓存尚未完整确认，已保留本轮任务和自动规则");
+  }
+  if (destination.schedules.length) {
+    throw new Error("接收对话已有自动规则，已停止覆盖，请先核对本次接力");
+  }
   // One durable storage write moves all references together. Images live in
   // IndexedDB and are NOT copied or deleted; their IDs remain referenced.
-  destination.tasks = source.tasks;
-  destination.schedules = source.schedules;
-  for (const field of ["queuePaused","compactView","autoOpenTab",
-                       "sendCooldownSeconds","countRateLimit","countRateTimes",
-                       "lastQueueSettledAt","lastTimeScheduleId","lastCountScheduleId"]) {
-    if (source[field] !== undefined) destination[field] = source[field];
-  }
+  const receiverPaused = destination.queuePaused === true;
+  destination.tasks = JSON.parse(JSON.stringify(cache.tasks));
+  destination.schedules = JSON.parse(JSON.stringify(cache.schedules));
+  Object.assign(destination,handoffQueueSettings(cache.settings));
+  if (receiverPaused) destination.queuePaused = true;
+  // Receipt carries the logical relay queue ID without exposing it to the AI.
+  destination.receivedHandoffQueueId = cache.queueId;
+  removeHandoffQueue(store,source);
   destination.lastQueueSettledAt = Date.now();
+  const counts = handoffCounts(handoff);
+  if ((handoff.trigger === "automatic" ||
+       !handoff.trigger && !handoff.manualRequested) && counts.remainingCount > 0) {
+    counts.remainingCount -= 1;
+  }
+  const enabled = handoff.enabled === true && counts.remainingCount !== 0;
   destination.handoff = {
-    enabled: handoff.enabled, intervalMinutes:handoff.intervalMinutes,
-    nextAt:Date.now() + handoff.intervalMinutes * 60_000, phase:"idle",
+    enabled, intervalMinutes:handoff.intervalMinutes,...counts,
+    nextAt:enabled ? Date.now() + handoff.intervalMinutes * 60_000 : null, phase:"idle",
+    ...(handoff.topicTitle ? {topicTitle:handoff.topicTitle} : {}),
   };
   source.tasks = [];
   source.schedules = [];
   source.autoOpenTab = false;
   source.handoff = {
-    enabled:false,intervalMinutes:handoff.intervalMinutes,nextAt:null,
+    enabled:false,intervalMinutes:handoff.intervalMinutes,...counts,nextAt:null,
     phase:"completed",destinationKey:destination.key,changedAt:Date.now(),
+    ...(handoff.topicTitle ? {topicTitle:handoff.topicTitle} : {}),
   };
   delete destination.handoffSourceKey;
   delete destination.handoffToken;
+  delete destination.handoffCacheKey;
+  delete destination.handoffQueueId;
   recordHistory(source,"handoff_completed");
   recordHistory(destination,"handoff_received");
 }
@@ -1876,7 +3312,12 @@ function createBackupMetadata(state) {
     exportedAt: new Date().toISOString(),
     conversation: {
       key: state.key,
-      tasks: state.tasks.map((task) => copy(backupTask(task))),
+      // Relay commands are state-machine operations, never ordinary prompts
+      // that a backup restore may replay outside the handoff lifecycle.
+      tasks: state.tasks.filter((task) =>
+        !["handoff_summary","handoff_intro"].includes(task.kind)).map((task) => copy(backupTask(task))),
+      omittedHandoffTasks:state.tasks.filter((task) =>
+        ["handoff_summary","handoff_intro"].includes(task.kind)).length,
       schedules: state.schedules.map((rule) => copy(backupRule(rule))),
       countRateLimit: countRateLimit(state),
     },
@@ -1930,7 +3371,10 @@ async function createConversationBackup(state) {
   }
   const conversation = {
     key: state.key,
-    tasks: state.tasks.map(backupTask),
+    tasks: state.tasks.filter((task) =>
+      !["handoff_summary","handoff_intro"].includes(task.kind)).map(backupTask),
+    omittedHandoffTasks:state.tasks.filter((task) =>
+      ["handoff_summary","handoff_intro"].includes(task.kind)).length,
     schedules: state.schedules.map(backupRule),
     countRateLimit: countRateLimit(state),
   };
@@ -2039,6 +3483,9 @@ function prepareConversationRestore(backup, key, maxPending, stagedImages = null
     if (!old || typeof old.id !== "string" || !old.id || taskIds.has(old.id)) {
       throw new Error("备份中存在重复或无效的队列任务");
     }
+    if (["handoff_summary","handoff_intro"].includes(old.kind)) {
+      throw new Error("备份包含内部交接命令，不能作为普通任务恢复；请重新导出队列备份");
+    }
     taskIds.add(old.id);
     const images = refs(old.images);
     const text = requirePrompt(old.text, images.length > 0);
@@ -2115,6 +3562,11 @@ function imageReferences(store) {
   }
   for (const session of Object.values(store.conversations)) {
     for (const item of [...session.tasks, ...session.schedules]) {
+      for (const image of item.images || []) ids.add(image.id);
+    }
+  }
+  for (const cache of Object.values(store.handoffQueues || {})) {
+    for (const item of [...(cache.schedules || []),...(cache.tasks || [])]) {
       for (const image of item.images || []) ids.add(image.id);
     }
   }
@@ -2290,6 +3742,7 @@ function enqueueScheduledTask(state, schedule, now) {
 }
 
 function dueSchedules(state, now = Date.now(), maxPending = DEFAULT_PENDING_LIMIT) {
+  if (state.parkedDraft) return false;
   // Scheduled rules move together with the queue; do not create more items
   // in a source conversation while its handoff is suspended or in transit.
   if (handoffBusy(state)) return false;
@@ -2374,15 +3827,23 @@ function dueSchedules(state, now = Date.now(), maxPending = DEFAULT_PENDING_LIMI
   return changed;
 }
 
+function dispatchTimeoutBudget(task) {
+  return ["handoff_summary","handoff_intro"].includes(task?.kind) &&
+    !Number.isFinite(task.sendArmedAt) ? HANDOFF_PREPARE_TIMEOUT_MS : DISPATCH_TIMEOUT_MS;
+}
+
 function checkTimeout(state, now = Date.now()) {
   const active = state.tasks.find((task) => task.id === state.activeTaskId);
   if (!active) return false;
-  const started = active.sentAt || active.claimedAt || now;
-  const timeout = active.status === "waiting" ? WAIT_TIMEOUT_MS : DISPATCH_TIMEOUT_MS;
+  const started = active.sentAt || active.sendArmedAt || active.claimedAt || now;
+  const timeout = active.status === "waiting" ? WAIT_TIMEOUT_MS : dispatchTimeoutBudget(active);
   if (now - started <= timeout) return false;
   const wasWaiting = active.status === "waiting";
   active.status = "error";
-  active.error = "等待超时，无法确认是否成功发送/回复；请人工检查后恢复。";
+  active.error = wasWaiting ? "等待回复超时；请人工检查后恢复。" :
+    ["handoff_summary","handoff_intro"].includes(active.kind) && !Number.isFinite(active.sendArmedAt)
+      ? "交接正文准备超时，已停止自动发送；请核对输入框和聊天记录后恢复。"
+      : "发送确认超时，无法确认是否成功发送；请人工检查后恢复，不会自动重发。";
   state.activeTaskId = null;
   state.halted = true;
   state.haltReason = "timeout";
@@ -2394,6 +3855,42 @@ function checkTimeout(state, now = Date.now()) {
   return true;
 }
 
+function releaseSteerReservation(state, task, now = Date.now()) {
+  // Before Send is armed, a queue instruction may return to its old position;
+  // a typed shortcut must remain a draft rather than becoming queued work.
+  // Once native Stop was requested, the old turn is no completion evidence.
+  if (Number.isFinite(task.steerPauseRequestedAt)) {
+    const active = state.tasks.find((item) => item.id === state.activeTaskId &&
+      item.id === task.steerActiveTaskId);
+    if (active?.status === "waiting") {
+      active.status = "interrupted";
+      active.error = "引导已暂停原回复，但新指令未发送；请核对后手动继续，此任务不会自动重发。";
+      state.activeTaskId = null;
+      state.lastQueueSettledAt = now;
+    }
+    state.queuePaused = true;
+    state.error = "引导未发送，已暂停自动队列；请核对原回复后手动继续。";
+  }
+  if (task.steerFromComposer === true) {
+    // A failed Ctrl+Enter must never quietly become an ordinary queued send.
+    // Keep a review record only if Stop has already affected the old reply.
+    if (Number.isFinite(task.steerPauseRequestedAt)) {
+      task.status = "error";
+      task.error = "快捷引导未发送，指令已保留供核对；不会自动入队发送。";
+    } else {
+      state.tasks.splice(state.tasks.indexOf(task),1);
+    }
+    state.steeringTaskId = null;
+    return;
+  }
+  task.status = "pending";
+  delete task.steerPauseRequestedAt;
+  delete task.steerPauseAssistantCount;
+  delete task.steerPauseAssistantId;
+  delete task.steerActiveTaskId;
+  state.steeringTaskId = null;
+}
+
 function checkSteerTimeout(state, now = Date.now()) {
   const task = state.tasks.find((item) => item.id === state.steeringTaskId);
   if (!task) {
@@ -2403,8 +3900,7 @@ function checkSteerTimeout(state, now = Date.now()) {
   }
   if (task.status === "steering" && now - task.steerClaimedAt > STEER_RESERVE_TIMEOUT_MS) {
     // The native Send button was never armed. It is safe to restore the item.
-    task.status = "pending";
-    state.steeringTaskId = null;
+    releaseSteerReservation(state, task, now);
     return true;
   }
   if (task.status === "steering_wait" && now - task.steerClickedAt > STEER_CONFIRM_TIMEOUT_MS) {
@@ -2467,6 +3963,10 @@ function checkInFlightIntegrity(state, now = Date.now()) {
 async function reattachIfOldTabClosed(session, sender, url) {
   if (!session || session.key !== resolveKey(url, sender.tab?.id) || !sender.tab) return false;
   if (session.tabId === sender.tab.id) return false;
+  // During handoff the owning tab legitimately shows the destination URL.
+  // Opening the source in another tab must not steal that transaction owner.
+  if (session.handoffSourceKey || ["queued","due","summarizing","opening","navigating",
+      "bootstrapping","failed"].includes(session.handoff?.phase)) return false;
   try {
     const previousTab = await chrome.tabs.get(session.tabId);
     if (chatKey(previousTab.url) === session.key) {
@@ -2487,28 +3987,130 @@ async function handle(message, sender) {
   const url = safeUrl(message.url);
   const key = resolveKey(url, tabId);
   if (!key) throw new Error("只支持 ChatGPT 的有效对话页面");
-  let changed = adoptNewChat(store, sender, url, message.lastUserText);
-  if (key.startsWith("draft:")) {
+  if (key.startsWith("draft:") && message.type !== "HELLO" &&
+      safeUrl(sender.tab?.url) && !sameDraftScope(url,sender.tab.url) &&
+      Object.values(store.conversations).some(draft => draft.parkedDraft === true &&
+        draft.tabId === tabId && sameDraftScope(draft.url,url))) {
+    throw new Error("原接力页面已切换，已拒绝旧页面的迟到操作；当前项目队列不受影响");
+  }
+  let draftScopeChanged = false;
+  let previousDraft = key.startsWith("draft:") ? store.conversations[key] : null;
+  const projectVisitId = isProjectOverview(url) && typeof message.projectVisitId === "string" &&
+    /^[a-zA-Z0-9_-]{1,100}$/.test(message.projectVisitId) ? message.projectVisitId : null;
+  // A project homepage queue belongs only to this visit. A new visit may
+  // discard unsent work, while a sent first turn remains available to adopt.
+  if (previousDraft && projectVisitId && previousDraft.projectVisitId !== projectVisitId &&
+      message.type === "HELLO" && canDiscardProjectDraft(previousDraft)) {
+    delete store.conversations[key];
+    previousDraft = null;
+    draftScopeChanged = true;
+  }
+  if (key.startsWith("draft:") && message.type === "HELLO" &&
+      safeUrl(sender.tab?.url) === url &&
+      (previousDraft?.handoffSourceKey && !sameDraftScope(previousDraft.url,url) ||
+       !previousDraft && Object.values(store.conversations).some(draft =>
+         draft.parkedDraft === true && draft.tabId === tabId && sameDraftScope(draft.url,url)))) {
+    draftScopeChanged = switchDraftScope(store,tabId,url) || draftScopeChanged;
+    previousDraft = store.conversations[key] || null;
+  }
+  if (previousDraft && !sameDraftScope(previousDraft.url, url)) {
+    if (hasConversationWork(previousDraft) || previousDraft.handoffSourceKey) {
+      throw new Error("此标签页的新对话队列属于其他页面，请返回原页面处理，或另开标签页使用收藏");
+    }
+    previousDraft.url = url;
+    draftScopeChanged = true;
+  }
+  let projectHandoffAttached = false;
+  if (isProjectOverview(url)) {
+    // Ordinary project starts use the same owned draft queue as a new chat.
+    // An internal handoff must keep its isolated introduction-only gate.
+    projectHandoffAttached = message.type === "HELLO" &&
+      attachProjectHandoff(store, sender, url);
+    if (activeProjectHandoffDraft(store, key, sender, url) &&
+        !["HELLO","GET","CLAIM","SENT","FINISHED","FAIL","HANDOFF_SEND_READY",
+          "RELEASE_CLAIM","SCHEDULE_PULSE","ACK_COMPLETION_VIEWED",
+          "REPLY_COMPLETED","STOPPED","USER_RESUMED",
+          "RECOVER_ON_VOICE","CANCEL_HANDOFF","DELETE_TASK","SKIP_FAILED","ACK_RECOVERY",
+          "RETRY_UNSENT_HANDOFF"].includes(message.type)) {
+      throw new Error("项目主页仅允许正在进行的内部上下文接力");
+    }
+  }
+  const confirmingHandoff = message.type === "CONFIRM_HANDOFF";
+  const adoptionSelection = chatKey(url) ? selectHandoffAdoption(store,sender,url,
+    message.lastUserText,message.userCount,message.lastUserFolded === true,confirmingHandoff) : null;
+  const adoptionObservation = adoptionSelection?.observation?.source
+    ? {...adoptionSelection.observation,reason:adoptionSelection.reason} : null;
+  let confirmPageCurrent = true;
+  if (confirmingHandoff) {
+    try { confirmPageCurrent = safeUrl((await chrome.tabs.get(tabId)).url) === url; }
+    catch { confirmPageCurrent = false; }
+  }
+  const confirmAllowed = !confirmingHandoff || message.userCount === 1 && confirmPageCurrent;
+  if (!confirmAllowed && adoptionObservation) adoptionObservation.reason =
+    confirmPageCurrent ? "user_count_mismatch" : "owner_mismatch";
+  const destinationNoted = confirmPageCurrent && ["HELLO","CONFIRM_HANDOFF"].includes(message.type) &&
+    noteHandoffCreatedChat(store,sender,url);
+  const adopted = confirmAllowed && adoptNewChat(store, sender, url,
+    message.lastUserText, message.lastUserFolded === true,adoptionObservation,confirmingHandoff,message.userCount);
+  // A recovery probe is not a reservation or permission to bind an unrelated
+  // ordinary chat to a pending draft merely because the project matches.
+  const pendingNewChat = !confirmingHandoff && !adopted &&
+    pendingHandoffDraftForChat(store,sender,url);
+  const effectiveKey = pendingNewChat?.key || key;
+  let changed = adopted || destinationNoted ||
+    projectHandoffAttached || draftScopeChanged;
+  if (effectiveKey.startsWith("draft:") && !isProjectOverview(url) &&
+      !pendingNewChat) {
     changed = attachProjectHandoff(store, sender, url) || changed;
   }
-  const existing = store.conversations[key];
-  const state = sessionFor(store, key, url, tabId);
+  const existing = store.conversations[effectiveKey];
+  const state = sessionFor(store, effectiveKey, url, tabId);
+  if (isProjectOverview(url) && !state.handoffSourceKey) {
+    if (!projectVisitId) throw new Error("项目主页队列已更新，请刷新页面后使用");
+    if (state.projectVisitId && state.projectVisitId !== projectVisitId) {
+      throw new Error("上一轮新对话仍在发送，请先等待发送确认");
+    }
+    state.projectVisitId = projectVisitId;
+  }
   if (["HELLO", "SCHEDULE_PULSE", "CLAIM"].includes(message.type)) {
     changed = checkInFlightIntegrity(state) || changed;
   }
   // This also repairs an old Queue 0 + permanently-red-warning state before
   // the scheduler is evaluated or the UI is returned on HELLO / GET.
   changed = recoverObsoleteHalt(state) || changed;
+  changed = syncFailedHandoffDestination(store, state) || changed;
   let dispatch = null;
+  let sendReady = false;
+  let handoffPending = false;
+  let retryReady = false;
+  let cancelPending = null;
+  let dispatchBlockedReason = null;
+  let steerDeferred = false;
+  let enqueuedTaskId = null;
   let imagePayload = null;
   let backupPayload = null;
   let restoreTokenCompleted = null;
+  const requestTaskKind = state.tasks.find(task => task.id === message.id)?.kind;
   let imageHealth = null;
   const newImageIds = [];
   const maxPending = queueLimit(store);
 
   try {
   switch (message.type) {
+    case "CONFIRM_HANDOFF": {
+      const intro = state.tasks.find(task => task.id === state.activeTaskId &&
+        task.kind === "handoff_intro" && ["dispatching","waiting"].includes(task.status));
+      const source = store.conversations[state.handoffSourceKey];
+      handoffPending = Boolean(message.userCount === 1 && confirmPageCurrent &&
+        targetMatches(state,sender,url) && intro && source?.tabId === tabId &&
+        source.handoff?.phase === "bootstrapping" && !source.handoff.cancelRequested &&
+        !state.halted && !state.queuePaused && source.handoff.token &&
+        source.handoff.token === state.handoffToken && source.handoff.destinationKey === state.key &&
+        CQHandoff.projectId(source.url) === CQHandoff.projectId(url) &&
+        CQHandoff.textMatch(intro.text,message.lastUserText).matches);
+      break;
+    }
+
     case "ACK_COMPLETION_VIEWED": {
       if (!targetMatches(state, sender, url)) break;
       if (state.unreadCompleted === true) {
@@ -2719,17 +4321,30 @@ async function handle(message, sender) {
       if (!targetMatches(state, sender, url)) throw new Error("只能修改本对话的接力设置");
       if (typeof message.enabled !== "boolean") throw new Error("接力开关参数无效");
       const minutes = CQHandoff.requireMinutes(message.intervalMinutes);
+      const repeatCount = CQHandoff.requireRepeatCount(message.repeatCount ?? -1);
       if (message.enabled && (!chatKey(url) || !CQHandoff.projectId(url))) {
         throw new Error("仅支持 ChatGPT 原生项目内的已建立对话；请先在项目内打开一个聊天");
       }
       const handoff = handoffState(state);
-      if (!["idle","completed"].includes(handoff.phase)) {
+      if (!["idle","queued","completed"].includes(handoff.phase)) {
         throw new Error("接力正在进行或需要人工恢复，请先处理当前交接");
       }
+      if (!message.enabled && handoff.phase === "queued") {
+        state.tasks = state.tasks.filter((task) => !(task.kind === "handoff_summary" &&
+          task.status === "pending" && task.handoffTrigger === "automatic"));
+      }
+      const queued = state.tasks.find((task) =>
+        task.kind === "handoff_summary" && task.status === "pending");
+      if (!queued) removeHandoffQueue(store,state);
       state.handoff = {
         enabled:message.enabled,intervalMinutes:minutes,
-        nextAt:message.enabled ? Date.now() + minutes * 60_000 : null,
-        phase:"idle",
+        repeatCount,remainingCount:repeatCount,
+        nextAt:message.enabled && !queued ? Date.now() + minutes * 60_000 : null,
+        phase:queued ? "queued" : "idle",
+        ...(queued ? {trigger:queued.handoffTrigger,
+          manualRequested:queued.handoffTrigger === "manual",changedAt:handoff.changedAt,
+          queueId:handoff.queueId,token:handoff.token} : {}),
+        ...(handoff.topicTitle ? {topicTitle:handoff.topicTitle} : {}),
       };
       recordHistory(state, "handoff_setting");
       changed = true;
@@ -2739,92 +4354,63 @@ async function handle(message, sender) {
     case "HANDOFF_NOW": {
       if (!targetMatches(state, sender, url) || !chatKey(url) ||
           !CQHandoff.projectId(url)) {
-        throw new Error("只能在 ChatGPT 原生项目里的已建立对话中立即接力");
-      }
-      if (state.halted || state.queuePaused) {
-        throw new Error("队列已暂停或需要核对，请先恢复自动发送再立即接力");
+        throw new Error("只能在 ChatGPT 原生项目里的已建立对话中添加交接命令");
       }
       if (state.handoffSourceKey) throw new Error("新对话正在接收交接，不能重复创建接力");
       const handoff = handoffState(state);
-      if (handoff.phase === "due") break; // Double click is idempotent.
+      if (["queued","due"].includes(handoff.phase)) break; // Double click is idempotent.
       if (!["idle","completed"].includes(handoff.phase)) {
         throw new Error("已有接力正在进行或等待人工处理，不能重复启动");
       }
-      // Reuse the same durable due state as the timer. The normal CLAIM gate
-      // waits for an active reply and sends the summary before any pending job.
-      handoff.phase = "due";
-      handoff.changedAt = Date.now();
-      handoff.manualRequested = true;
-      delete handoff.error;
-      recordHistory(state, "handoff_manual");
-      changed = true;
+      handoff.topicTitle = CQHandoff.topicTitle(sender.tab?.title) ||
+        CQHandoff.topicTitle(handoff.topicTitle);
+      changed = enqueueHandoff(store,state,"manual") || changed;
       break;
     }
 
     case "CANCEL_HANDOFF": {
-      if (!targetMatches(state, sender, url)) throw new Error("只能从原对话恢复旧队列");
-      const handoff = state.handoff;
-      if (!handoff || !["due","summarizing","opening","navigating","failed","bootstrapping"]
-        .includes(handoff.phase)) {
-        throw new Error("没有可以安全取消的接力");
+      if (!targetMatches(state,sender,url) && !pendingNewChat) {
+        throw new Error("只能取消当前页面所属的接力");
       }
-      if (handoff.phase === "summarizing") {
-        const activeSummary = state.tasks.find((task) =>
-          task.id === state.activeTaskId && task.kind === "handoff_summary" &&
-          ["dispatching","waiting"].includes(task.status));
-        if (activeSummary) {
-          // A native Send might already have happened. Keep its lock until
-          // RELEASE_CLAIM/FINISHED; never delete a possibly-sent active row.
-          if (!handoff.cancelRequested) {
-            handoff.cancelRequested = true;
-            handoff.changedAt = Date.now();
-            changed = true;
-          }
-          break;
-        }
-      }
-      const destination = store.conversations[handoff.destinationKey];
-      if (destination) {
-        const intro = destination.tasks.find((task) => task.kind === "handoff_intro");
-        if (!intro || destination.tasks.length !== 1 ||
-            destination.handoffToken !== handoff.token ||
-            destination.handoffSourceKey !== state.key) {
-          throw new Error("新对话队列状态无法确认；拒绝删除可能包含正常任务的对话");
-        }
-        if (intro.status !== "pending" && message.reviewed !== true) {
-          throw new Error("新对话可能已收到交接记录；请人工核对并明确确认后再恢复旧队列");
-        }
-        // Only the context-introduction row can be discarded here. No
-        // original work was ever copied before a successful FINISHED.
-        delete store.conversations[destination.key];
-      }
-      if (state.activeTaskId && state.tasks.some((task) =>
-          task.id === state.activeTaskId && task.kind === "handoff_summary")) {
-        throw new Error("总结消息仍在执行，不能中途取消");
-      }
-      state.tasks = state.tasks.filter((task) =>
-        task.kind !== "handoff_summary" ||
-        (task.status !== "pending" && task.status !== "error" && task.status !== "interrupted"));
-      cancelHandoffState(state);
-      // Recovery from a failed handoff may leave ordinary pending messages,
-      // including ones the user has already sent by hand. Let the UI request
-      // a paused recovery so those messages cannot be duplicated unattended.
-      if (message.pauseAfter === true) state.queuePaused = true;
-      if (state.halted && ["failure","timeout"].includes(state.haltReason) &&
-          !state.activeTaskId && !state.steeringTaskId &&
-          !state.tasks.some((task) => ["error","interrupted"].includes(task.status))) {
-        // User explicitly reviewed and abandoned the failed *summary* turn.
-        // This must never override an unrelated or user-initiated stop.
-        state.halted = false;
-        state.haltReason = null;
-        state.haltAtUserCount = null;
-        state.error = "";
-        state.lastQueueSettledAt = Date.now();
-      }
+      cancelPending = cancelHandoffTransaction(store,state,message);
       changed = true;
       break;
     }
-
+    case "RETRY_UNSENT_HANDOFF": {
+      const source = store.conversations[state.handoffSourceKey];
+      const handoff = source?.handoff;
+      const task = state.tasks.find(item => item.id === message.id);
+      const cache = handoffQueueFor(store,source,state);
+      const liveTab = await chrome.tabs.get(tabId);
+      if (!targetMatches(state,sender,url) || !isProjectOverview(url) ||
+          safeUrl(liveTab.url) !== url || liveTab.discarded === true ||
+          message.userRequested !== true || message.nativeBusy !== false || message.userCount !== 0 ||
+          state.queuePaused || state.haltReason === "user" || state.activeTaskId || state.steeringTaskId ||
+          !source || source.tabId !== tabId || source.halted || source.activeTaskId || source.steeringTaskId ||
+          !["failed","bootstrapping"].includes(handoff?.phase) || handoff.cancelRequested ||
+          !cache || cache.observedChatKey || cache.confirmedChatKey ||
+          !task || state.tasks.length !== 1 || task.kind !== "handoff_intro" || task.status !== "pending" ||
+          task.handoffQueueId !== cache.queueId || task.images?.length ||
+          task.sentAt != null || task.sendArmedAt != null) {
+        throw new Error("无法确认交接尚未发送，未替换草稿；请核对日志或取消本轮接力");
+      }
+      // Explicit retry of a never-armed introduction preserves this exact
+      // transaction and its cached work. Already-clicked/uncertain sends can
+      // never become pending through this action.
+      handoff.phase = "bootstrapping";
+      handoff.changedAt = Date.now();
+      delete handoff.error;
+      delete task.claimedAt;
+      delete task.retryNotBefore;
+      delete task.error;
+      state.handoff = CQHandoff.defaults();
+      clearCancelledHandoffHalt(state);
+      recordHistory(source,"handoff_retry",task.id);
+      recordHistory(state,"handoff_retry",task.id);
+      retryReady = true;
+      changed = true;
+      break;
+    }
     case "HANDOFF_NAVIGATE": {
       if (!targetMatches(state, sender, url) || state.handoff?.phase !== "opening") {
         throw new Error("交接导航尚未准备好");
@@ -2845,6 +4431,8 @@ async function handle(message, sender) {
       // includes a human-readable slug; repair old staged handoffs as well.
       handoff.projectId = projectId;
       handoff.projectUrl = CQHandoff.projectStart(url);
+      if (!handoffQueueFor(store,state)) throw new Error("本轮接力缓存缺失或不匹配，已停止导航");
+      checkpointHandoffQueue(store,state,false);
       handoff.phase = "navigating";
       handoff.changedAt = Date.now();
       changed = true;
@@ -2852,6 +4440,9 @@ async function handle(message, sender) {
     }
 
     case "RECOVER_ON_VOICE": {
+      // A failed destination is still tied to its original queue. Normal
+      // recovery would erase the visible error without completing transfer.
+      if (state.handoffSourceKey && state.handoff?.phase === "failed") break;
       // The page owns the Voice Mode readiness observation. Verify the same
       // evidence as FINISHED and the exact tab/chat binding before resuming.
       if (!targetMatches(state, sender, url) ||
@@ -2879,14 +4470,17 @@ async function handle(message, sender) {
       if (!state.url) state.url = url;
       if (state.tabId == null) state.tabId = tabId;
       // Do not automatically resume a conversation explicitly stopped by user.
-      state.tasks.push(newTask(text, null, images));
+      const queued = newTask(text, null, images);
+      state.tasks.push(queued);
+      enqueuedTaskId = queued.id;
+      if (message.priority === true) reorderPendingTasks(state, queued.id);
       markSubmission(state, requestId, fingerprint);
       changed = true;
       break;
     }
 
     case "ENQUEUE_FAVORITE": {
-      if (favoriteSenderKind(message, sender) !== "chat") {
+      if (await favoriteSenderKind(message, sender) !== "chat") {
         throw new Error("只能从 ChatGPT 对话把收藏加入队列");
       }
       const favorite = favoritesOf(store).find((item) => item.id === message.favoriteId);
@@ -2940,6 +4534,9 @@ async function handle(message, sender) {
     case "EDIT_TASK": {
       const task = state.tasks.find((item) => item.id === message.id);
       if (!task || task.status !== "pending") throw new Error("只能编辑未发送任务");
+      if (["handoff_summary","handoff_intro"].includes(task.kind)) {
+        throw new Error("交接命令不能编辑，请使用接力设置或取消交接");
+      }
       requirePrompt(message.text, Boolean((message.keepImageIds ?? task.images)?.length || message.images?.length));
       const images = await attachImages(task.images, message.keepImageIds, message.images || [], newImageIds);
       task.text = requirePrompt(message.text, images.length > 0);
@@ -2964,6 +4561,12 @@ async function handle(message, sender) {
     case "DELETE_TASK": {
       const idx = state.tasks.findIndex((task) => task.id === message.id);
       if (idx < 0) break;
+      if (["handoff_summary","handoff_intro"].includes(state.tasks[idx].kind)) {
+        if (!targetMatches(state,sender,url) && !pendingNewChat) throw new Error("只能删除当前页面的接力任务");
+        cancelPending = cancelHandoffTransaction(store,state,message);
+        changed = true;
+        break;
+      }
       if (state.tasks[idx].id === state.activeTaskId ||
           state.tasks[idx].id === state.steeringTaskId) {
         throw new Error("正在发送的任务不能删除，请等确认后再操作");
@@ -2973,23 +4576,94 @@ async function handle(message, sender) {
       break;
     }
 
+    case "DISMISS_WAITING": {
+      if (!targetMatches(state, sender, url)) {
+        throw new Error("只能移除当前对话正在等待的任务");
+      }
+      if (message.userRequested !== true || message.nativeBusy !== false) {
+        throw new Error("请在回复停止生成后，手动移除等待任务");
+      }
+      const index = state.tasks.findIndex((task) => task.id === message.id);
+      const task = state.tasks[index];
+      if (!task || task.id !== state.activeTaskId || task.status !== "waiting" ||
+          state.steeringTaskId || VOICE_RECOVERABLE_HALTS.has(state.haltReason) ||
+          state.haltReason === "state_inconsistent") {
+        throw new Error("只能移除已发送且正在等待的普通任务，请先核对发送状态");
+      }
+      if (["handoff_summary","handoff_intro"].includes(task.kind) || state.handoffSourceKey) {
+        throw new Error("上下文接力任务不能直接移除，请先处理当前接力");
+      }
+      // This is an explicit dismissal, not successful reply completion. Keep
+      // pause/error/unread flags and never return the sent row to pending.
+      state.tasks.splice(index, 1);
+      state.activeTaskId = null;
+      state.lastQueueSettledAt = Date.now();
+      changed = true;
+      break;
+    }
+
+    case "STEER_PROMPT_CLAIM":
     case "STEER_CLAIM": {
       if (!targetMatches(state, sender, url) || state.halted || handoffBusy(state)) {
         throw new Error("当前对话不可即时发送，请先返回原对话或核对暂停状态");
       }
-      if (state.steeringTaskId || state.activeTaskId &&
-          state.tasks.find((item) => item.id === state.activeTaskId)?.status !== "waiting") {
+      if (state.steeringTaskId) {
         throw new Error("已有消息正在发送，请稍后再引导");
       }
-      const task = state.tasks.find((item) => item.id === message.id);
+      const fromComposer = message.type === "STEER_PROMPT_CLAIM";
+      if (fromComposer && (safeUrl(sender.tab?.url) && safeUrl(sender.tab.url) !== url ||
+          message.images?.length)) throw new Error("原生草稿或页面已变化，未创建引导任务");
+      if (fromComposer && pendingCount(state) >= maxPending) throw new Error("队列已满，请先处理现有任务再引导");
+      const task = fromComposer ? newTask(requireText(message.text)) :
+        state.tasks.find((item) => item.id === message.id);
       if (!task || task.status !== "pending") throw new Error("只能引导待发送的队列任务");
+      if (["handoff_summary","handoff_intro"].includes(task.kind)) {
+        throw new Error("交接命令需要按队列顺序执行，不能即时引导发送");
+      }
       if (task.images?.length) throw new Error("图片任务只能按普通队列发送，暂不支持引导");
+      const active = state.tasks.find((item) => item.id === state.activeTaskId);
+      if (state.activeTaskId && active?.status !== "waiting") {
+        throw new Error("上一条任务正在发送，请稍后再引导");
+      }
+      if (active && ["handoff_summary","handoff_intro"].includes(active.kind)) {
+        throw new Error("正在交接上下文，请等待交接完成后再引导");
+      }
+      if (fromComposer) {
+        task.steerFromComposer = true;
+        state.tasks.push(task);
+      }
+      // Reserve first, then try native steering or stop/send only as fallback.
+      // Keep the original turn waiting until the continued reply
+      // completes; the transient idle surface after Stop must not finish it.
       task.status = "steering";
       task.steerClaimedAt = Date.now();
+      task.steerActiveTaskId = active?.id || null;
+      delete task.steerPauseRequestedAt;
+      delete task.steerPauseAssistantCount;
+      delete task.steerPauseAssistantId;
       task.steerBaselineUserCount = Number.isInteger(message.userCount) ? message.userCount : 0;
       task.steerBaselineUserId = typeof message.lastUserId === "string" ? message.lastUserId : null;
       state.steeringTaskId = task.id;
-      dispatch = { id: task.id, text: task.text };
+      dispatch = { id: task.id, text: task.text,
+        needsPause: Boolean(active || message.busy === true) };
+      changed = true;
+      break;
+    }
+
+    case "STEER_PAUSING": {
+      if (!targetMatches(state, sender, url) || state.halted || handoffBusy(state)) {
+        throw new Error("当前对话已暂停或正在交接，不能暂停回复进行引导");
+      }
+      const task = state.tasks.find((item) => item.id === message.id &&
+        item.id === state.steeringTaskId);
+      if (!task || task.status !== "steering") throw new Error("引导任务未被锁定，不能暂停回复");
+      // Persist BEFORE native Stop so a crash cannot mistake its idle result
+      // for completion of the original queued task.
+      task.steerPauseRequestedAt = Date.now();
+      task.steerPauseAssistantCount = Number.isInteger(message.assistantCount) &&
+        message.assistantCount >= 0 ? message.assistantCount : null;
+      task.steerPauseAssistantId = typeof message.lastAssistantId === "string" &&
+        message.lastAssistantId.length <= 1024 ? message.lastAssistantId : null;
       changed = true;
       break;
     }
@@ -2999,9 +4673,9 @@ async function handle(message, sender) {
       const task = state.tasks.find((item) => item.id === message.id &&
         item.id === state.steeringTaskId);
       if (!task || task.status !== "steering") break;
-      // No native Send click took place; keep its original queue order.
-      task.status = "pending";
-      state.steeringTaskId = null;
+      // No native Send click took place. Restore a queue row's order, or
+      // release a typed shortcut without turning it into a pending send.
+      releaseSteerReservation(state, task);
       changed = true;
       break;
     }
@@ -3032,6 +4706,9 @@ async function handle(message, sender) {
         message.newUserElement === true;
       if (!newTurn || !sameMessage(task.text, message.lastUserText)) {
         throw new Error("没有观察到属于这条引导任务的新用户消息");
+      }
+      if (Number.isFinite(task.steerPauseRequestedAt) && message.continuationObserved !== true) {
+        throw new Error("引导消息已发送，尚未观察到新回复继续生成，请继续等待");
       }
       const active = state.tasks.find((item) => item.id === state.activeTaskId);
       if (active?.status === "waiting") {
@@ -3191,6 +4868,21 @@ async function handle(message, sender) {
     case "SET_QUEUE_PAUSED":
       if (!targetMatches(state, sender, url)) throw new Error("只能暂停当前对话的自动发送");
       if (typeof message.paused !== "boolean") throw new Error("暂停参数必须是布尔值");
+      if (!message.paused && state.halted) {
+        // "Continue" is an explicit user action. It may clear a native Stop,
+        // but must never bypass an uncertain delivery or crash-safety hold.
+        if (state.haltReason !== "user") {
+          throw new Error("当前对话存在待核对的发送异常，请先核对后继续，不能直接恢复自动发送");
+        }
+        if (state.activeTaskId || state.steeringTaskId) {
+          throw new Error("上一条任务仍在处理，暂不能恢复自动发送");
+        }
+        state.halted = false;
+        state.haltReason = null;
+        state.haltAtUserCount = null;
+        state.error = "";
+        // Keep interrupted tasks quarantined: never resend a stopped reply.
+      }
       state.queuePaused = message.paused;
       changed = true;
       break;
@@ -3205,39 +4897,102 @@ async function handle(message, sender) {
       break;
 
     case "CLAIM": {
-      if (state.halted || state.queuePaused || state.activeTaskId || state.steeringTaskId ||
-          !targetMatches(state, sender, url) || !message.ready) break;
-      // Serialize the decision in the service worker: a stale tab or an old
-      // content script cannot skip this gate by polling CLAIM early.
-      // The manual button is an explicit send request. Do not impose the
-      // automatic queue's between-task cooldown on its summary message.
-      if (sendCooldownUntil(state) &&
-          !(state.handoff?.phase === "due" && state.handoff.manualRequested)) break;
-      changed = maybeRequestHandoff(state) || changed;
-      if (handoffBusy(state) && state.handoff.phase !== "due") break;
-      if (state.handoff?.phase === "due") {
-        const handoff = state.handoff;
-        if (!handoff.manualRequested &&
-            !state.tasks.some((item) => item.status === "pending")) {
-          handoff.phase = "idle";
-          handoff.nextAt = Date.now() + handoff.intervalMinutes * 60_000;
-          changed = true;
+      // An initially background tab may have missed ownership on HELLO.
+      // A foreground claimant can take over only an idle established chat.
+      if (chatKey(url) && sender.tab?.active === true && !ownerMatches(state, sender) &&
+          !state.activeTaskId && !state.steeringTaskId) {
+        changed = await reattachIfOldTabClosed(state, sender, url) || changed;
+      }
+      dispatchBlockedReason = state.halted ? "halted"
+        : state.queuePaused ? "paused"
+        : state.activeTaskId ? "active_task"
+        : state.steeringTaskId ? "steering"
+        : !ownerMatches(state, sender) ? "owner_mismatch"
+        : !targetMatches(state, sender, url) ? "target_mismatch"
+        : !message.ready ? "not_ready" : null;
+      if (dispatchBlockedReason) break;
+      // A pre-click RELEASE_CLAIM leaves the one summary pending. Continue
+      // that exact unsent row instead of blocking forever in summarizing or
+      // creating another summary. Uncertain/sent rows are never retried here.
+      const summaries = state.handoff?.phase === "summarizing"
+        ? state.tasks.filter((task) => task.kind === "handoff_summary") : [];
+      const retrySummary = summaries.length === 1 && summaries[0].status === "pending" &&
+        !state.handoff.cancelRequested ? summaries[0] : null;
+      changed = maybeRequestHandoff(store,state) || changed;
+      if (handoffBusy(state) && !retrySummary) {
+        dispatchBlockedReason = "busy_handoff";
+        break;
+      }
+      const task = retrySummary
+        ? (!retrySummary.retryNotBefore || Date.now() >= retrySummary.retryNotBefore ? retrySummary : null)
+        : state.tasks.find((item) => item.status === "pending" &&
+          (!item.retryNotBefore || Date.now() >= item.retryNotBefore));
+      if (!task) {
+        dispatchBlockedReason = retrySummary || state.tasks.some((item) => item.status === "pending")
+          ? "retry_wait" : "no_pending";
+        break;
+      }
+      if (task.kind === "handoff_intro") {
+        const cache = handoffQueueFor(store,store.conversations[state.handoffSourceKey],state);
+        if (!cache || task.handoffQueueId !== cache.queueId) {
+          throw new Error("本轮交接缓存或队列 ID 不匹配，已停止领取");
+        }
+      } else if (task.kind === "handoff_summary" &&
+          (!handoffQueueFor(store,state) || task.handoffQueueId !== state.handoff?.queueId)) {
+        throw new Error("本轮总结缓存或队列 ID 不匹配，已停止领取");
+      }
+      if (Object.hasOwn(message, "resumeHandoffTaskId")) {
+        // The page may reuse this exact unsent internal document in its native
+        // composer. The hint is not permission to pick another FIFO row or to
+        // restore any clicked, failed or delayed reservation.
+        const firstPending = state.tasks.find((item) => item.status === "pending");
+        let valid = typeof message.resumeHandoffTaskId === "string" &&
+          task.id === message.resumeHandoffTaskId && firstPending?.id === task.id &&
+          ["handoff_summary","handoff_intro"].includes(task.kind) && !task.images?.length;
+        if (valid && task.kind === "handoff_summary") {
+          valid = ["queued","summarizing"].includes(state.handoff?.phase) &&
+            !state.handoff.cancelRequested;
+        } else if (valid && task.kind === "handoff_intro") {
+          const source = store.conversations[state.handoffSourceKey];
+          const handoff = source?.handoff;
+          const projectId = CQHandoff.normalizeProjectId(handoff?.projectId);
+          valid = Boolean(source && source.tabId === state.tabId &&
+            typeof handoff?.token === "string" && handoff.token &&
+            handoff.token === state.handoffToken && handoff.destinationKey === state.key &&
+            handoff.phase === "bootstrapping" && projectId &&
+            CQHandoff.projectId(source.url) === projectId &&
+            CQHandoff.projectId(state.url) === projectId &&
+            CQHandoff.projectId(url) === projectId);
+        }
+        if (!valid) {
+          dispatchBlockedReason = "resume_handoff_mismatch";
           break;
         }
-        // Tag each request with unique visible delimiters. The assistant's
-        // matching reply proves which generation produced the summary, even if
-        // ChatGPT virtualizes or reformats the original user bubble.
-        handoff.requestId = id();
-        const summary = newTask(CQHandoff.summaryPrompt(handoff.requestId));
-        summary.kind = "handoff_summary";
-        state.tasks.unshift(summary);
-        handoff.phase = "summarizing";
-        handoff.changedAt = Date.now();
-        changed = true;
       }
-      const task = state.tasks.find((item) => item.status === "pending" &&
-        (!item.retryNotBefore || Date.now() >= item.retryNotBefore));
-      if (!task) break;
+      // A queued handoff occupies an ordinary FIFO slot. It must never make
+      // preceding tasks bypass their normal cooldown or jump to the front.
+      const manualSummary = task.kind === "handoff_summary" &&
+        (task.handoffTrigger === "manual" || state.handoff?.manualRequested === true);
+      if (sendCooldownUntil(state) && !manualSummary) {
+        dispatchBlockedReason = "cooldown";
+        break;
+      }
+      if (task.kind === "handoff_summary") {
+        const handoff = state.handoff;
+        if (!["queued","summarizing"].includes(handoff?.phase)) {
+          throw new Error("交接命令与接力状态不一致，请先取消交接后重试");
+        }
+        if (handoff.phase === "queued") {
+          delete handoff.requestId;
+          handoff.topicTitle = CQHandoff.topicTitle(sender.tab?.title) ||
+            CQHandoff.topicTitle(handoff.topicTitle);
+          task.text = CQHandoff.summaryPrompt(handoff.topicTitle);
+          handoff.trigger = task.handoffTrigger || (handoff.manualRequested ? "manual" : "automatic");
+          handoff.manualRequested = handoff.trigger === "manual";
+          handoff.phase = "summarizing";
+          handoff.changedAt = Date.now();
+        }
+      }
       task.status = "dispatching";
       task.claimedAt = Date.now();
       task.baselineUserCount = Math.max(0, Number(message.userCount) || 0);
@@ -3246,9 +5001,18 @@ async function handle(message, sender) {
         ? message.assistantCount : null;
       task.baselineAssistantId = typeof message.lastAssistantId === "string"
         ? message.lastAssistantId : null;
+      task.baselineAssistantSignature = typeof message.lastAssistantSignature === "string"
+        ? message.lastAssistantSignature : null;
       state.activeTaskId = task.id;
       dispatch = {
         id: task.id, text: task.text,
+        // Bind the send attempt to the route where it was reserved. The
+        // content script must keep this origin while awaiting the RPC and
+        // must release it there if the user changes conversations.
+        sourceUrl: url,
+        sourceSessionKey: state.key,
+        ...(state.projectVisitId ? {projectVisitId:state.projectVisitId} : {}),
+        ...(task.kind ? {kind:task.kind} : {}),
         images: task.images || [],
         baselineUserCount: task.baselineUserCount,
         baselineUserId: task.baselineUserId,
@@ -3287,6 +5051,49 @@ async function handle(message, sender) {
       break;
     }
 
+    case "HANDOFF_SEND_READY": {
+      const task = state.tasks.find(item => item.id === message.id &&
+        item.id === state.activeTaskId && item.status === "dispatching" &&
+        ["handoff_summary","handoff_intro"].includes(item.kind));
+      if (!targetMatches(state,sender,url) || !task || state.parkedDraft ||
+          state.halted || state.queuePaused || state.steeringTaskId ||
+          task.images?.length || Number.isFinite(task.sendArmedAt) ||
+          !Number.isFinite(task.claimedAt) ||
+          Date.now()-task.claimedAt > HANDOFF_PREPARE_TIMEOUT_MS) {
+        throw new Error("交接发送准备已失效或已确认过，拒绝再次发送；请核对当前任务");
+      }
+      const liveTab = await chrome.tabs.get(tabId);
+      if (safeUrl(liveTab.url) !== url || liveTab.discarded === true ||
+          safeUrl(sender.tab?.url) && safeUrl(sender.tab.url) !== url) {
+        throw new Error("交接页面已变化，拒绝发送到其他页面");
+      }
+      if (task.kind === "handoff_summary") {
+        if (state.handoff?.phase !== "summarizing" || state.handoff.cancelRequested ||
+            !chatKey(url) || !CQHandoff.projectId(url) || !handoffQueueFor(store,state) ||
+            task.handoffQueueId !== state.handoff.queueId) {
+          throw new Error("交接总结已取消或状态失效，拒绝发送");
+        }
+      } else {
+        const source = store.conversations[state.handoffSourceKey];
+        const handoff = source?.handoff;
+        const projectId = CQHandoff.normalizeProjectId(handoff?.projectId);
+        if (!source || source.tabId !== tabId || !handoff?.token ||
+            handoff.token !== state.handoffToken || handoff.destinationKey !== state.key ||
+            handoff.phase !== "bootstrapping" || handoff.cancelRequested || !projectId ||
+            !handoffQueueFor(store,source,state) || task.handoffQueueId !== handoff.queueId ||
+            CQHandoff.projectId(source.url) !== projectId ||
+            CQHandoff.projectId(state.url) !== projectId || CQHandoff.projectId(url) !== projectId) {
+          throw new Error("接收交接关系已失效或已取消，拒绝发送");
+        }
+      }
+      // Durable one-shot permission precedes the native click. A lost reply
+      // cannot be retried as another arm, or released into the pending queue.
+      task.sendArmedAt = Date.now();
+      sendReady = true;
+      changed = true;
+      break;
+    }
+
     case "RELEASE_CLAIM": {
       // The Voice Mode button disappeared or the composer changed BEFORE any
       // native Send click. Release the lock without sending or pausing.
@@ -3294,9 +5101,13 @@ async function handle(message, sender) {
       const task = state.tasks.find((item) => item.id === message.id &&
         item.id === state.activeTaskId && item.status === "dispatching");
       if (!task) break;
+      if (Number.isFinite(task.sendArmedAt)) {
+        throw new Error("交接发送已确认准备，无法回退重发；请核对原生聊天记录");
+      }
       if (task.kind === "handoff_summary" && state.handoff?.cancelRequested) {
         state.tasks.splice(state.tasks.indexOf(task),1);
         state.activeTaskId = null;
+        removeHandoffQueue(store,state);
         cancelHandoffState(state);
         changed = true;
         break;
@@ -3309,8 +5120,19 @@ async function handle(message, sender) {
     }
 
     case "SENT": {
-      if (!targetMatches(state, sender, url)) throw new Error("对话地址变化，拒绝确认发送");
+      // The first native Send may create /c/<id> before its user bubble
+      // arrives. Confirm the click against the still-owned draft, not an
+      // unrelated empty chat. HELLO will bind the real chat ID once visible.
+      const pendingIntroSend = pendingNewChat &&
+        pendingNewChat.active.id === message.id;
+      if (!targetMatches(state, sender, url) && !pendingIntroSend) {
+        throw new Error("对话地址变化，拒绝确认发送");
+      }
       const task = state.tasks.find((item) => item.id === message.id);
+      // The new document may already have confirmed the first native user
+      // turn and adopted its draft before the old script's SENT RPC arrived.
+      if (task && task.id === state.activeTaskId && task.status === "waiting" &&
+          (targetMatches(state,sender,url) || pendingIntroSend)) break;
       if (!task || task.id !== state.activeTaskId || task.status !== "dispatching") {
         // An async send from a previous chat must be reported as an error,
         // not silently acknowledged as sent in the newly opened chat.
@@ -3369,6 +5191,12 @@ async function handle(message, sender) {
           !Number.isFinite(task.sentAt) || Date.now() - task.sentAt < 1700) {
         throw new Error("尚未确认本轮回复完整结束，继续等待");
       }
+      if (task.kind === "handoff_summary" && !state.handoff?.cancelRequested &&
+          (message.handoffReplyIsNew !== true || message.handoffLastRole !== "assistant")) {
+        // A stable Voice control can precede reply hydration. Stay waiting
+        // rather than parse the prior assistant turn or lose the source queue.
+        throw new Error("尚未确认接力请求之后的下一条完整助手回复，继续等待");
+      }
       if (task.kind === "handoff_summary") {
         const handoff = state.handoff;
         if (handoff?.phase !== "summarizing") throw new Error("接力状态异常，旧队列未迁移");
@@ -3376,40 +5204,32 @@ async function handle(message, sender) {
           state.tasks.splice(state.tasks.indexOf(task),1);
           state.activeTaskId = null;
           state.lastQueueSettledAt = Date.now();
+          removeHandoffQueue(store,state);
           cancelHandoffState(state);
           changed = true;
           break;
         }
         try {
-          if (!handoff.manualRequested && !state.tasks.some((item) =>
-              item.id !== task.id && item.status === "pending")) {
-            // Timed handoffs still require queued work. Explicit manual
-            // handoffs can transfer context even if the queue is empty.
-            state.handoff = {
-              enabled:handoff.enabled,intervalMinutes:handoff.intervalMinutes,
-              nextAt:Date.now() + handoff.intervalMinutes * 60_000,phase:"idle",
-            };
-            recordHistory(state,"handoff_cancelled");
-          } else {
-            // A stale assistant message can contain old handoff markers. Only
-            // accept output when the newest user bubble is our summary request.
-            // Otherwise keep the source queue instead of transferring on
-            // unrelated/stale ChatGPT content.
-            if (!handoff.requestId && !sameMessage(message.handoffLastUserText, task.text)) {
-              throw new Error("未确认交接总结对应最新的用户请求，已保留旧队列");
-            }
-            const summary = CQHandoff.parseSummary(message.handoffSummary,handoff.requestId);
-            handoff.summary = summary;
-            handoff.token = id();
-            handoff.sourceUserCount = Number.isInteger(message.userCount)
-              ? message.userCount : null;
-            handoff.projectId = CQHandoff.projectId(url);
-            handoff.projectUrl = CQHandoff.projectStart(url);
-            if (!handoff.projectId) throw new Error("无法确认原生项目归属");
-            handoff.phase = "opening";
-            handoff.changedAt = Date.now();
-            recordHistory(state,"handoff_summary");
+          if (Number.isInteger(message.userCount) &&
+              message.userCount > task.baselineUserCount + 1) {
+            throw new Error("生成交接总结期间出现了额外用户消息，旧队列已保留；请重新接力");
           }
+          // The next assistant reply is identified by the pre-send
+          // assistant snapshot, not by its wording or marker formatting.
+          // ChatGPT may virtualize the full user request bubble.
+          const summary = CQHandoff.parseSummary(message.handoffSummary);
+          handoff.summary = summary;
+          handoff.topicTitle = CQHandoff.summaryTopic(summary) ||
+            CQHandoff.topicTitle(handoff.topicTitle);
+          if (!handoffQueueFor(store,state)) throw new Error("本轮接力缓存缺失或不匹配，旧队列已保留");
+          handoff.sourceUserCount = Number.isInteger(message.userCount)
+            ? message.userCount : null;
+          handoff.projectId = CQHandoff.projectId(url);
+          handoff.projectUrl = CQHandoff.projectStart(url);
+          if (!handoff.projectId) throw new Error("无法确认原生项目归属");
+          handoff.phase = "opening";
+          handoff.changedAt = Date.now();
+          recordHistory(state,"handoff_summary");
         } catch (error) {
           failHandoff(state,error.message);
           task.status = "error";
@@ -3495,8 +5315,15 @@ async function handle(message, sender) {
     }
 
     case "SKIP_FAILED": {
-      if (!targetMatches(state, sender, url)) break;
-      const index = state.tasks.findIndex((task) => task.id === message.id && task.status === "error");
+      if (!targetMatches(state, sender, url) && !pendingNewChat) break;
+      const index = state.tasks.findIndex((task) => task.id === message.id &&
+        (task.status === "error" || task.status === "interrupted" &&
+         ["handoff_summary","handoff_intro"].includes(task.kind)));
+      if (index >= 0 && ["handoff_summary","handoff_intro"].includes(state.tasks[index].kind)) {
+        cancelPending = cancelHandoffTransaction(store,state,message);
+        changed = true;
+        break;
+      }
       if (index < 0 || state.steeringTaskId ||
           state.haltReason === "user" ||
           state.activeTaskId && state.haltReason !== "steer_unconfirmed") break;
@@ -3522,8 +5349,14 @@ async function handle(message, sender) {
     case "ACK_RECOVERY": {
       // Explicit recovery when a *newer* delivery failure has been confirmed
       // by the user. Does not modify or resend an uncertain task.
-      if (!targetMatches(state, sender, url) || state.activeTaskId ||
+      if ((!targetMatches(state, sender, url) && !pendingNewChat) || state.activeTaskId ||
           !state.halted || state.haltReason === "user") break;
+      if (state.handoffSourceKey || state.tasks.some(task =>
+          ["handoff_summary","handoff_intro"].includes(task.kind))) {
+        cancelPending = cancelHandoffTransaction(store,state,{...message,reviewed:true});
+        changed = true;
+        break;
+      }
       state.halted = false;
       state.haltReason = null;
       state.haltAtUserCount = null;
@@ -3589,10 +5422,12 @@ async function handle(message, sender) {
   const historyAction = ({
     ENQUEUE: "manual_enqueue", ENQUEUE_FAVORITE: "manual_enqueue",
     ADD_TASK: "manual_enqueue", EDIT_TASK: "task_edited",
-    DELETE_TASK: "task_deleted", PIN_TASK: "task_pinned",
+    DELETE_TASK: "task_deleted", DISMISS_WAITING: "waiting_dismissed", PIN_TASK: "task_pinned",
     REORDER_TASK: "task_reordered", CLAIM: "claim", SENT: "sent",
     FINISHED: "finished", RELEASE_CLAIM: "deferred",
-    STEER_CLAIM: "steer_claim", STEER_CLICKED: "steer_clicked",
+    STEER_CLAIM: steerDeferred ? "steer_deferred" : "steer_claim",
+    STEER_PROMPT_CLAIM:"steer_claim", STEER_PAUSING: "steer_pausing",
+    STEER_CLICKED: "steer_clicked",
     STEER_CANCEL: "steer_cancel", STEER_CONFIRM: "steer_confirm",
     STEER_UNCONFIRMED: "steer_uncertain", STOPPED: "user_stopped",
     USER_RESUMED: "user_resumed", RECOVER_ON_VOICE: "auto_recovered",
@@ -3603,40 +5438,85 @@ async function handle(message, sender) {
     SAVE_COUNT_RATE_LIMIT: "rate_limit_updated",
     SAVE_SEND_COOLDOWN: "send_cooldown_updated",
   })[message.type];
+  if (cancelPending === false && isProjectOverview(url) &&
+      !state.handoffSourceKey && projectVisitId) state.projectVisitId = projectVisitId;
   // CLAIM can repair an inconsistent persisted lock without claiming any
   // pending row. Do not misreport that maintenance as an actual send attempt.
   if (changed && historyAction && (message.type !== "CLAIM" || dispatch)) {
-    const itemId = ["ENQUEUE", "ENQUEUE_FAVORITE", "ADD_TASK"].includes(message.type)
-      ? state.tasks.at(-1)?.id : message.id;
+    const itemId = enqueuedTaskId ||
+      (["ENQUEUE_FAVORITE", "ADD_TASK"].includes(message.type)
+        ? state.tasks.at(-1)?.id : message.id);
     recordHistory(state, historyAction, itemId);
   }
 
+  changed = syncFailedHandoffDestination(store, state) || changed;
   // Recheck after queue mutations, so count-triggered schedules refill as soon
   // as an item finishes or is deleted, without waiting for a countdown.
   if (["HELLO", "SCHEDULE_PULSE", "ADD_SCHEDULE", "EDIT_SCHEDULE", "TOGGLE_SCHEDULE",
-       "ENQUEUE", "ENQUEUE_FAVORITE", "ADD_TASK", "DELETE_TASK", "FINISHED", "STEER_CONFIRM",
+       "ENQUEUE", "ENQUEUE_FAVORITE", "ADD_TASK", "DELETE_TASK", "DISMISS_WAITING", "FINISHED", "STEER_CONFIRM",
        "STEER_UNCONFIRMED", "STOPPED", "USER_RESUMED", "RECOVER_ON_VOICE",
        "UNCERTAIN_SEND", "FAIL", "SKIP_FAILED", "ACK_RECOVERY", "SAVE_SETTINGS",
        "SAVE_COUNT_RATE_LIMIT"].includes(message.type) &&
-      dueSchedules(state, Date.now(), queueLimit(store))) changed = true;
+      dueSchedules(state, Date.now(), queueLimit(store))) {
+    checkpointScheduledHandoffQueue(store,state);
+    changed = true;
+  }
   if (["HELLO","SCHEDULE_PULSE","ENQUEUE","ADD_TASK","FINISHED","CLAIM"].includes(message.type)) {
-    changed = maybeRequestHandoff(state) || changed;
+    changed = maybeRequestHandoff(store,state) || changed;
+  }
+
+  if (changed && ["ADD_SCHEDULE","EDIT_SCHEDULE","TOGGLE_SCHEDULE","DELETE_SCHEDULE",
+      "SAVE_COUNT_RATE_LIMIT","SAVE_SEND_COOLDOWN","SAVE_SETTINGS","AUTO_OPEN",
+      "SET_QUEUE_PAUSED","SET_COMPACT_VIEW"].includes(message.type)) {
+    checkpointHandoffQueue(store,state,["ADD_SCHEDULE","EDIT_SCHEDULE","TOGGLE_SCHEDULE",
+      "DELETE_SCHEDULE"].includes(message.type));
+  }
+  if (changed && !["handoff_summary","handoff_intro"].includes(requestTaskKind) &&
+      ["ENQUEUE","ENQUEUE_FAVORITE","ADD_TASK","EDIT_TASK","PIN_TASK","REORDER_TASK",
+       "DELETE_TASK","DISMISS_WAITING","CLAIM","SENT","FINISHED","STEER_CONFIRM",
+       "STEER_UNCONFIRMED","STOPPED","USER_RESUMED","RECOVER_ON_VOICE","UNCERTAIN_SEND",
+       "FAIL","SKIP_FAILED","ACK_RECOVERY","RELEASE_CLAIM","STEER_PROMPT_CLAIM",
+       "STEER_CLAIM","STEER_CANCEL","STEER_PAUSING","STEER_CLICKED"].includes(message.type)) {
+    checkpointHandoffTasks(store,state);
   }
 
   if (changed) {
-    store.conversations[key] = state;
+    // Merely opening an empty homepage must not leave a durable queue.
+    if (!state.projectVisitId || hasConversationWork(state)) store.conversations[effectiveKey] = state;
+    else delete store.conversations[effectiveKey];
     await saveStore(store);
+    if (draftScopeChanged) await cleanupUnusedImages(store);
     // Keep staged image references protected until durable queue persistence
     // succeeds. Only then can the normal queue own those originals.
     if (restoreTokenCompleted) pendingBackupRestores.delete(restoreTokenCompleted);
-    if (["DELETE_TASK", "EDIT_TASK", "FINISHED", "STEER_CONFIRM",
+    if (["DELETE_TASK", "DISMISS_WAITING", "EDIT_TASK", "FINISHED", "STEER_CONFIRM",
          "DELETE_SCHEDULE", "EDIT_SCHEDULE", "IMPORT_LEGACY", "SKIP_FAILED"].includes(message.type)) {
       await cleanupUnusedImages(store);
     }
   }
   if (changed || message.type === "HELLO") await maintainTabProtection(store);
+  if (message.type === "CLAIM") {
+    try { await recordHandoffDebugClaim(store,{state,sender,url,dispatch,blockedReason:dispatchBlockedReason}); }
+    catch (error) { console.warn("[ChatQueue] 领取诊断暂时无法记录，领取结果保持不变",error); }
+  }
+  if (adoptionObservation && ["HELLO","CONFIRM_HANDOFF"].includes(message.type)) {
+    try { await recordHandoffDebugAdoption(store,adoptionObservation,sender,url,message,adopted); }
+    catch (error) { console.warn("[ChatQueue] 接收归属诊断暂时无法记录",error); }
+  }
   return {
-    ok: true, state, sessionKey: key, dispatch, tabId,
+    ok: true, state, sessionKey: effectiveKey, dispatch, steerDeferred, tabId,
+    ...(message.type === "HANDOFF_SEND_READY" ? {sendReady} : {}),
+    ...(confirmingHandoff ? {handoffPending,adopted:Boolean(adopted)} : {}),
+    ...(message.type === "RETRY_UNSENT_HANDOFF" ? {retryReady} : {}),
+    ...(cancelPending !== null ? {cancelPending} : {}),
+    ...(message.type === "CLAIM" && !dispatch ? {dispatchBlockedReason} : {}),
+    ...(message.type === "CLAIM" ? {claimDiagnostic:{
+      outcome:dispatch ? "acquired" : "empty",
+      reason:dispatch ? "claim_acquired" : dispatchBlockedReason || "claim_empty",
+      backendVersion:handoffDebugBackendVersion(),
+      ...handoffDebugClaimSnapshot(state,url),
+    }} : {}),
+    ...(pendingNewChat ? {awaitingChatConfirmation:true} : {}),
     ...(backupPayload ? { backup: backupPayload } : {}),
     ...(imageHealth ? { imageHealth } : {}),
     ...(imagePayload ? { images: imagePayload } : {}),
@@ -3728,6 +5608,11 @@ async function ensureTargetTab(state) {
 }
 
 async function onScheduleTick() {
+  // Recovery installation is independent of durable queue reads/locks. Even
+  // a damaged store or an occupied dispatch lock must not strand an error page.
+  // Re-injection calls the existing guardian's scan, including its independent
+  // five-minute transport-error cadence when page timers are throttled.
+  void installLoadRecoveryGuardians();
   const wakeTabIds = await exclusive(async () => {
     const store = await readStore();
     const staleIds = [];
@@ -3749,18 +5634,25 @@ async function onScheduleTick() {
     if (expiredFavorites) await cleanupUnusedImages(store);
     let changed = false;
     for (const state of Object.values(store.conversations)) {
+      if (state.parkedDraft) continue;
       const recovered = recoverObsoleteHalt(state);
       // Per-chat timers keep running while the user views a different chat.
       const scheduled = dueSchedules(state, Date.now(), queueLimit(store));
+      if (scheduled) checkpointScheduledHandoffQueue(store,state);
       const inconsistent = checkInFlightIntegrity(state);
       const timedOut = checkTimeout(state);
       const steerTimedOut = checkSteerTimeout(state);
-      const handoffDue = maybeRequestHandoff(state);
+      if (steerTimedOut) checkpointHandoffTasks(store,state);
+      const handoffDue = maybeRequestHandoff(store,state);
       const handoffExpired = timeoutHandoff(state);
+      const destinationFailed = syncFailedHandoffDestination(store, state);
       // A single failed tabs.query/reload/create must not abort scheduling for
       // every other conversation or discard this minute's newly due tasks.
       let reopened = false;
-      try { reopened = await ensureTargetTab(state); }
+      try {
+        reopened = await ensureTargetTab(state);
+        reopened = await reviveProtectedDiscardedTab(store, state) || reopened;
+      }
       catch (error) {
         console.warn("[ChatQueue] 自动恢复标签失败，保留已排队任务并继续其他对话", error);
         const lastFailure = Array.isArray(state.history) ?
@@ -3771,7 +5663,7 @@ async function onScheduleTick() {
         }
       }
       if (recovered || scheduled || inconsistent || timedOut || steerTimedOut ||
-          handoffDue || handoffExpired || reopened) changed = true;
+          handoffDue || handoffExpired || destinationFailed || reopened) changed = true;
     }
     if (changed) await saveStore(store);
     return maintainTabProtection(store);
@@ -3817,34 +5709,75 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.url) pagePulses.delete(tabId);
+  if (changeInfo.url || changeInfo.discarded === true) pagePulses.delete(tabId);
   if (changeInfo.status === "complete") {
+    // This path deliberately stays outside exclusive(): a broken/missing
+    // content script must not prevent the native error-page watchdog running.
+    void installLoadRecoveryGuardians(tabId);
     void processPendingVersionRefresh().catch((error) =>
       console.warn("[ChatQueue] 网页加载后的版本刷新检查失败", error));
   }
-  if (!changeInfo.url) return;
+  if (!changeInfo.url && changeInfo.discarded !== true &&
+      changeInfo.autoDiscardable !== true && changeInfo.status !== "complete") return;
   // Revoke our no-discard flag promptly if the protected tab navigates away.
-  void exclusive(async () => maintainTabProtection(await readStore()))
+  void exclusive(async () => {
+    const store = await readStore();
+    if (changeInfo.url) await discardDepartedProjectDraft(store, tabId, changeInfo.url);
+    let revived = changeInfo.url ? noteHandoffCreatedChat(store,
+      {tab:{id:tabId,url:changeInfo.url}},safeUrl(changeInfo.url)) : false;
+    if (changeInfo.discarded === true) {
+      for (const state of Object.values(store.conversations)) {
+        if (state.tabId !== tabId) continue;
+        try { revived = await reviveProtectedDiscardedTab(store, state) || revived; }
+        catch (error) { console.warn("[ChatQueue] 已丢弃的队列页面暂时无法恢复", tabId, error); }
+      }
+    }
+    if (revived) await saveStore(store);
+    await maintainTabProtection(store);
+  })
     .catch((error) => console.warn("[ChatQueue] 标签导航后的保护同步失败，已保留队列数据", error));
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   pagePulses.delete(tabId);
   recentTabRevives.delete(tabId);
   recentTabOpens.delete(tabId);
-  void exclusive(async () => maintainTabProtection(await readStore()))
+  void exclusive(async () => {
+    const store = await readStore();
+    await discardDepartedProjectDraft(store, tabId);
+    await maintainTabProtection(store);
+  })
     .catch((error) => console.warn("[ChatQueue] 标签关闭后的保护同步失败，已保留队列数据", error));
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Heartbeats never write durable queue state or enter the dispatch lock.
   const work = message?.type === "PAGE_PULSE"
     ? Promise.resolve().then(() => handlePagePulse(message, sender))
-    : exclusive(() => FAVORITE_ACTIONS.has(message?.type)
-      ? handleFavoriteMessage(message, sender)
-      : ["DASHBOARD_GET", "DASHBOARD_SET_PAUSED",
-         "DASHBOARD_REMOVE_CONVERSATION", "DASHBOARD_CLEANUP_IDLE"].includes(message?.type)
-        ? handleDashboardMessage(message, sender) : handle(message, sender));
+    : exclusive(async () => {
+      try {
+        if (message?.type === "HANDOFF_DEBUG_SIGNAL") {
+          return await appendHandoffDebugSignal(message,sender);
+        }
+        if (message?.type === "GET_HANDOFF_DEBUG") {
+          return await handoffDebugReport(message,sender);
+        }
+        return await (FAVORITE_ACTIONS.has(message?.type)
+          ? handleFavoriteMessage(message, sender)
+          : ["DASHBOARD_GET", "DASHBOARD_SET_PAUSED",
+             "DASHBOARD_REMOVE_CONVERSATION", "DASHBOARD_CLEANUP_IDLE"].includes(message?.type)
+            ? handleDashboardMessage(message, sender) : handle(message, sender));
+      } catch (error) {
+        try { await recordHandoffDebugRpcError(message,sender,error); }
+        catch (debugError) {
+          console.warn("[ChatQueue] 接力操作错误未能写入调试日志",debugError);
+        }
+        throw error;
+      }
+    });
   work.then(sendResponse)
-    .catch((error) => sendResponse({ ok: false, error: error.message || "未知错误" }));
+    .catch((error) => sendResponse({ ok: false, error: error.message || "未知错误",
+      ...(message?.type === "CLAIM" ? {claimDiagnostic:{outcome:"rejected",reason:"claim_rejected",
+        errorReason:handoffDebugReason(error.message),backendVersion:handoffDebugBackendVersion()}} : {}),
+    }));
   return true;
 });
 chrome.action.onClicked.addListener(async (tab) => {

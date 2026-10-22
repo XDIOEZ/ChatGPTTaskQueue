@@ -19,8 +19,8 @@ test("真实浏览器从图片队列恢复附件后才发送，读取图片失�
     let content = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
     content = content.replace("  function boundHere() {",
       "  function boundHere() { return true; }\n  function unusedOriginalBoundHere() {");
-    const marker = "  void init();\n})();";
-    assert.ok(content.includes(marker));
+    const marker = content.match(/  void init\(\);\r?\n\}\)\(\);/)?.[0];
+    assert.ok(marker, "Cannot locate extension initialization with either line-ending style");
     content = content.replace(marker, `  window.__cqImageTest = {
       async send(task) {
         state = { ...state, tasks: [task], activeTaskId: task.id, halted: false };

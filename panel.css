@@ -16,6 +16,16 @@
 #cq-extension-root .cq-handoff-cancel {
   margin: 4px 0 8px;
 }
+#cq-extension-root .cq-handoff-page .cq-handoff-panel:last-child {
+  margin-bottom: 0;
+}
+#cq-extension-root .cq-handoff-page .cq-section-title span {
+  overflow-wrap: anywhere;
+}
+#cq-extension-root .cq-handoff-state {
+  color: var(--cq-accent);
+  font-variant-numeric: tabular-nums;
+}
 #cq-extension-root button[aria-busy="true"] {
   opacity: .6;
   cursor: progress;
@@ -86,10 +96,26 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   border: 0;
   background: transparent;
   border-radius: 6px;
-  transition: background-color .12s ease;
+  transition: background-color .16s ease, color .16s ease,
+    border-color .16s ease, box-shadow .16s ease, transform .14s ease;
 }
 
 #cq-extension-root button:hover { background: var(--cq-hover); }
+#cq-extension-root button:not(:disabled):active { transform: scale(.97); }
+#cq-extension-root button:disabled { cursor: default; }
+#cq-extension-root .cq-tool:not(:disabled):hover { transform: translateY(-1px); }
+#cq-extension-root .cq-tool:not(:disabled):active { transform: scale(.96); }
+#cq-extension-root textarea,
+#cq-extension-root input,
+#cq-extension-root select {
+  transition: border-color .16s ease, box-shadow .16s ease,
+    background-color .16s ease;
+}
+#cq-extension-root textarea:focus-visible,
+#cq-extension-root input:focus-visible,
+#cq-extension-root select:focus-visible {
+  border-color: var(--cq-accent);
+}
 #cq-extension-root button:focus-visible,
 #cq-extension-root textarea:focus-visible,
 #cq-extension-root input:focus-visible,
@@ -155,6 +181,7 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 #cq-extension-root .cq-status svg { width: 13px; height: 13px; }
 #cq-extension-root .cq-compose-wait[hidden] { display: none !important; }
 #cq-extension-root .cq-voice-wait[hidden] { display: none !important; }
+#cq-extension-root .cq-dispatch-wait[hidden] { display: none !important; }
 #cq-extension-root .cq-next-run {
   display: inline-flex;
   align-items: center;
@@ -227,9 +254,7 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 #cq-extension-root .cq-queue-tools {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 12px;
-  padding: 7px 10px;
+  padding: 4px 8px;
   border-top: 1px solid var(--cq-border);
   background: var(--cq-bg);
 }
@@ -264,15 +289,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   color: var(--cq-accent);
   font-weight: 650;
 }
-#cq-extension-root .cq-queue-search-row {
-  display: flex;
-  flex: 1 1 225px;
-  align-items: center;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 6px 9px;
-  min-width: 0;
-}
 #cq-extension-root .cq-search-field {
   display: flex;
   flex: 0 1 240px;
@@ -302,43 +318,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 }
 #cq-extension-root .cq-search-field input:focus-visible { outline: 0; }
 #cq-extension-root .cq-search-field input::placeholder { color: var(--cq-muted); }
-#cq-extension-root .cq-search-result {
-  color: var(--cq-muted);
-  font-size: 10px;
-  line-height: 1.25;
-  text-align: right;
-  white-space: nowrap;
-}
-#cq-extension-root .cq-quick-jump {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 29px;
-  color: var(--cq-muted);
-  white-space: nowrap;
-}
-#cq-extension-root .cq-quick-jump svg { width: 14px; height: 14px; }
-#cq-extension-root .cq-quick-jump select {
-  min-width: 84px;
-  padding: 5px 3px;
-  border: 1px solid var(--cq-border);
-  border-radius: 7px;
-  background: var(--cq-row);
-  font-size: 11px;
-}
-#cq-extension-root button.cq-view-toggle {
-  min-height: 29px;
-  padding: 4px 9px;
-  border: 1px solid var(--cq-border);
-  color: var(--cq-muted);
-  background: var(--cq-row);
-  font-size: 11px;
-  white-space: nowrap;
-}
-#cq-extension-root button.cq-view-toggle[aria-pressed="true"] {
-  color: var(--cq-accent);
-  border-color: var(--cq-accent);
-}
 #cq-extension-root .cq-filter-empty {
   display: grid;
   justify-items: center;
@@ -378,6 +357,7 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   cursor: ns-resize;
   user-select: none;
   touch-action: none;
+  transition: color .16s ease, background-color .16s ease;
 }
 #cq-extension-root .cq-resize-handle:hover,
 #cq-extension-root .cq-resize-handle:focus-visible,
@@ -403,12 +383,12 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   min-width: 0;
   background: var(--cq-row);
   border-bottom: 1px solid var(--cq-border);
+  transition: background-color .16s ease;
+}
+#cq-extension-root .cq-task:not(.cq-dragging):not(.cq-drop-before):not(.cq-drop-after):hover {
+  background: var(--cq-bg);
 }
 #cq-extension-root .cq-task:last-child { border-bottom: none; }
-#cq-extension-root .cq-task.cq-jump-target {
-  outline: 2px solid var(--cq-accent);
-  outline-offset: -3px;
-}
 #cq-extension-root .cq-task:focus-visible {
   outline: 2px solid var(--cq-accent);
   outline-offset: -3px;
@@ -793,6 +773,15 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   overflow-wrap: anywhere;
 }
 #cq-extension-root .cq-notice > span { flex: 1; min-width: 0; }
+#cq-extension-root .cq-handoff-collapse-error {
+  padding: 7px 10px;
+  border-top: 1px solid var(--cq-border);
+  background: var(--cq-row);
+  color: var(--cq-warning);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
 #cq-extension-root .cq-notice button {
   flex-shrink: 0;
   white-space: nowrap;
@@ -871,29 +860,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   flex-shrink: 0;
   gap: 3px;
 }
-#cq-extension-root .cq-shortcuts {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 5px 13px;
-  flex: 1 1 210px;
-  min-width: 0;
-  padding: 3px 0;
-  color: var(--cq-muted);
-  font-size: 10px;
-}
-
-#cq-extension-root kbd {
-  display: inline-block;
-  padding: 1px 4px;
-  border-radius: 4px;
-  border: 1px solid var(--cq-border);
-  background: var(--cq-row);
-  font: inherit;
-  font-weight: 600;
-  line-height: 1.3;
-}
-
 #cq-extension-root .cq-scheduler {
   padding: 11px;
   background: var(--cq-row);
@@ -918,6 +884,10 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   background: var(--cq-hover);
   font-weight: 650;
 }
+#cq-extension-root .cq-scheduler-tabs button:not(:disabled):active,
+#cq-extension-root .cq-settings-tabs button:not(:disabled):active {
+  transform: scale(.985);
+}
 #cq-extension-root .cq-scheduler-tabs button span { font-size: 10px; }
 #cq-extension-root .cq-scheduler-tabs .cq-auto-advanced-toggle {
   display: inline-flex;
@@ -939,64 +909,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 }
 #cq-extension-root .cq-auto-advanced[hidden] { display: none !important; }
 
-#cq-extension-root .cq-rule-tools {
-  display: grid;
-  gap: 7px;
-  margin: 6px 0 10px;
-  padding: 8px;
-  border: 1px solid var(--cq-border);
-  border-radius: 9px;
-  background: var(--cq-bg);
-}
-#cq-extension-root .cq-rule-status-filters {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-#cq-extension-root .cq-rule-search-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 12px;
-}
-#cq-extension-root .cq-rule-search-row .cq-search-field {
-  flex: 1 1 160px;
-  max-width: none;
-}
-#cq-extension-root .cq-rule-select-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 29px;
-  color: var(--cq-muted);
-  font-size: 11px;
-  white-space: nowrap;
-}
-#cq-extension-root .cq-rule-select-label select {
-  max-width: 124px;
-  padding: 5px 4px;
-  border: 1px solid var(--cq-border);
-  border-radius: 6px;
-  background: var(--cq-row);
-  color: var(--cq-text);
-  font-size: 11px;
-}
-#cq-extension-root .cq-rule-tools-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 5px;
-  color: var(--cq-muted);
-  font-size: 10px;
-}
-#cq-extension-root .cq-rule-tools-footer button {
-  border: 1px solid var(--cq-border);
-  padding: 3px 7px;
-  color: var(--cq-accent);
-  background: var(--cq-row);
-}
 #cq-extension-root .cq-schedule-results {
   max-height: min(43dvh, 360px);
   overflow: auto;
@@ -1007,12 +919,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 #cq-extension-root .cq-schedule-item {
   padding: 8px 6px;
   background: var(--cq-row);
-}
-#cq-extension-root .cq-schedule-item .cq-task-text mark {
-  padding: 0 1px;
-  border-radius: 2px;
-  color: var(--cq-text);
-  background: var(--cq-mark);
 }
 #cq-extension-root .cq-rule-state {
   display: inline-block;
@@ -1061,13 +967,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   padding: 0 0 13px;
   border: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--cq-text) 30%, var(--cq-border));
-}
-#cq-extension-root .cq-auto-advanced .cq-handoff-panel {
-  margin: 0;
-  padding: 13px 0;
-  border: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--cq-text) 30%, var(--cq-border));
-  border-radius: 0;
 }
 #cq-extension-root .cq-auto-advanced > .cq-switch {
   margin-top: 0;
@@ -1136,6 +1035,70 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   margin-left: 8px;
   font-size: 10px;
   color: var(--cq-muted);
+}
+
+/* Image attachments live inside the automatic-task editor, not in a second row. */
+#cq-extension-root .cq-inline-image-composer {
+  position: relative;
+  border: 1px solid var(--cq-border);
+  border-radius: 7px;
+  background: var(--cq-bg);
+}
+#cq-extension-root .cq-inline-image-composer:focus-within {
+  border-color: var(--cq-accent);
+}
+#cq-extension-root .cq-inline-image-composer > textarea {
+  min-height: 54px;
+  margin: 0;
+  padding: 8px 38px 8px 8px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+}
+#cq-extension-root .cq-inline-image-composer > textarea:focus-visible {
+  outline: none;
+}
+#cq-extension-root .cq-inline-image-composer > .cq-images {
+  margin: 0;
+  padding: 0 38px 8px 8px;
+}
+#cq-extension-root .cq-composer-image-button {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: var(--cq-muted);
+  cursor: pointer;
+}
+#cq-extension-root .cq-composer-image-button:hover {
+  color: var(--cq-text);
+  background: var(--cq-hover);
+}
+#cq-extension-root .cq-composer-image-button:focus-visible {
+  outline: 2px solid var(--cq-accent);
+  outline-offset: -2px;
+}
+#cq-extension-root .cq-composer-image-button svg { width: 16px; height: 16px; }
+#cq-extension-root .cq-composer-image-button input { display: none; }
+#cq-extension-root .cq-image-drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  place-items: center;
+  border: 2px dashed var(--cq-accent);
+  border-radius: inherit;
+  color: var(--cq-text);
+  background: var(--cq-bg);
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+}
+#cq-extension-root .cq-inline-image-composer.cq-image-drag-over .cq-image-drop-overlay {
+  display: grid;
 }
 #cq-extension-root .cq-panel-actions {
   display: flex;
@@ -1369,19 +1332,60 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
 #cq-extension-root .cq-diagnostics-actions .cq-restore-label:hover {
   background: var(--cq-hover);
 }
+#cq-extension-root .cq-handoff-debug {
+  padding: 9px 0;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--cq-border);
+}
+#cq-extension-root .cq-handoff-debug-summary {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 6px 0;
+  color: var(--cq-muted);
+  font-size: 10px;
+}
+#cq-extension-root .cq-handoff-debug-summary strong { color: var(--cq-text); }
+#cq-extension-root .cq-handoff-debug-events {
+  max-height: 230px;
+  overflow: auto;
+  border: 1px solid var(--cq-border);
+  border-radius: 7px;
+}
+#cq-extension-root .cq-handoff-debug-entry {
+  display: flex;
+  gap: 8px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--cq-border);
+  font-size: 10px;
+}
+#cq-extension-root .cq-handoff-debug-entry:last-child { border-bottom: none; }
+#cq-extension-root .cq-handoff-debug-entry time {
+  flex: 0 0 auto;
+  color: var(--cq-muted);
+  font-variant-numeric: tabular-nums;
+}
+#cq-extension-root .cq-handoff-debug-entry span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+#cq-extension-root .cq-handoff-debug-entry details { margin-top: 4px; }
+#cq-extension-root .cq-handoff-debug-entry summary { cursor: pointer; }
+#cq-extension-root .cq-handoff-debug-entry pre {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  margin: 4px 0;
+  font-size: 10px;
+}
 
 @container (max-width: 540px) {
   #cq-extension-root .cq-settings-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  #cq-extension-root .cq-rule-search-row { gap: 6px 8px; }
-  #cq-extension-root .cq-rule-search-row .cq-search-field { flex-basis: 100%; }
   #cq-extension-root .cq-toolbar { flex-wrap: wrap; padding: 5px 7px; gap: 3px 7px; }
   #cq-extension-root .cq-next-run { font-size: 10px; }
-  #cq-extension-root .cq-queue-tools { padding: 6px 8px; gap: 5px; }
-  #cq-extension-root .cq-queue-search-row { flex-basis: 100%; justify-content: flex-start; }
   #cq-extension-root .cq-search-field { flex: 1 1 150px; }
-  #cq-extension-root .cq-quick-jump select { min-width: 76px; }
   #cq-extension-root .cq-footer-toolbar { padding: 5px 8px; gap: 4px; }
-  #cq-extension-root .cq-shortcuts { flex-basis: 100%; gap: 4px 8px; font-size: 9px; }
   #cq-extension-root .cq-bottom-actions {
     width: 100%;
     justify-content: space-between;
@@ -1395,14 +1399,6 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
     padding: 1px 3px;
     font-size: 8px;
   }
-  #cq-extension-root .cq-rule-tools { padding: 6px; }
-  #cq-extension-root .cq-rule-select-label select { max-width: 109px; }
-  #cq-extension-root .cq-search-result {
-    order: 2;
-    width: 100%;
-    text-align: left;
-  }
-  #cq-extension-root .cq-quick-jump svg { display: none; }
   #cq-extension-root .cq-tool > span { display: none; }
   #cq-extension-root .cq-bottom-actions .cq-tool {
     min-height: 31px;
@@ -1417,4 +1413,16 @@ html.dark #cq-extension-root, html[data-theme="dark"] #cq-extension-root {
   #cq-extension-root .cq-item-actions .cq-steer-action span { display: none; }
   #cq-extension-root .cq-item-actions button.cq-pin-action,
   #cq-extension-root .cq-item-actions button.cq-steer-action { min-width: 28px; padding: 5px; }
+}
+
+/* System-level reduced motion takes precedence over all UI polish. JavaScript
+   view and list animations use the same media query. */
+@media (prefers-reduced-motion: reduce) {
+  #cq-extension-root *,
+  #cq-extension-root *::before,
+  #cq-extension-root *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
 }

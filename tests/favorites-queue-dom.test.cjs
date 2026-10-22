@@ -128,6 +128,23 @@ setTimeout(async()=>{
   await until(()=>favorites.length===1);
   result.saveComposer=favorites[0].text==="输入框文字" &&
    q("#prompt-textarea")===null && document.querySelector("#prompt-textarea").value==="输入框文字";
+  const outside=document.querySelector("main");
+  outside.dispatchEvent(new MouseEvent("click",{bubbles:true,button:0,detail:1}));
+  result.outsideClickFolds=q('[data-action="toggle-queue"]')?.getAttribute("aria-label")==="展开队列" &&
+   !q(".cq-favorites");
+  q('[data-action="toggle-queue"]').click();
+  result.reopenKeepsDraft=!!q(".cq-favorites") &&
+   document.querySelector("#prompt-textarea").value==="输入框文字";
+  document.querySelector("#prompt-textarea").dispatchEvent(
+   new MouseEvent("click",{bubbles:true,button:0,detail:1}));
+  result.inputClickStaysOpen=q('[data-action="toggle-queue"]')?.getAttribute("aria-label")==="收起队列" &&
+   !!q(".cq-favorites");
+  q(".cq-toolbar").dispatchEvent(new MouseEvent("click",{bubbles:true,button:0,detail:1}));
+  result.insideClickStaysOpen=q('[data-action="toggle-queue"]')?.getAttribute("aria-label")==="收起队列";
+  document.querySelector('[data-testid="send-button"]').click();
+  result.syntheticSendStaysOpen=q('[data-action="toggle-queue"]')?.getAttribute("aria-label")==="收起队列";
+  outside.dispatchEvent(new MouseEvent("click",{bubbles:true,button:2,detail:1}));
+  result.rightClickStaysOpen=q('[data-action="toggle-queue"]')?.getAttribute("aria-label")==="收起队列";
   favorites[0].category="效率";
   favorites[0].useCount=3;
   onStorageChange?.({"cq.state.v2":{newValue:{
@@ -161,9 +178,11 @@ setTimeout(async()=>{
   await wait(50);
   result.noOverflow=q(".cq-inline").scrollWidth<=q(".cq-inline").clientWidth+2;
  }catch(error){result.error=error.stack || String(error);}
- result.ok=["entry","savedImage","library","searchStable","imePreserved",
+  result.ok=["entry","savedImage","library","searchStable","imePreserved",
   "imageNameSearch","reenqueue","noImmediateSend","deleteKeepsQueue",
-  "saveComposer","categoriesAvailable","categoryFilter","uncategorizedFilter",
+  "saveComposer","outsideClickFolds","reopenKeepsDraft","inputClickStaysOpen","insideClickStaysOpen",
+  "syntheticSendStaysOpen","rightClickStaysOpen",
+  "categoriesAvailable","categoryFilter","uncategorizedFilter",
   "pinnedFilterEmpty","pin","unpin","noOverflow"].every(key=>result[key]===true);
  document.body.dataset.test=JSON.stringify(result);
 },350);
