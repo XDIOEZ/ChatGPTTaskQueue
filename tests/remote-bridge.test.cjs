@@ -101,6 +101,18 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
     id:newJobId,status:"created",tabId:20,chatUrl:chatUrl,
   },"extension",extensionOrigin)).data.job.status,"created");
   assert.equal((await call("GET","/v1/jobs/"+newJobId)).data.job.chatUrl,chatUrl);
+  const unclaimed=await call("POST","/v1/jobs",{
+    action:"continue",target:{kind:"chat",id:"chat-123"},text:"cancel stress",
+  });
+  const unclaimedId=unclaimed.data.job.id;
+  assert.equal((await call("POST","/v1/jobs/cancel-unclaimed",
+    {ids:[unclaimedId]},"none")).code,401);
+  const cancelled=await call("POST","/v1/jobs/cancel-unclaimed",{ids:[unclaimedId]});
+  assert.equal(cancelled.code,200);
+  assert.deepEqual(cancelled.data.cancelled,[unclaimedId]);
+  assert.equal((await call("GET","/v1/jobs/"+unclaimedId)).data.job.status,"cancelled");
+  assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
+    extensionOrigin)).data.job,null,"取消的未领取任务不得再被派发");
 
   const otherId="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
@@ -141,6 +153,36 @@ test("输入校验和租约重试：类型、长度、终态不会重复领取",
   assert.equal(again.attempts,2);
   bridge.updateJob(item,{status:"queued",tabId:2},220000);
   assert.equal(bridge.dispatchNext(data,999999),null);
+});
+
+test("只能取消尚未被扩展领取的任务，已领取/已完成严格保留",()=>{
+  const payload={action:"continue",target:{kind:"chat",name:"test"},text:"smoke"};
+  const a=bridge.makeJob(payload,1000);
+  const b=bridge.makeJob(payload,1001);
+  const c=bridge.makeJob(payload,1002);
+  const state={jobs:[a,b,c]};
+  const claimed=bridge.dispatchNext({jobs:[b]},1100);
+  assert.equal(claimed.id,b.id);
+  bridge.updateJob(c,{status:"queued",tabId:11},1200);
+  const result=bridge.cancelUnclaimedJobs(state,[a.id,b.id,c.id],1300);
+  assert.deepEqual(result.cancelled,[a.id]);
+  assert.equal(result.skipped.length,2);
+  assert.equal(a.status,"cancelled");
+  assert.equal(b.status,"pending","已尝试发送的任务不允许当作未发取消");
+  assert.equal(c.status,"queued");
+  assert.equal(bridge.dispatchNext({jobs:[a]},999999),null);
+  assert.equal(bridge.updateJob(a,{status:"queued"},1500).status,"cancelled",
+    "终态不接受迟到回执反向重排");
+  assert.throws(()=>bridge.cancelUnclaimedJobs(state,[a.id,a.id]),/不重复/);
+  const duringLease=bridge.quarantineUncertainJobs(state,[b.id],1150);
+  assert.equal(duringLease.quarantined.length,0,"未过期租约不能被隔离");
+  assert.equal(b.status,"pending");
+  const stale=bridge.quarantineUncertainJobs(state,[b.id],200000);
+  assert.deepEqual(stale.quarantined,[b.id]);
+  assert.equal(b.status,"review_required");
+  assert.equal(bridge.dispatchNext({jobs:[b]},999999),null,
+    "隔离后绝不可自动重发不确定消息");
+  assert.equal(bridge.quarantineUncertainJobs(state,[c.id],200000).quarantined.length,0);
 });
 
 test("扩展调度：严格匹配指定会话和项目，拒绝重名歧义",()=>{

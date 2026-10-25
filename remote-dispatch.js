@@ -10,8 +10,19 @@ globalThis.CQRemoteDispatch = (() => {
   const CHAT_URLS = ["https://chatgpt.com/*","https://chat.openai.com/*"];
   const ALARM = "cq.remote-bridge";
   const TEAM_CHANNELS_KEY = "cq.remote.teamChannels.v1";
+  const TAB_RESPONSE_TIMEOUT_MS = 20000;
   let running = false;
   let targets = [];
+
+  function withTabResponseDeadline(promise,timeoutMs=TAB_RESPONSE_TIMEOUT_MS) {
+    let guard;
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise((_,reject)=>{
+        guard=setTimeout(()=>reject(new Error("CQ_REMOTE_TAB_TIMEOUT")),timeoutMs);
+      }),
+    ]).finally(()=>clearTimeout(guard));
+  }
 
   async function api(path, body = null) {
     if (typeof fetch !== "function") throw new Error("浏览器不支持本机桥接请求");
@@ -122,10 +133,10 @@ globalThis.CQRemoteDispatch = (() => {
   }
 
   async function refreshTargets() {
-    const [store,tabs,metadata]=await Promise.all([
+    const [store,tabs,metadata]=await withTabResponseDeadline(Promise.all([
       readStore(),chrome.tabs.query({url:CHAT_URLS}),
       chrome.storage.local.get(["cq.dashboard.aliases.v1","cq.dashboard.projects.v1"]),
-    ]);
+    ]));
     targets=listTargets(store,tabs,
       metadata["cq.dashboard.aliases.v1"],metadata["cq.dashboard.projects.v1"]);
     await api("/targets",{targets,version:chrome.runtime.getManifest().version});
@@ -149,7 +160,7 @@ globalThis.CQRemoteDispatch = (() => {
   }
 
   async function teamChannels() {
-    const data=await chrome.storage.local.get(TEAM_CHANNELS_KEY);
+    const data=await withTabResponseDeadline(chrome.storage.local.get(TEAM_CHANNELS_KEY));
     const entries=data?.[TEAM_CHANNELS_KEY];
     return entries && typeof entries==="object" && !Array.isArray(entries) ? entries : {};
   }
@@ -159,9 +170,9 @@ globalThis.CQRemoteDispatch = (() => {
       throw new Error("协作专用标签标识无效");
     const channels=await teamChannels();
     if(channels[chatId]===tabId) return;
-    await chrome.storage.local.set({[TEAM_CHANNELS_KEY]:{
+    await withTabResponseDeadline(chrome.storage.local.set({[TEAM_CHANNELS_KEY]:{
       ...channels,[chatId]:tabId,
-    }});
+    }}));
   }
 
   async function findTeamChannel(job,target,current) {
@@ -185,17 +196,17 @@ globalThis.CQRemoteDispatch = (() => {
       current.find(tab=>Number.isInteger(tab.windowId));
     // Unlike a normal user task, multiple team messages share this ONE
     // inactive inbox tab per chat. Never hijack a user's unrelated tab.
-    const tab=await chrome.tabs.create({
+    const tab=await withTabResponseDeadline(chrome.tabs.create({
       url:target.url+"#cq-team-channel="+target.id,active:false,
       ...(sameWindow?{windowId:sameWindow.windowId}:{}),
-    });
+    }));
     await rememberTeamChannel(target.id,tab.id);
     await api("/report",{id:job.id,status:"opening",tabId:tab.id});
     return tab;
   }
 
   async function findOrOpen(job,target) {
-    const current=await chrome.tabs.query({url:CHAT_URLS});
+    const current=await withTabResponseDeadline(chrome.tabs.query({url:CHAT_URLS}));
     if(Number.isInteger(job.tabId)) {
       const owned=current.find(tab=>tab.id===job.tabId);
       if(!owned) throw new Error("任务专属标签页已关闭；不重新打开以避免重复发消息");
@@ -227,10 +238,10 @@ globalThis.CQRemoteDispatch = (() => {
     const sameWindow=current.find(tab=>sameScope(tab,target) && Number.isInteger(tab.windowId))
       || current.find(tab=>Number.isInteger(tab.windowId));
     const markedUrl=target.url+"#cq-remote-job="+job.id;
-    const tab=await chrome.tabs.create({
+    const tab=await withTabResponseDeadline(chrome.tabs.create({
       url:markedUrl,active:false,
       ...(sameWindow?{windowId:sameWindow.windowId}:{}),
-    });
+    }));
     // This acknowledgement also protects against retries after the SPA
     // removes its marker or redirects from project overview into a new chat.
     await api("/report",{id:job.id,status:"opening",tabId:tab.id});
@@ -240,10 +251,10 @@ globalThis.CQRemoteDispatch = (() => {
   async function messageTab(tab,job) {
     if(tab.discarded===true || tab.status!=="complete") return {status:"waiting",
       tabId:tab.id,error:"等待 ChatGPT 标签页加载"};
-    const response=await chrome.tabs.sendMessage(tab.id,{
+    const response=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
       type:"CQ_REMOTE_EXECUTE",id:job.id,action:job.action,
       text:job.text,mode:job.mode,targetUrl:tab.url,
-    });
+    }));
     if (!response || !response.ok)
       throw new Error(response?.error||"扩展页面尚未初始化");
     return {...response,tabId:tab.id};
@@ -254,9 +265,9 @@ globalThis.CQRemoteDispatch = (() => {
     if(!url || !chatKey(url) || CQHandoff.projectId(url)!==target.id)
       return {status:"waiting",tabId:tab.id,error:"首条消息尚未建立新对话"};
     try {
-      const result=await chrome.tabs.sendMessage(tab.id,{
+      const result=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
         type:"CQ_REMOTE_INSPECT",id:job.id,text:job.text,targetUrl:tab.url,
-      });
+      }));
       if(result?.ok && result.observed === true) {
         if(job.channel==="team_spawn") {
           // The new chat is already confirmed. A storage hiccup must not
@@ -275,10 +286,10 @@ globalThis.CQRemoteDispatch = (() => {
     if (tab.discarded || tab.status!=="complete")
       return {status:"waiting",tabId:tab.id,error:"等待引导所在对话恢复"};
     try {
-      const result=await chrome.tabs.sendMessage(tab.id,{
+      const result=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
         type:"CQ_REMOTE_INSPECT",mode:"steer",id:job.id,
         text:job.text,targetUrl:tab.url,
-      });
+      }));
       if(result?.ok && result.observed)
         return {status:"steered",tabId:tab.id,taskId:job.taskId};
       if(result?.uncertain)
@@ -297,7 +308,7 @@ globalThis.CQRemoteDispatch = (() => {
         job.action==="new_chat" && target.kind!=="project")
       throw new Error("目标类型与任务不匹配");
 
-    const store=await readStore();
+    const store=await withTabResponseDeadline(readStore());
     const already=Object.values(store.conversations||{}).find(state=>
       state.recentSubmissions?.some(entry=>entry.id===job.id));
     // A successful queue submission must never be performed again on retry.
@@ -335,6 +346,9 @@ globalThis.CQRemoteDispatch = (() => {
     } catch(error) {
       if(steering) return {status:"review_required",tabId:tab.id,
         error:"引导已开始但未获得完整回执；需要核对旧对话，不自动重复发送"};
+      if(error.message==="CQ_REMOTE_TAB_TIMEOUT")
+        return {status:"waiting",tabId:tab.id,
+          error:"浏览器消息回执超时，稍后核对原提交 ID；不会重新开页"};
       if(/Receiving end does not exist|Could not establish connection|扩展页面尚未初始化|context invalidated|队列尚未绑定当前页面|插件还没初始化/i.test(error.message))
         return {status:"waiting",tabId:tab.id,error:"队列扩展页面尚未就绪"};
       if(/目标旧对话正在执行、暂停或交接/.test(error.message))

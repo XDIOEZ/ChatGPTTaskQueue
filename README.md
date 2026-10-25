@@ -1,3 +1,18 @@
+### v0.49.58：长任务压力测试与队列自恢复
+
+- 多智能体长流程压力测试暴露了**浏览器标签消息请求无超时、远程调度 `running` 持续锁住**的问题：一条 `CQ_REMOTE_EXECUTE` 或标签读取 Promise 若一直不返回，后续 30 秒调度轮询与扩展目标心跳都不能正常运行，Skill 按在线门槛安全停用。
+- 为目标同步、队列归属读取、标签查找及 `CQ_REMOTE_EXECUTE` / `CQ_REMOTE_INSPECT` 增加 20 秒超时保护，确保单个请求不能永久阻断所有消息。普通队列超时标为 `waiting`，之后沿持久提交 ID 核对，不新开页、不盲目重复；即时引导发送结果不明时仍转人工核对。
+- 本机桥接器新增显式清理指令（只作用于指定任务 ID，不能批量猜目标）：
+
+```powershell
+node remote-bridge.cjs cancel-unclaimed --json "C:\path\to\ids.json"
+node remote-bridge.cjs quarantine-uncertain --json "C:\path\to\ids.json"
+```
+
+  其中 JSON 是 UUID 字符串数组。`cancel-unclaimed` **仅取消 pending、从未领取（attempts=0）**的任务；已领取、已发送、已完成严格拒绝取消。`quarantine-uncertain` **仅隔离租约已经过期、曾领取但仍无回执**的任务，标记 `review_required` 并停用自动重试，不声称此前未发送。所有修改使用原有本机 Bearer token 接口，不允许网页跨域调用；旧版桥接器运行时需重启服务以启用新指令。
+- 新增无法返回的浏览器 RPC、读取超时的真实调度锁模拟回归、取消/隔离权限与终态检查。测试创建的旧队列任务仍需按实际已发送/未发送状态人工核对；勿删除状态不明的真实工作消息。
+- 此版升级后在 Edge `edge://extensions` 重新加载扩展、刷新测试对话，再运行 `node skills/gpt-queue-agent-team/team.cjs doctor`；磁盘版本与在线扩展版本不一致时 Skill 会安全拒绝继续协作。
+
 ### v0.49.57：GPT 队列专属多智能体协作 Skill（Git 管理，扩展在线才启用）
 
 - 协作规则、安装器与消息 CLI 都保存在此仓库的 `skills/gpt-queue-agent-team/`，版本由 Git 管理，不复制/覆盖已有全局 `agent-team`。

@@ -21,7 +21,7 @@ const DATA_FILE = path.join(ROOT,"jobs.json");
 const MAX_JOBS = 300;
 // Align with the extension's requireText limit; never accept a job it cannot send.
 const MAX_TEXT = 12000;
-const TERMINAL = new Set(["queued","steered","created","failed","review_required"]);
+const TERMINAL = new Set(["queued","steered","created","failed","review_required","cancelled"]);
 const EXTENSION_HEADER = "chatgpt-task-queue-extension-v1";
 
 function fail(message,code=400) {
@@ -144,6 +144,53 @@ function publicJob(job) {
 function makeJob(input,now=Date.now()) {
   return {...validateJob(input),id:crypto.randomUUID(),status:"pending",
     createdAt:now,updatedAt:now,attempts:0,leaseUntil:0};
+}
+function cancelUnclaimedJobs(store,ids,now=Date.now()) {
+  if (!Array.isArray(ids) || !ids.length || ids.length>300 ||
+      ids.some(id=>typeof id!=="string" ||
+        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)) ||
+      new Set(ids).size!==ids.length) fail("取消请求必须包含 1～300 个不重复的 UUID");
+  const cancelled=[],skipped=[];
+  for(const id of ids) {
+    const job=store.jobs.find(x=>x.id===id);
+    if(!job) {skipped.push({id,reason:"not_found"});continue;}
+    // Never cancel a leased/attempted job: the browser might have saved it
+    // even if its acknowledgement is missing.
+    if(job.status!=="pending" || job.attempts!==0 ||
+        job.openIntent===true || job.sendIntent===true) {
+      skipped.push({id,reason:"claimed_or_terminal",status:job.status,
+        attempts:job.attempts});continue;
+    }
+    job.status="cancelled";
+    job.updatedAt=now;
+    job.leaseUntil=Number.MAX_SAFE_INTEGER;
+    job.error="测试任务在扩展领取之前已取消；不会被自动发送";
+    cancelled.push(id);
+  }
+  return {cancelled,skipped};
+}
+function quarantineUncertainJobs(store,ids,now=Date.now()) {
+  if (!Array.isArray(ids) || !ids.length || ids.length>300 ||
+      ids.some(id=>typeof id!=="string" ||
+        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)) ||
+      new Set(ids).size!==ids.length) fail("隔离请求必须包含 1～300 个不重复的 UUID");
+  const quarantined=[],skipped=[];
+  for(const id of ids) {
+    const job=store.jobs.find(x=>x.id===id);
+    if(!job) {skipped.push({id,reason:"not_found"});continue;}
+    // A leased or already-sent message must not be represented as cancelled.
+    // Only an expired, attempted, still-unconfirmed dispatch can be quarantined.
+    if(job.status!=="pending" || job.attempts<1 || job.leaseUntil>now) {
+      skipped.push({id,reason:"not_expired_or_terminal",status:job.status,
+        attempts:job.attempts});continue;
+    }
+    job.status="review_required";
+    job.updatedAt=now;
+    job.leaseUntil=Number.MAX_SAFE_INTEGER;
+    job.error="该消息可能已经发送但没有回执；停止自动重试，请人工核对对话";
+    quarantined.push(id);
+  }
+  return {quarantined,skipped};
 }
 function normalizeTarget(target) {
   if (!target || typeof target!=="object" || !["chat","project"].includes(target.kind) ||
@@ -292,6 +339,20 @@ function makeServer() {
         fail("扩展接口不存在",404);
       }
       requireAgent(req);
+      if (req.method==="POST" && url.pathname==="/v1/jobs/cancel-unclaimed") {
+        const body=await readJson(req,18000);
+        const store=load();
+        const result=cancelUnclaimedJobs(store,body?.ids);
+        if(result.cancelled.length) save(store);
+        return output(res,200,{ok:true,...result});
+      }
+      if (req.method==="POST" && url.pathname==="/v1/jobs/quarantine-uncertain") {
+        const body=await readJson(req,18000);
+        const store=load();
+        const result=quarantineUncertainJobs(store,body?.ids);
+        if(result.quarantined.length) save(store);
+        return output(res,200,{ok:true,...result});
+      }
       if (req.method==="POST" && url.pathname==="/v1/jobs") {
         const store=load();
         const item=makeJob(await readJson(req));
@@ -398,6 +459,8 @@ async function cli(argv) {
       "  node remote-bridge.cjs bind --chat <名称> --url <现有对话地址>",
       "  node remote-bridge.cjs submit --json <文件> 结构化创建任务",
       "  node remote-bridge.cjs status [任务ID]      查看任务状态",
+      "  node remote-bridge.cjs cancel-unclaimed --json <JSON数组文件> 仅取消尚未领取的任务",
+      "  node remote-bridge.cjs quarantine-uncertain --json <JSON数组文件> 停止已过租约的不确定任务重试",
       "  node remote-bridge.cjs reset-pairing       改变浏览器扩展安装 ID 后重新配对",
       "  可以用 --file <UTF-8文件> 代替 --text；指定项目新聊天不会创建新项目。",
     ].join("\n")+"\n");return;
@@ -430,6 +493,18 @@ async function cli(argv) {
     data=await request("POST","/v1/bindings",{kind,name,url});
   }
   else if(command==="status") data=await request("GET","/v1/jobs"+(args[0]?"/"+encodeURIComponent(args[0]):""));
+  else if(command==="cancel-unclaimed") {
+    const file=args[args.indexOf("--json")+1];
+    if(!file || file.startsWith("--")) fail("需要 --json 指定 UUID 数组文件");
+    data=await request("POST","/v1/jobs/cancel-unclaimed",
+      {ids:JSON.parse(fs.readFileSync(path.resolve(file),"utf8"))});
+  }
+  else if(command==="quarantine-uncertain") {
+    const file=args[args.indexOf("--json")+1];
+    if(!file || file.startsWith("--")) fail("需要 --json 指定 UUID 数组文件");
+    data=await request("POST","/v1/jobs/quarantine-uncertain",
+      {ids:JSON.parse(fs.readFileSync(path.resolve(file),"utf8"))});
+  }
   else if(["enqueue","new","submit"].includes(command))
     data=await request("POST","/v1/jobs",argsToJob(command,args));
   else fail("未知指令，运行 help 查看说明");
@@ -438,4 +513,5 @@ async function cli(argv) {
 if(require.main===module) cli(process.argv.slice(2)).catch(error=>{
   process.stderr.write("操作失败："+error.message+"\n");process.exitCode=1;
 });
-module.exports={validateJob,makeJob,dispatchNext,updateJob,makeServer,ROOT,PORT};
+module.exports={validateJob,makeJob,dispatchNext,updateJob,
+  cancelUnclaimedJobs,quarantineUncertainJobs,makeServer,ROOT,PORT};
