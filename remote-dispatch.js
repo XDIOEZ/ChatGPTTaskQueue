@@ -9,6 +9,7 @@ globalThis.CQRemoteDispatch = (() => {
   const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
   const CHAT_URLS = ["https://chatgpt.com/*","https://chat.openai.com/*"];
   const ALARM = "cq.remote-bridge";
+  const TEAM_CHANNELS_KEY = "cq.remote.teamChannels.v1";
   let running = false;
   let targets = [];
 
@@ -127,7 +128,7 @@ globalThis.CQRemoteDispatch = (() => {
     ]);
     targets=listTargets(store,tabs,
       metadata["cq.dashboard.aliases.v1"],metadata["cq.dashboard.projects.v1"]);
-    await api("/targets",{targets});
+    await api("/targets",{targets,version:chrome.runtime.getManifest().version});
     return targets;
   }
 
@@ -140,6 +141,57 @@ globalThis.CQRemoteDispatch = (() => {
   function taggedJob(tab,jobId) {
     try {return new URL(tab.url).hash==="#cq-remote-job="+jobId;}
     catch {return false;}
+  }
+
+  function taggedTeamChannel(tab,chatId) {
+    try {return new URL(tab.url).hash==="#cq-team-channel="+chatId;}
+    catch {return false;}
+  }
+
+  async function teamChannels() {
+    const data=await chrome.storage.local.get(TEAM_CHANNELS_KEY);
+    const entries=data?.[TEAM_CHANNELS_KEY];
+    return entries && typeof entries==="object" && !Array.isArray(entries) ? entries : {};
+  }
+
+  async function rememberTeamChannel(chatId,tabId) {
+    if(!/^[a-zA-Z0-9-]+$/.test(chatId) || !Number.isInteger(tabId))
+      throw new Error("协作专用标签标识无效");
+    const channels=await teamChannels();
+    if(channels[chatId]===tabId) return;
+    await chrome.storage.local.set({[TEAM_CHANNELS_KEY]:{
+      ...channels,[chatId]:tabId,
+    }});
+  }
+
+  async function findTeamChannel(job,target,current) {
+    const channels=await teamChannels();
+    const remembered=Number.isInteger(channels[target.id])
+      ? current.find(tab=>tab.id===channels[target.id] && sameScope(tab,target)) : null;
+    if(remembered) return remembered;
+    const marked=current.filter(tab=>sameScope(tab,target) &&
+      taggedTeamChannel(tab,target.id));
+    if(marked.length>1) throw new Error("同一成员存在多个协作通道，请人工核对");
+    if(marked.length===1) {
+      await rememberTeamChannel(target.id,marked[0].id);
+      await api("/report",{id:job.id,status:"opening",tabId:marked[0].id});
+      return marked[0];
+    }
+    if(job.openIntent) throw new Error(
+      "协作消息已尝试创建专用标签，但原标签无法核实；拒绝重复开页");
+    await api("/report",{id:job.id,status:"opening",openIntent:true});
+    const sameWindow=current.find(tab=>sameScope(tab,target) &&
+      Number.isInteger(tab.windowId)) ||
+      current.find(tab=>Number.isInteger(tab.windowId));
+    // Unlike a normal user task, multiple team messages share this ONE
+    // inactive inbox tab per chat. Never hijack a user's unrelated tab.
+    const tab=await chrome.tabs.create({
+      url:target.url+"#cq-team-channel="+target.id,active:false,
+      ...(sameWindow?{windowId:sameWindow.windowId}:{}),
+    });
+    await rememberTeamChannel(target.id,tab.id);
+    await api("/report",{id:job.id,status:"opening",tabId:tab.id});
+    return tab;
   }
 
   async function findOrOpen(job,target) {
@@ -159,6 +211,7 @@ globalThis.CQRemoteDispatch = (() => {
       if(!owner) throw new Error("引导只能使用指定旧对话已有的标签页；请打开该对话");
       return owner;
     }
+    if(job.channel==="team") return findTeamChannel(job,target,current);
     // All ordinary jobs get their own inactive TAB within the existing
     // browser window. A unique URL fragment permits crash-time discovery.
     const matching=current.filter(tab=>taggedJob(tab,job.id));
@@ -204,8 +257,16 @@ globalThis.CQRemoteDispatch = (() => {
       const result=await chrome.tabs.sendMessage(tab.id,{
         type:"CQ_REMOTE_INSPECT",id:job.id,text:job.text,targetUrl:tab.url,
       });
-      if(result?.ok && result.observed === true)
+      if(result?.ok && result.observed === true) {
+        if(job.channel==="team_spawn") {
+          // The new chat is already confirmed. A storage hiccup must not
+          // turn it into a failed/newly re-created chat; later messages may
+          // still recover the marked channel or create a dedicated inbox.
+          try {await rememberTeamChannel(chatKey(url).slice(5),tab.id);}
+          catch(error) {console.warn("[ChatQueue] 团队通道绑定稍后恢复",error);}
+        }
         return {status:"created",chatUrl:url,tabId:tab.id,taskId:job.taskId};
+      }
     } catch { /* ChatGPT may still be hydrating the new route. */ }
     return {status:"waiting",tabId:tab.id,error:"等待确认新对话首条消息"};
   }

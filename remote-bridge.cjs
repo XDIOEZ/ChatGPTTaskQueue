@@ -121,17 +121,23 @@ function validateJob(input) {
   const mode=input.mode || "queue";
   if (!["queue","steer"].includes(mode) || (action==="new_chat" && mode!=="queue"))
     fail("新对话仅支持 queue；已有对话支持 queue / steer");
+  const channel=input.channel||"job";
+  if (!["job","team","team_spawn"].includes(channel) ||
+      (channel==="team" && (action!=="continue" || mode!=="queue")) ||
+      (channel==="team_spawn" && (action!=="new_chat" || mode!=="queue")))
+    fail("channel 类型不合法：team 用于已有对话消息，team_spawn 用于团队新对话");
   return {action,text:input.text,target:{
     kind:target.kind,...(target.id?{id:target.id}:{}),
     ...(target.url?{url:target.url}:{}),...(target.name?{name:target.name}:{})
-  },mode};
+  },mode,...(channel!=="job"?{channel}:{})};
 }
 function publicJob(job) {
   const {id,action,target,mode,status,createdAt,updatedAt,attempts,tabId,taskId,chatUrl,error,
-    openIntent,sendIntent}=job;
+    openIntent,sendIntent,channel}=job;
   return {id,action,target,mode,status,createdAt,updatedAt,attempts,
     ...(tabId?{tabId}:{}),...(taskId?{taskId}:{}),
     ...(chatUrl?{chatUrl}:{}),...(error?{error}:{}),
+    ...(channel?{channel}:{}) ,
     ...(openIntent===true?{openIntent:true}:{}),
     ...(sendIntent===true?{sendIntent:true}:{})};
 }
@@ -242,7 +248,8 @@ function makeServer() {
         res.writeHead(204);res.end();return;
       }
       if (req.method==="GET" && url.pathname==="/health")
-        return output(res,200,{ok:true,service:"chatgpt-task-queue-bridge",version:1});
+        return output(res,200,{ok:true,service:"chatgpt-task-queue-bridge",
+          version:2,features:["extension_version","team_channels"]});
       if (url.pathname.startsWith("/v1/extension/")) {
         requireExtension(req);
         if (req.method==="GET" && url.pathname==="/v1/extension/poll") {
@@ -264,6 +271,11 @@ function makeServer() {
           const data=await readJson(req,160000);
           if (!Array.isArray(data.targets) || data.targets.length>500) fail("目标列表无效");
           const store=load();
+          // A live browser version proof prevents a new Skill from silently
+          // relying on an obsolete extension which lacks team channel reuse.
+          store.extensionVersion=typeof data.version==="string" &&
+            /^\d{1,4}(?:\.\d{1,4}){2,3}$/.test(data.version)
+            ? data.version:null;
           store.targets=data.targets.filter(t=>t && ["chat","project"].includes(t.kind) &&
             typeof t.id==="string" && t.id.length<200 &&
             typeof t.url==="string" && t.url.length<600).map(t=>({

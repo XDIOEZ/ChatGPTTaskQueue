@@ -1,3 +1,23 @@
+### v0.49.57：GPT 队列专属多智能体协作 Skill（Git 管理，扩展在线才启用）
+
+- 协作规则、安装器与消息 CLI 都保存在此仓库的 `skills/gpt-queue-agent-team/`，版本由 Git 管理，不复制/覆盖已有全局 `agent-team`。
+- **每次协作都先检查扩展**：`doctor` 检查插件文件、本机桥接器、扩展 ID 配对、扩展实际版本和最近 120 秒内的同步。即使 Skill 已链接到 Codex，扩展下线或未重新加载新版后也不能启动新协作或发送团队消息。
+- 首次启用：在本仓库运行 `node skills/gpt-queue-agent-team/team.cjs install`，仅当扩展在线时向 `%USERPROFILE%\.codex\skills\gpt-queue-agent-team` 建立目录链接；重启/刷新 Codex 的 Skill 列表后可显式调用 `$gpt-queue-agent-team`。删除插件或不再使用时可以执行 `uninstall` 解除链接，Git 内源文件仍在。
+- 建议主智能体为每个独立任务建立单独的 Git worktree/分支，按模块分配开发所有权。**团队通信使用每位成员固定的后台标签，后续复用；普通用户任务仍独立开页**。只有显式 `--mode steer --urgent` 才能在现有对话直接引导。
+- 简短使用示例（不自动创建真实开发任务）：
+
+```powershell
+node skills/gpt-queue-agent-team/team.cjs doctor
+node skills/gpt-queue-agent-team/team.cjs init --run liquid-01 --repo "D:\_Unity\_UnityProject\FlatWorld" --project FlatWorld --lead-chat "https://chatgpt.com/g/项目ID/c/主智能体对话ID"
+node skills/gpt-queue-agent-team/team.cjs spawn --run liquid-01 --member gas --role researcher --task "调查气体管网并主动向主智能体交换发现"
+node skills/gpt-queue-agent-team/team.cjs sync --run liquid-01
+node skills/gpt-queue-agent-team/team.cjs send --run liquid-01 --from lead --to gas --type CONTRACT --text "请先确认体积、温度和压力接口"
+node skills/gpt-queue-agent-team/team.cjs status --run liquid-01
+```
+
+- 每条消息带 `run/messageId/from/to/type`，接收者必须使用 `ack` 显式确认，ACK 会登记并尽力回送到发件人的对话。**`queued` 仅说明已存入发送队列，不能代替成员 ACK 或实际完成**。通信账本保存于用户本地 `ChatGPTTaskQueue/team-skill`，不写入 Git，避免多人同时改动任务状态文件；Git 只管理协作规则、代码与提交。
+- `team.cjs help` 展示所有命令；只有已经真实创建、`sync` 获得正式对话 URL 的成员才能接收新消息。提交不明时禁止盲目重试开页/发送，避免队列风暴。
+
 ### v0.49.56：AI 远程为指定对话创建任务 / 引导 / 项目新对话
 
 - 新增本机 Node 桥接器 `remote-bridge.cjs` 和浏览器扩展调度器 `remote-dispatch.js`。通过 HomePC2 在电脑执行命令，AI 即可给指定旧对话入队、直接引导当前任务，或在指定 ChatGPT 项目里创建独立新对话；不通过远程服务、不直接篡改 Chrome 本地队列数据库。

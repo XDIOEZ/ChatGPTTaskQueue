@@ -17,6 +17,7 @@ const jobId="12345678-1234-4234-8234-123456789abc";
 function harness() {
   const tabs=[{id:1,url:chatUrl,status:"complete",active:true,windowId:7}];
   const created=[],reports=[],messages=[];
+  const storage={};
   let owner=1;
   const chrome={
     runtime:{id:"abcdefghijklmnopabcdefghijklmnop"},
@@ -27,9 +28,16 @@ function harness() {
           url:props.url,active:props.active};
         created.push(tab);tabs.push(tab);return tab;
       },
-      async sendMessage(id,message){messages.push({id,message});return {ok:true};},
+      async sendMessage(id,message){
+        messages.push({id,message});
+        return message.type==="CQ_REMOTE_INSPECT"?
+          {ok:true,observed:true}:{ok:true};
+      },
     },
-    storage:{local:{async get(){return {};}}},
+    storage:{local:{
+      async get(key){return {[key]:storage[key]};},
+      async set(values){Object.assign(storage,values);},
+    }},
   };
   const sandbox={
     URL,console,chrome,AbortController,setTimeout,clearTimeout,
@@ -62,7 +70,7 @@ function harness() {
     },
   };
   const remote=vm.runInNewContext(source+"\nCQRemoteDispatch",sandbox);
-  return {remote,tabs,created,reports,messages,setOwner(id){owner=id;}};
+  return {remote,tabs,created,reports,messages,storage,setOwner(id){owner=id;}};
 }
 
 test("普通旧对话任务必须另开后台标签，同任务重试不再次开页",async()=>{
@@ -113,5 +121,45 @@ test("已记录发送/开页意图与标签ID的任务，目标页关闭或改�
   assert.equal(env.created.length,0);
   env.tabs.push({id:31,url:projectUrl,status:"complete",active:false});
   await assert.rejects(()=>env.remote.findOrOpen(job,targetChat),/已切换目标/);
+  assert.equal(env.created.length,0);
+});
+
+test("协作队列每位成员只有一个后台通信标签，多条消息重复利用",async()=>{
+  const env=harness();
+  const channel="cq.remote.teamChannels.v1";
+  const first={id:jobId,action:"continue",mode:"queue",channel:"team"};
+  const second={...first,id:"88888888-1234-4234-8234-123456789abc"};
+  const tab1=await env.remote.findOrOpen(first,targetChat);
+  assert.equal(tab1.active,false);
+  assert.equal(env.created.length,1);
+  assert.equal(env.storage[channel][targetChat.id],tab1.id);
+  assert.equal(new URL(tab1.url).hash,"#cq-team-channel="+targetChat.id);
+  const tab2=await env.remote.findOrOpen(second,targetChat);
+  assert.equal(tab2.id,tab1.id);
+  assert.equal(env.created.length,1);
+  assert.equal(env.tabs[0].active,true,"用户原标签始终不被协作消息接管");
+  env.tabs[1].url=chatUrl;
+  const tab3=await env.remote.findOrOpen({...second,openIntent:true},targetChat);
+  assert.equal(tab3.id,tab1.id,"即使 URL 标记被网页清除，持久 channel 表也能找回");
+  assert.equal(env.created.length,1);
+  env.tabs.splice(1,1);
+  await assert.rejects(()=>env.remote.findOrOpen({...second,openIntent:true},targetChat),
+    /拒绝重复开页/);
+});
+
+test("团队新建项目子对话确认后，原后台标签成为成员通信标签",async()=>{
+  const env=harness();
+  const url="https://chatgpt.com/g/"+projectId+"/c/chat-worker";
+  env.tabs.push({id:2,url,status:"complete",active:false,windowId:7});
+  const createJob={id:jobId,action:"new_chat",channel:"team_spawn",
+    mode:"queue",taskId:"task-1",tabId:2,text:"hello",
+    target:{kind:"project",id:projectId,url:projectUrl}};
+  const result=await env.remote.executeJob(createJob);
+  assert.equal(result.status,"created");
+  assert.equal(env.storage["cq.remote.teamChannels.v1"]["chat-worker"],2);
+  const next=await env.remote.findOrOpen({id:"88888888-1234-4234-8234-123456789abc",
+    action:"continue",mode:"queue",channel:"team"},
+    {kind:"chat",id:"chat-worker",url});
+  assert.equal(next.id,2);
   assert.equal(env.created.length,0);
 });

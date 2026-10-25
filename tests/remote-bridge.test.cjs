@@ -54,6 +54,7 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
     "https://example.com")).code,403);
   const extensionOrigin="chrome-extension://"+extensionId;
   const discovery=await call("POST","/v1/extension/targets",{
+    version:require("../manifest.json").version,
     targets:[{kind:"chat",id:"chat-123",url:chatUrl,name:"游戏问题讨论"},
       {kind:"project",id:"g-p-1234567890abcdef1234567890abcdef",
         url:projectUrl,name:"FlatWorld"}],
@@ -61,6 +62,8 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
   assert.equal(discovery.code,200);
   assert.equal(discovery.data.count,2);
   assert.equal(discovery.headers["access-control-allow-origin"],extensionOrigin);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(temp,"jobs.json"),"utf8")).extensionVersion,
+    require("../manifest.json").version);
 
   const first=await call("POST","/v1/jobs",{
     action:"continue",target:{kind:"chat",name:"游戏问题讨论"},
@@ -113,6 +116,14 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
 });
 
 test("输入校验和租约重试：类型、长度、终态不会重复领取",()=>{
+  assert.equal(bridge.validateJob({action:"continue",mode:"queue",channel:"team",
+    target:{kind:"chat",name:"A"},text:"team"}).channel,"team");
+  assert.equal(bridge.validateJob({action:"new_chat",channel:"team_spawn",
+    target:{kind:"project",name:"FlatWorld"},text:"spawn"}).channel,"team_spawn");
+  assert.throws(()=>bridge.validateJob({action:"new_chat",channel:"team",
+    target:{kind:"project",name:"FlatWorld"},text:"invalid"}));
+  assert.throws(()=>bridge.validateJob({action:"continue",channel:"team_spawn",
+    target:{kind:"chat",name:"A"},text:"invalid"}));
   assert.throws(()=>bridge.validateJob({action:"new_chat",mode:"steer",
     target:{kind:"project",id:"g-p-abc"},text:"hi"}));
   assert.throws(()=>bridge.validateJob({action:"continue",
