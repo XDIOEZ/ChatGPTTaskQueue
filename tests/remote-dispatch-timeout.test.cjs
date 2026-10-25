@@ -45,7 +45,10 @@ test("卡住的 ChatGPT 页面 RPC 会超时释放调度锁，下一条仍能继
     async fetch(endpoint,options){
       const suffix=new URL(endpoint).pathname;
       requests.push(suffix);
-      const payload=suffix.endsWith("/poll")?{ok:true,job:jobs.shift()||null}:{ok:true};
+      const payload=suffix==="/v1/extension/poll"
+        ? {ok:true,job:jobs.shift()||null}
+        : suffix==="/v1/extension/releases/poll"
+        ? {ok:true,request:null} : {ok:true};
       if(suffix.endsWith("/report")) reports.push(JSON.parse(options.body));
       return {ok:true,async json(){return payload;}};
     },
@@ -60,7 +63,7 @@ test("卡住的 ChatGPT 页面 RPC 会超时释放调度锁，下一条仍能继
   assert.equal(tabCreates,0,"timeouts never open extra tabs");
   assert.equal(requests.filter(x=>x.endsWith("/targets")).length,3,
     "every tick can refresh extension heartbeat after the previous timeout");
-  assert.equal(requests.filter(x=>x.endsWith("/poll")).length,3);
+  assert.equal(requests.filter(x=>x==="/v1/extension/poll").length,3);
   const final=reports.filter(x=>["waiting","review_required"].includes(x.status));
   assert.deepEqual(Array.from(final,x=>x.status),["waiting","waiting","review_required"]);
   assert.ok(final.slice(0,2).every(x=>x.error.includes("回执超时")));

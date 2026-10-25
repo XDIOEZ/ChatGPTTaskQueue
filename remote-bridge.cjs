@@ -22,6 +22,8 @@ const MAX_JOBS = 300;
 // Align with the extension's requireText limit; never accept a job it cannot send.
 const MAX_TEXT = 12000;
 const TERMINAL = new Set(["queued","steered","created","failed","review_required","cancelled"]);
+const RELEASE_RUN_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{2,63}$/;
+const RELEASE_OUTCOMES = new Set(["closed","deferred","skipped"]);
 const EXTENSION_HEADER = "chatgpt-task-queue-extension-v1";
 
 function fail(message,code=400) {
@@ -36,7 +38,9 @@ function token() {
     crypto.randomBytes(32).toString("hex"),{mode:0o600,flag:"wx"});
   return fs.readFileSync(TOKEN_FILE,"utf8").trim();
 }
-function emptyStore() { return {version:1,jobs:[],targets:[],targetsAt:null,bindings:[]}; }
+function emptyStore() {
+  return {version:1,jobs:[],targets:[],targetsAt:null,bindings:[],releases:[]};
+}
 function load() {
   ensureRoot();
   if (!fs.existsSync(DATA_FILE)) return emptyStore();
@@ -44,6 +48,7 @@ function load() {
   if (data.version!==1 || !Array.isArray(data.jobs) || !Array.isArray(data.targets))
     fail("桥接器数据格式不兼容，已停止以免覆盖数据",500);
   if (!Array.isArray(data.bindings)) data.bindings=[];
+  if (!Array.isArray(data.releases)) data.releases=[];
   return data;
 }
 function save(data) {
@@ -126,24 +131,116 @@ function validateJob(input) {
       (channel==="team" && (action!=="continue" || mode!=="queue")) ||
       (channel==="team_spawn" && (action!=="new_chat" || mode!=="queue")))
     fail("channel 类型不合法：team 用于已有对话消息，team_spawn 用于团队新对话");
+  const runId=input.runId;
+  if(runId!=null && (!RELEASE_RUN_PATTERN.test(runId) || channel==="job"))
+    fail("只有协作消息可以包含合法 runId");
   return {action,text:input.text,target:{
     kind:target.kind,...(target.id?{id:target.id}:{}),
     ...(target.url?{url:target.url}:{}),...(target.name?{name:target.name}:{})
-  },mode,...(channel!=="job"?{channel}:{})};
+  },mode,...(channel!=="job"?{channel}:{}),
+    ...(runId?{runId}:{})};
 }
 function publicJob(job) {
   const {id,action,target,mode,status,createdAt,updatedAt,attempts,tabId,taskId,chatUrl,error,
-    openIntent,sendIntent,channel}=job;
+    openIntent,sendIntent,channel,runId}=job;
   return {id,action,target,mode,status,createdAt,updatedAt,attempts,
     ...(tabId?{tabId}:{}),...(taskId?{taskId}:{}),
     ...(chatUrl?{chatUrl}:{}),...(error?{error}:{}),
-    ...(channel?{channel}:{}) ,
+    ...(channel?{channel}:{}),...(runId?{runId}:{}),
     ...(openIntent===true?{openIntent:true}:{}),
     ...(sendIntent===true?{sendIntent:true}:{})};
 }
 function makeJob(input,now=Date.now()) {
   return {...validateJob(input),id:crypto.randomUUID(),status:"pending",
     createdAt:now,updatedAt:now,attempts:0,leaseUntil:0};
+}
+
+function releaseChatUrl(value) {
+  if (typeof value!=="string") fail("释放目标必须是 ChatGPT 对话地址");
+  let parsed;
+  try {parsed=new URL(value);}catch {fail("无效的对话地址");}
+  if(parsed.protocol!=="https:" ||
+      !["chatgpt.com","chat.openai.com"].includes(parsed.hostname))
+    fail("只能释放 ChatGPT 官方对话");
+  const match=parsed.pathname.match(/(?:^|\/)c\/([a-zA-Z0-9-]+)\/?$/);
+  if(!match) fail("释放目标必须是已建立的聊天，而不是项目主页");
+  return {id:match[1],url:parsed.origin+parsed.pathname.replace(/\/+$/,"")};
+}
+function createReleaseRequest(store,input,now=Date.now()) {
+  if(!input || !RELEASE_RUN_PATTERN.test(input.runId||"")) fail("协作 runId 无效");
+  if(!Array.isArray(input.chats) || !input.chats.length || input.chats.length>30)
+    fail("释放需提供 1～30 个明确的协作对话 URL");
+  const chats=input.chats.map(releaseChatUrl);
+  if(new Set(chats.map(c=>c.id)).size!==chats.length)
+    fail("协作释放目标存在重复聊天");
+  const existing=store.releases.find(r=>r.runId===input.runId);
+  if(existing) {
+    if(JSON.stringify(existing.chats.map(c=>c.id).sort())!==
+      JSON.stringify(chats.map(c=>c.id).sort()))
+      fail("同一 run 的释放目标已固定，拒绝改变目标",409);
+    return existing;
+  }
+  if(store.releases.length>=200) fail("释放请求已满，请先检查已完成记录",409);
+  const request={id:crypto.randomUUID(),runId:input.runId,
+    createdAt:now,updatedAt:now,leaseUntil:0,attempts:0,
+    status:"pending",chats:chats.map(c=>({...c,status:"pending"}))};
+  store.releases.push(request);
+  return request;
+}
+function claimReleaseRequest(store,now=Date.now()) {
+  const request=store.releases.find(r=>r.status==="pending" && r.leaseUntil<=now);
+  if(!request) return null;
+  if(request.attempts>=25 || now-request.createdAt>24*60*60*1000) {
+    request.status="review_required";
+    request.updatedAt=now;
+    request.chats.forEach(c=>{
+      if(c.status==="pending"){c.status="review_required";c.reason="超出安全重试次数";}
+    });
+    return null;
+  }
+  request.attempts++;
+  request.leaseUntil=now+90000;
+  const selected=request.chats.filter(c=>c.status==="pending")
+    .sort((a,b)=>(a.lastTriedAt||0)-(b.lastTriedAt||0))
+    .slice(0,5);
+  for(const chat of selected) chat.lastTriedAt=now;
+  return {id:request.id,runId:request.runId,
+    chats:selected.map(c=>({id:c.id,url:c.url})),
+    attempts:request.attempts};
+}
+function reportReleaseRequest(store,input,now=Date.now()) {
+  const request=store.releases.find(r=>r.id===input?.id);
+  if(!request) fail("协作释放请求不存在",404);
+  if(!Array.isArray(input.results) || input.results.length>30)
+    fail("释放结果格式错误");
+  for(const result of input.results) {
+    if(!result || !RELEASE_OUTCOMES.has(result.status)) fail("释放状态错误");
+    const chat=request.chats.find(c=>c.id===result.id);
+    if(!chat) fail("不能回报其他协作运行的聊天");
+    if(chat.status!=="pending") continue;
+    if(result.status==="deferred") {
+      chat.reason=String(result.reason||"等待任务结束").slice(0,180);
+    }else {
+      chat.status=result.status;
+      chat.reason=String(result.reason||"").slice(0,180);
+    }
+  }
+  request.updatedAt=now;
+  if(request.chats.every(c=>c.status!=="pending")) {
+    request.status="finished";
+    request.leaseUntil=Number.MAX_SAFE_INTEGER;
+  }else {
+    request.status="pending";
+    request.leaseUntil=now+60000;
+  }
+  return request;
+}
+function publicRelease(request) {
+  return {id:request.id,runId:request.runId,status:request.status,
+    createdAt:request.createdAt,updatedAt:request.updatedAt,
+    attempts:request.attempts,chats:request.chats.map(c=>({
+      id:c.id,url:c.url,status:c.status,...(c.reason?{reason:c.reason}:{})
+    }))};
 }
 function cancelUnclaimedJobs(store,ids,now=Date.now()) {
   if (!Array.isArray(ids) || !ids.length || ids.length>300 ||
@@ -296,9 +393,20 @@ function makeServer() {
       }
       if (req.method==="GET" && url.pathname==="/health")
         return output(res,200,{ok:true,service:"chatgpt-task-queue-bridge",
-          version:2,features:["extension_version","team_channels"]});
+          version:3,features:["extension_version","team_channels","safe_tab_release"]});
       if (url.pathname.startsWith("/v1/extension/")) {
         requireExtension(req);
+        if(req.method==="GET" && url.pathname==="/v1/extension/releases/poll") {
+          const store=load(),request=claimReleaseRequest(store);
+          if(request || store.releases.some(r=>r.status==="review_required")) save(store);
+          return output(res,200,{ok:true,request});
+        }
+        if(req.method==="POST" && url.pathname==="/v1/extension/releases/report") {
+          const message=await readJson(req,6500),store=load();
+          const request=reportReleaseRequest(store,message);
+          save(store);
+          return output(res,200,{ok:true,release:publicRelease(request)});
+        }
         if (req.method==="GET" && url.pathname==="/v1/extension/poll") {
           const store=load(); const job=dispatchNext(store);
           // dispatchNext may mark an exhausted job review_required without
@@ -339,6 +447,18 @@ function makeServer() {
         fail("扩展接口不存在",404);
       }
       requireAgent(req);
+      if(req.method==="POST" && url.pathname==="/v1/releases") {
+        const input=await readJson(req,10000),store=load();
+        const request=createReleaseRequest(store,input);
+        save(store);
+        return output(res,200,{ok:true,release:publicRelease(request)});
+      }
+      const releaseLookup=url.pathname.match(/^\/v1\/releases\/([a-zA-Z0-9_-]{3,64})$/);
+      if(req.method==="GET" && releaseLookup) {
+        const request=load().releases.find(r=>r.runId===releaseLookup[1]);
+        if(!request) fail("协作释放请求不存在",404);
+        return output(res,200,{ok:true,release:publicRelease(request)});
+      }
       if (req.method==="POST" && url.pathname==="/v1/jobs/cancel-unclaimed") {
         const body=await readJson(req,18000);
         const store=load();
@@ -514,4 +634,5 @@ if(require.main===module) cli(process.argv.slice(2)).catch(error=>{
   process.stderr.write("操作失败："+error.message+"\n");process.exitCode=1;
 });
 module.exports={validateJob,makeJob,dispatchNext,updateJob,
-  cancelUnclaimedJobs,quarantineUncertainJobs,makeServer,ROOT,PORT};
+  cancelUnclaimedJobs,quarantineUncertainJobs,
+  createReleaseRequest,claimReleaseRequest,reportReleaseRequest,makeServer,ROOT,PORT};

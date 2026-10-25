@@ -78,10 +78,11 @@ node skills/gpt-queue-agent-team/team.cjs inbox --run liquid-01 --member liquid
 - **契约先确认**：跨模块接口写入前把 `CONTRACT` 发送给依赖成员，收到 ACK 后才进行破坏性联动。独立不受该接口影响的任务可继续并行。
 - 工作结果使用明确 commit SHA + 测试命令/输出发 `READY`；复查者独立 CodeReviewFix，发现问题立即发 `REVIEW`，开发者修复后发 `VERIFIED`。
 - 主智能体审计未 ACK / 未解决的重大阻塞，确认所有依赖收敛才集成；不使用 `git reset --hard` 清除其他成员工作；不强制推送。
+- **任务验收后释放成员后台聊天标签**：只有所有成员 `READY`/`VERIFIED` 获主智能体 ACK、所有消息和 ACK 回执已经确认为入队、Git 集成和测试完成，主智能体才调用 `node skills/gpt-queue-agent-team/team.cjs finish --run <ID> --verified`，随后执行 `sync`/`status` 检查结果。关闭只针对插件自建、没有未完成回复、没有草稿且未被用户访问过的后台标签；不删除聊天历史，不关闭用户窗口。**不能提前 finish 或通过 finish 绕过未确认的协作消息。**
 - 测试未执行或受 Unity PlayMode/Edge 环境限制，必须如实说明。依项目 Git 规范只提交本任务改动；除非用户要求，否则不推送发布。
 
 ## 5. 交付
 
-主智能体简洁汇报：**成员/模块进展｜关键消息与 ACK｜CodeReviewFix｜测试｜Git commit｜剩余风险**。如果队列在线但接收方没有 ACK，只能标记“已排队待确认”，不可宣称已完成跨智能体协作。
+主智能体简洁汇报：**成员/模块进展｜关键消息与 ACK｜CodeReviewFix｜测试｜Git commit｜窗口释放状态｜剩余风险**。如果队列在线但接收方没有 ACK，只能标记“已排队待确认”，不可宣称已完成跨智能体协作。
 
 > 队列通信与本地 ACK 登记是可追踪的异步工作流，不能凭 `queued` 推断其他 AI 已理解并执行；缺乏可读回复内容时依赖对端主动回执。服务与插件关闭后，本 Skill 必须停止发起新协作。

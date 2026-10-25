@@ -10,9 +10,11 @@ globalThis.CQRemoteDispatch = (() => {
   const CHAT_URLS = ["https://chatgpt.com/*","https://chat.openai.com/*"];
   const ALARM = "cq.remote-bridge";
   const TEAM_CHANNELS_KEY = "cq.remote.teamChannels.v1";
+  const OWNED_TABS_KEY = "cq.remote.ownedTabs.v1";
   const TAB_RESPONSE_TIMEOUT_MS = 20000;
   let running = false;
   let targets = [];
+  let ownershipSerial = Promise.resolve();
 
   function withTabResponseDeadline(promise,timeoutMs=TAB_RESPONSE_TIMEOUT_MS) {
     let guard;
@@ -159,6 +161,241 @@ globalThis.CQRemoteDispatch = (() => {
     catch {return false;}
   }
 
+  async function ownedTabs() {
+    const stored=await withTabResponseDeadline(chrome.storage.local.get(OWNED_TABS_KEY));
+    const value=stored?.[OWNED_TABS_KEY];
+    return value && typeof value==="object" && !Array.isArray(value) ? value : {};
+  }
+
+  function editOwnedTabs(mutate) {
+    // A foreground activation must not be lost behind a concurrent
+    // channel-registration write. Never infer ownership from an open URL.
+    const update=ownershipSerial.then(async()=>{
+      const entries=await ownedTabs();
+      if(mutate(entries)===false) return;
+      await withTabResponseDeadline(chrome.storage.local.set({[OWNED_TABS_KEY]:entries}));
+    });
+    ownershipSerial=update.catch(()=>{});
+    return update;
+  }
+
+  async function rememberOwned(tab,job,kind) {
+    if(!Number.isInteger(tab?.id) || !UUID.test(job?.id)) throw new Error("远程标签创建凭据无效");
+    await editOwnedTabs(entries=>{
+      const key=String(tab.id),current=entries[key];
+      if(current && current.jobId!==job.id && current.kind==="job")
+        throw new Error("不能将普通任务的独占标签归属转移给其他任务");
+      const runIds=[...new Set([...(current?.runIds||[]),
+        ...(job.runId?[job.runId]:[])])];
+      entries[key]={tabId:tab.id,kind:current?.kind||kind,
+        jobId:current?.jobId||job.id,
+        chatId:current?.chatId|| (kind!=="team_spawn"
+          ? job.target?.id||chatKey(tab.url)?.slice(5) : null),
+        projectId:current?.projectId||
+          (job.action==="new_chat"
+            ? CQHandoff.normalizeProjectId(job.target?.id)
+            : CQHandoff.projectId(tab.url))||null,
+        taskId:current?.taskId||null,
+        finished:current?.finished===true,
+        visited:current?.visited===true,runIds,
+        releasedRuns:current?.releasedRuns||[],
+        createdAt:current?.createdAt||Date.now()};
+    });
+  }
+
+  async function noteOwnedTask(tabId,job,taskId,chatUrl=null) {
+    if(!Number.isInteger(tabId)) return;
+    await editOwnedTabs(entries=>{
+      const existing=entries[String(tabId)];
+      if(!existing || (existing.kind==="job" && existing.jobId!==job.id)) return false;
+      if(typeof taskId==="string" && taskId.length<128) existing.taskId=taskId;
+      const id=chatUrl ? chatKey(chatUrl) : null;
+      if(id) existing.chatId=id.slice(5);
+      if(job.runId && !existing.runIds.includes(job.runId)) existing.runIds.push(job.runId);
+    });
+  }
+
+  function idleSessionFor(store,entry) {
+    if(!entry.chatId || !Array.isArray(entry.runIds)) return null;
+    const state=store.conversations?.["chat:"+entry.chatId];
+    // The tab owner can move between multiple extension-created tabs.
+    // All such tabs are eligible ONLY after their shared conversation is
+    // idle; their individual proof/ownership checks happen separately.
+    if(!state || state.halted || state.queuePaused ||
+        state.activeTaskId || state.steeringTaskId || state.handoffSourceKey ||
+        state.error || state.tasks?.length || state.schedules?.length ||
+        state.handoff?.phase && state.handoff.phase!=="idle") return null;
+    return state;
+  }
+
+  async function releaseOwnedChat(chatId,runId=null,expectedTaskId=null) {
+    const records=await ownedTabs();
+    const candidates=Object.values(records).filter(entry=>
+      entry?.chatId===chatId && (runId
+        ? entry.runIds?.includes(runId)
+        : entry.kind==="job" && entry.finished===true &&
+          entry.taskId===expectedTaskId));
+    if(!candidates.length) return {status:"skipped",reason:"没有可以证明由插件创建的后台标签"};
+    let closed=0,waiting=0,reason="";
+    for(const entry of candidates) {
+      if(runId && !entry.releasedRuns?.includes(runId)) {
+        await editOwnedTabs(entries=>{
+          const current=entries[String(entry.tabId)];
+          if(current?.chatId===chatId && current.runIds?.includes(runId))
+            current.releasedRuns=[...new Set([...(current.releasedRuns||[]),runId])];
+        });
+        entry.releasedRuns=[...(entry.releasedRuns||[]),runId];
+      }
+      if(entry.visited || runId && entry.runIds?.some(id=>
+          !entry.releasedRuns?.includes(id))) {
+        reason="标签被用户查看或仍由其他协作运行使用";
+        continue;
+      }
+      let tab;
+      try {tab=await withTabResponseDeadline(chrome.tabs.get(entry.tabId));}
+      catch(error) {
+        // A timeout is not proof that a tab disappeared.
+        if(/No tab with id|tab not found|No tab found/i.test(error.message||"")) {
+          await forgetOwnedTab(entry.tabId);closed++;continue;
+        }
+        waiting++;reason="浏览器无法确认标签是否存在";continue;
+      }
+      if(!tab || tab.active || tab.pinned || tab.audible || tab.discarded ||
+          tab.status!=="complete" ||
+          chatKey(tab.url)!=="chat:"+chatId) {
+        reason="标签正在被用户使用、加载或目标已发生变化";
+        continue;
+      }
+      const store=await withTabResponseDeadline(readStore());
+      const state=idleSessionFor(store,entry);
+      if(!state) {waiting++;reason="队列尚未清空或会话被安全暂停";continue;}
+      if(!runId && (!expectedTaskId || !state.history?.some(h=>
+        h.type==="finished" && h.taskId===expectedTaskId))) {
+        waiting++;reason="尚无对应队列消息的完成证据";continue;
+      }
+      let response;
+      try {
+        response=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
+          type:"CQ_REMOTE_RELEASE_CHECK",chatId,targetUrl:tab.url,
+        }));
+      }catch {waiting++;reason="当前网页无法确认草稿和回复状态";continue;}
+      if(!response?.ok || response.safe!==true) {
+        waiting++;reason=response?.reason||"网页检测到未完成回复或输入草稿";continue;
+      }
+      // Double-check tab and persistent ownership immediately before a
+      // destructive close. An activated tab must always win this race.
+      const latest=(await ownedTabs())[String(tab.id)];
+      if(!latest || latest.visited ||
+          latest.chatId!==chatId || latest.jobId!==entry.jobId) {
+        reason="标签所有权已变化";continue;
+      }
+      const newest=await withTabResponseDeadline(chrome.tabs.get(tab.id));
+      if(newest.active || newest.pinned || newest.audible ||
+          chatKey(newest.url)!=="chat:"+chatId) {
+        reason="用户已切换到该标签";continue;
+      }
+      if(!Number.isInteger(newest.windowId)) {
+        reason="无法确认标签所属浏览器窗口";continue;
+      }
+      const windowTabs=await withTabResponseDeadline(chrome.tabs.query({
+        windowId:newest.windowId,
+      }));
+      if(!Array.isArray(windowTabs) || windowTabs.length<=1) {
+        reason="这是浏览器窗口中最后一个标签，保留窗口";
+        continue;
+      }
+      await withTabResponseDeadline(chrome.tabs.remove(tab.id));
+      await forgetOwnedTab(tab.id);
+      closed++;
+    }
+    return closed===candidates.length?{status:"closed",reason:"任务完成后已释放插件专用后台标签"}:
+      waiting?{status:"deferred",reason:reason||"等待最后一条回复确认"}:
+      {status:"skipped",reason:reason||"标签不符合安全释放条件"};
+  }
+
+  async function releaseFinishedJobs() {
+    const records=await ownedTabs();
+    const store=await withTabResponseDeadline(readStore());
+    const eligible=Object.values(records).filter(entry=>
+      entry?.kind==="job" && !entry.visited && entry.chatId && entry.taskId &&
+      store.conversations?.["chat:"+entry.chatId]?.history?.some(h=>
+        h.type==="finished" && h.taskId===entry.taskId))
+      .sort((a,b)=>(a.lastReleaseAt||0)-(b.lastReleaseAt||0))
+      .slice(0,5);
+    await Promise.all(eligible.map(async entry=>{
+      await editOwnedTabs(entries=>{
+          const current=entries[String(entry.tabId)];
+          if(current?.jobId===entry.jobId) {
+            current.finished=true;
+            current.lastReleaseAt=Date.now();
+          }
+      });
+      // A running, paused, or user-visited tab is simply retained.
+      try {await releaseOwnedChat(entry.chatId,null,entry.taskId);}
+      catch(error) {console.warn("[ChatQueue] 队列自动释放延后",error);}
+    }));
+  }
+
+  async function releaseTeamRun(request) {
+    const results=await Promise.all((request.chats||[]).slice(0,5).map(async(chat)=>{
+      try {
+        const result=await releaseOwnedChat(chat.id,request.runId);
+        return {id:chat.id,...result};
+      }catch(error) {
+        return {id:chat.id,status:"deferred",
+          reason:String(error.message||error).slice(0,180)};
+      }
+    }));
+    await api("/releases/report",{id:request.id,results});
+  }
+
+  async function onTaskFinished(tabId,taskId) {
+    if(!Number.isInteger(tabId) || typeof taskId!=="string") return;
+    await editOwnedTabs(entries=>{
+      const entry=entries[String(tabId)];
+      if(!entry || entry.kind!=="job" || entry.taskId!==taskId) return false;
+      entry.finished=true;
+    });
+    await releaseFinishedJobs();
+  }
+
+  async function onTabActivated(tabId) {
+    await noteTabVisited(tabId);
+  }
+
+  async function onTabNavigated(tabId,url) {
+    if(!safeUrl(url)) return noteTabVisited(tabId);
+    const entries=await ownedTabs(),entry=entries[String(tabId)];
+    if(!entry) return;
+    if(entry.chatId && chatKey(url)==="chat:"+entry.chatId) return;
+    if(!entry.chatId && entry.projectId &&
+        CQHandoff.projectId(url)===entry.projectId) return;
+    await noteTabVisited(tabId);
+  }
+
+  async function onTabRemoved(tabId) {
+    await forgetOwnedTab(tabId);
+  }
+
+  async function noteTabVisited(tabId) {
+    await editOwnedTabs(entries=>{
+      const current=entries[String(tabId)];
+      if(!current || current.visited) return false;
+      current.visited=true;
+    });
+  }
+
+  async function forgetOwnedTab(tabId) {
+    await editOwnedTabs(entries=>{
+      if(!entries[String(tabId)]) return false;
+      delete entries[String(tabId)];
+    });
+    const channels=await teamChannels();
+    const next=Object.fromEntries(Object.entries(channels).filter(([,id])=>id!==tabId));
+    if(Object.keys(next).length!==Object.keys(channels).length)
+      await withTabResponseDeadline(chrome.storage.local.set({[TEAM_CHANNELS_KEY]:next}));
+  }
+
   async function teamChannels() {
     const data=await withTabResponseDeadline(chrome.storage.local.get(TEAM_CHANNELS_KEY));
     const entries=data?.[TEAM_CHANNELS_KEY];
@@ -179,11 +416,21 @@ globalThis.CQRemoteDispatch = (() => {
     const channels=await teamChannels();
     const remembered=Number.isInteger(channels[target.id])
       ? current.find(tab=>tab.id===channels[target.id] && sameScope(tab,target)) : null;
-    if(remembered) return remembered;
+    if(remembered) {
+      const currentOwner=(await ownedTabs())[String(remembered.id)];
+      if(currentOwner && currentOwner.chatId===target.id &&
+          currentOwner.kind!=="job")
+        await rememberOwned(remembered,job,currentOwner.kind);
+      return remembered;
+    }
     const marked=current.filter(tab=>sameScope(tab,target) &&
       taggedTeamChannel(tab,target.id));
     if(marked.length>1) throw new Error("同一成员存在多个协作通道，请人工核对");
     if(marked.length===1) {
+      const currentOwner=(await ownedTabs())[String(marked[0].id)];
+      if(currentOwner && currentOwner.chatId===target.id &&
+          currentOwner.kind!=="job")
+        await rememberOwned(marked[0],job,currentOwner.kind);
       await rememberTeamChannel(target.id,marked[0].id);
       await api("/report",{id:job.id,status:"opening",tabId:marked[0].id});
       return marked[0];
@@ -200,6 +447,7 @@ globalThis.CQRemoteDispatch = (() => {
       url:target.url+"#cq-team-channel="+target.id,active:false,
       ...(sameWindow?{windowId:sameWindow.windowId}:{}),
     }));
+    await rememberOwned(tab,job,"team_inbox");
     await rememberTeamChannel(target.id,tab.id);
     await api("/report",{id:job.id,status:"opening",tabId:tab.id});
     return tab;
@@ -228,6 +476,12 @@ globalThis.CQRemoteDispatch = (() => {
     const matching=current.filter(tab=>taggedJob(tab,job.id));
     if(matching.length>1) throw new Error("同一任务发现多个标签页，请人工核对");
     if(matching.length===1) {
+      // URL fragments alone do not prove who opened this tab. A crashed
+      // worker may resume the queued task, but may not auto-close a tab
+      // unless it was already marked as extension-owned at creation time.
+      const currentOwner=(await ownedTabs())[String(matching[0].id)];
+      if(currentOwner?.jobId===job.id)
+        await rememberOwned(matching[0],job,job.channel==="team_spawn"?"team_spawn":"job");
       await api("/report",{id:job.id,status:"opening",tabId:matching[0].id});
       return matching[0];
     }
@@ -242,6 +496,7 @@ globalThis.CQRemoteDispatch = (() => {
       url:markedUrl,active:false,
       ...(sameWindow?{windowId:sameWindow.windowId}:{}),
     }));
+    await rememberOwned(tab,job,job.channel==="team_spawn"?"team_spawn":"job");
     // This acknowledgement also protects against retries after the SPA
     // removes its marker or redirects from project overview into a new chat.
     await api("/report",{id:job.id,status:"opening",tabId:tab.id});
@@ -269,6 +524,7 @@ globalThis.CQRemoteDispatch = (() => {
         type:"CQ_REMOTE_INSPECT",id:job.id,text:job.text,targetUrl:tab.url,
       }));
       if(result?.ok && result.observed === true) {
+        await noteOwnedTask(tab.id,job,job.taskId,url);
         if(job.channel==="team_spawn") {
           // The new chat is already confirmed. A storage hiccup must not
           // turn it into a failed/newly re-created chat; later messages may
@@ -339,6 +595,10 @@ globalThis.CQRemoteDispatch = (() => {
     });
     try {
       const result=await messageTab(tab,job);
+      if(result.taskId) {
+        try {await noteOwnedTask(tab.id,job,result.taskId);}
+        catch(error) {console.warn("[ChatQueue] 远程任务归属暂未同步",error);}
+      }
       if(job.action==="new_chat" && result.status==="queued")
         return {status:"waiting",tabId:tab.id,taskId:result.taskId,
           error:"首条消息已安全入队，等待 ChatGPT 建立新对话"};
@@ -363,6 +623,12 @@ globalThis.CQRemoteDispatch = (() => {
     try {
       try {await refreshTargets();}
       catch {return;} // Bridge not running / extension hasn't connected.
+      try {await releaseFinishedJobs();}
+      catch(error) {console.warn("[ChatQueue] 后台标签自动释放暂时延迟",error);}
+      try {
+        const release=await api("/releases/poll");
+        if(release.request) await releaseTeamRun(release.request);
+      }catch(error) {console.warn("[ChatQueue] 协作窗口释放稍后再试",error);}
       const received=await api("/poll");
       const job=received.job;
       if(!job) return;
@@ -380,5 +646,7 @@ globalThis.CQRemoteDispatch = (() => {
     } finally { running=false; }
   }
 
-  return {ALARM,tick,listTargets,pickTarget,findOrOpen,executeJob};
+  return {ALARM,tick,listTargets,pickTarget,findOrOpen,executeJob,
+    onTaskFinished,onTabActivated,onTabNavigated,onTabRemoved,
+    releaseOwnedChat,releaseFinishedJobs};
 })();

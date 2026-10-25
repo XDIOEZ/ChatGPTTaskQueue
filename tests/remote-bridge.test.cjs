@@ -49,6 +49,7 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
   }
   const health=await call("GET","/health",undefined,"none");
   assert.equal(health.code,200);
+  assert.ok(health.data.features.includes("safe_tab_release"));
   assert.equal((await call("GET","/v1/targets",undefined,"none")).code,401);
   assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
     "https://example.com")).code,403);
@@ -113,6 +114,31 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
   assert.equal((await call("GET","/v1/jobs/"+unclaimedId)).data.job.status,"cancelled");
   assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
     extensionOrigin)).data.job,null,"取消的未领取任务不得再被派发");
+
+  const releaseInput={runId:"stress-20261026-team",
+    chats:[chatUrl, "https://chatgpt.com/c/second-chat"]};
+  assert.equal((await call("POST","/v1/releases",releaseInput,"none")).code,401);
+  const created=await call("POST","/v1/releases",releaseInput);
+  assert.equal(created.code,200);
+  assert.equal(created.data.release.chats.length,2);
+  const same=await call("POST","/v1/releases",releaseInput);
+  assert.equal(same.data.release.id,created.data.release.id,"重复提交只能得到同一释放运行");
+  const polled=await call("GET","/v1/extension/releases/poll",undefined,
+    "extension",extensionOrigin);
+  assert.equal(polled.data.request.id,created.data.release.id);
+  assert.equal((await call("GET","/v1/extension/releases/poll",undefined,
+    "extension",extensionOrigin)).data.request,null,"释放领取具有独立租约");
+  const reported=await call("POST","/v1/extension/releases/report",{
+    id:created.data.release.id,
+    results:[{id:"chat-123",status:"closed"},{id:"second-chat",
+      status:"skipped",reason:"手动访问过的标签"}],
+  },"extension",extensionOrigin);
+  assert.equal(reported.data.release.status,"finished");
+  assert.equal((await call("GET","/v1/releases/stress-20261026-team"))
+    .data.release.chats[0].status,"closed");
+  assert.equal((await call("POST","/v1/releases",{
+    ...releaseInput,chats:["https://chatgpt.com/c/unrelated"],
+  })).code,409,"不能替换已经提交的释放目标");
 
   const otherId="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
@@ -183,6 +209,27 @@ test("只能取消尚未被扩展领取的任务，已领取/已完成严格保�
   assert.equal(bridge.dispatchNext({jobs:[b]},999999),null,
     "隔离后绝不可自动重发不确定消息");
   assert.equal(bridge.quarantineUncertainJobs(state,[c.id],200000).quarantined.length,0);
+});
+
+test("协作释放分批轮转目标，单个繁忙聊天不得长期饿死其他成员",()=>{
+  const store={releases:[]};
+  const chats=Array.from({length:7},(_,i)=>
+    "https://chatgpt.com/c/stress-member-"+i);
+  const release=bridge.createReleaseRequest(store,{
+    runId:"stress-20261026-rotation",chats,
+  },1000);
+  const first=bridge.claimReleaseRequest(store,2000);
+  assert.equal(first.chats.length,5);
+  assert.equal(first.chats[0].id,"stress-member-0");
+  bridge.reportReleaseRequest(store,{
+    id:release.id,results:first.chats.map(c=>({id:c.id,status:"deferred",
+      reason:"等待输入框空闲"})),
+  },3000);
+  const second=bridge.claimReleaseRequest(store,64000);
+  assert.equal(second.chats.length,5);
+  assert.equal(second.chats[0].id,"stress-member-5",
+    "先检查上次未选中的成员，而非重复检查排在最前面的繁忙标签");
+  assert.equal(second.chats[1].id,"stress-member-6");
 });
 
 test("扩展调度：严格匹配指定会话和项目，拒绝重名歧义",()=>{

@@ -22,6 +22,7 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
   const workerUrl="https://chatgpt.com/g/"+projectId+"/c/chat-worker";
   const posted=[];
   const jobs=new Map();
+  const releases=new Map();
   let ordinal=0;
   const server=http.createServer((req,res)=>{
     const chunks=[];
@@ -32,14 +33,29 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
         res.writeHead(status,{"Content-Type":"application/json"});
         res.end(JSON.stringify(payload));
       };
-      if(req.url==="/health") return respond(200,{ok:true,version:2,
+      if(req.url==="/health") return respond(200,{ok:true,version:3,
         service:"chatgpt-task-queue-bridge",
-        features:["extension_version","team_channels"]});
+        features:["extension_version","team_channels","safe_tab_release"]});
       if(req.headers.authorization!=="Bearer unit-test-token")
         return respond(401,{ok:false,error:"unverified"});
       if(req.method==="GET" && req.url==="/v1/targets")
         return respond(200,{ok:true,targets:[{kind:"project",name:"FlatWorld",
           id:projectId,url:projectUrl}]});
+      if(req.method==="POST" && req.url==="/v1/releases") {
+        let result=releases.get(body.runId);
+        if(!result) {
+          result={id:"22222222-2222-4222-8222-222222222222",
+            runId:body.runId,status:"pending",
+            chats:body.chats.map((url,index)=>({id:"chat-"+index,url,status:"pending"}))};
+          releases.set(body.runId,result);
+        }
+        return respond(200,{ok:true,release:result});
+      }
+      if(req.method==="GET" && req.url.startsWith("/v1/releases/")) {
+        const result=releases.get(req.url.slice("/v1/releases/".length));
+        return respond(result?200:404,result?{ok:true,release:result}:
+          {ok:false,error:"release not found"});
+      }
       if(req.method==="POST" && req.url==="/v1/jobs") {
         posted.push(body);
         const id="00000000-0000-4000-8000-"+(++ordinal).toString().padStart(12,"0");
@@ -149,6 +165,24 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
     message:sent.messageId,text:"同一确认再来一次"})).alreadyAcknowledged,true);
   assert.equal(posted.length,3,"重复 ACK 绝不重新发送");
   assert.equal(team.conciseRun(team.readRun(run)).counts.unacknowledged,0);
+  await assert.rejects(()=>team.finish({run,verified:true}),/未完成入队|未报告/);
+  const ready=await team.send({run,from:"worker",to:"main",type:"VERIFIED",
+    text:"成员已完成测试，执行结果可用于集成"});
+  const readyAck=await team.acknowledge({run,from:"main",
+    message:ready.messageId,text:"已完成 CodeReviewFix 和集成验证"});
+  for(const job of jobs.values()) {
+    if(job.action==="continue") job.status="queued";
+  }
+  await team.sync({run});
+  await assert.rejects(()=>team.finish({run}),/--verified/);
+  const finalized=await team.finish({run,verified:true});
+  assert.equal(finalized.ok,true);
+  assert.equal(finalized.release.chats.length,2);
+  assert.equal(releases.size,1);
+  assert.equal((await team.finish({run,verified:true})).release.id,finalized.release.id,
+    "重复 finish 只能读回同一 run 的释放请求");
+  await assert.rejects(()=>team.send({run,from:"main",to:"worker",
+    type:"PLAN",text:"结束后禁止发信"}),/运行已结束/);
 
   fs.writeFileSync(path.join(bridgeDir,"jobs.json"),JSON.stringify({
     version:1,extensionVersion:require("../manifest.json").version,
@@ -159,7 +193,7 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
     type:"DISCOVERY",text:"禁止离线发送"}).then(()=>{}),/Skill/);
   await assert.rejects(()=>team.main(["send","--run",run,"--from","main",
     "--to","worker","--type","DISCOVERY","--text","禁止离线"]),/Skill/);
-  assert.equal(posted.length,3,"离线时不允许绕过门槛发送");
+  assert.equal(posted.length,5,"离线时不允许绕过门槛发送");
   const removed=team.uninstall();
   assert.equal(removed.uninstalled,true);
   assert.equal(fs.existsSync(installed.registration),false);

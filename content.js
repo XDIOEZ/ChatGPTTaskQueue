@@ -4991,8 +4991,30 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TOGGLE_PANEL") { queueExpanded = !queueExpanded; render(); }
     if (message.type === "QUEUE_WAKE") { void heartbeat(); }
-    if (["CQ_REMOTE_EXECUTE","CQ_REMOTE_INSPECT"].includes(message.type)) {
+    if (["CQ_REMOTE_EXECUTE","CQ_REMOTE_INSPECT","CQ_REMOTE_RELEASE_CHECK"].includes(message.type)) {
       const run=async () => {
+        if(message.type==="CQ_REMOTE_RELEASE_CHECK") {
+          // Native input/draft safety is checked in the owning content script.
+          // Never write to the composer or click Send/Stop during a release.
+          if(sender.id!==chrome.runtime.id ||
+              validUrl(message.targetUrl)!==validUrl(location.href) ||
+              !pageChatKey(location.href) ||
+              pageChatKey(location.href)!=="chat:"+message.chatId)
+            return {ok:true,safe:false,reason:"对话地址或扩展身份已变化"};
+          const editor=getEditor();
+          if(!state || !boundHere() || !editor || !editor.isConnected)
+            return {ok:true,safe:false,reason:"页面队列或输入框尚未稳定"};
+          if(state.halted || state.queuePaused || state.activeTaskId ||
+              state.steeringTaskId || state.tasks?.length || state.schedules?.length ||
+              state.handoffSourceKey || state.handoff?.phase &&
+                state.handoff.phase!=="idle" || state.error ||
+              composerActionInProgress || workInProgress ||
+              nativeGenerationRunning() || nativeTransportErrorVisible() ||
+              normalize(editorText(editor)) || hasComposerAttachments(editor) ||
+              nativeUploadBusy(editor))
+            return {ok:true,safe:false,reason:"队列未完成或存在草稿、附件、正在生成的回复"};
+          return {ok:true,safe:true};
+        }
         if (sender.id !== chrome.runtime.id ||
             !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(message.id||"") ||
             validUrl(message.targetUrl) !== validUrl(location.href)) {

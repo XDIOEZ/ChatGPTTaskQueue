@@ -5766,6 +5766,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if(changeInfo.url) {
+    void CQRemoteDispatch.onTabNavigated(tabId,changeInfo.url).catch(error=>
+      console.warn("[ChatQueue] 远程标签导航保护标记暂未更新",error));
+  }
   if (changeInfo.url || changeInfo.discarded === true) pagePulses.delete(tabId);
   if (changeInfo.status === "complete") {
     // This path deliberately stays outside exclusive(): a broken/missing
@@ -5804,6 +5808,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     await maintainTabProtection(store);
   })
     .catch((error) => console.warn("[ChatQueue] 标签关闭后的保护同步失败，已保留队列数据", error));
+  void CQRemoteDispatch.onTabRemoved(tabId).catch(error=>
+    console.warn("[ChatQueue] 自动标签归属清理失败",error));
+});
+// A user-visited AI tab must never be auto-closed after focus changes.
+chrome.tabs.onActivated?.addListener(({tabId})=>{
+  void CQRemoteDispatch.onTabActivated(tabId).catch(error=>
+    console.warn("[ChatQueue] 标签访问保护标记暂时未保存",error));
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Heartbeats never write durable queue state or enter the dispatch lock.
@@ -5830,7 +5841,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throw error;
       }
     });
-  work.then(sendResponse)
+  work.then((reply)=>{
+    sendResponse(reply);
+    if(message?.type==="FINISHED" && reply?.ok===true &&
+        Number.isInteger(sender.tab?.id) && typeof message.id==="string" &&
+        reply.state?.history?.some(h=>h.type==="finished" && h.taskId===message.id)) {
+      // Completion is persisted before releasing its owned background tab.
+      void CQRemoteDispatch.onTaskFinished(sender.tab.id,message.id).catch(error=>
+        console.warn("[ChatQueue] 已完成队列标签释放延后",error));
+    }
+  })
     .catch((error) => sendResponse({ ok: false, error: error.message || "未知错误",
       ...(message?.type === "CLAIM" ? {claimDiagnostic:{outcome:"rejected",reason:"claim_rejected",
         errorReason:handoffDebugReason(error.message),backendVersion:handoffDebugBackendVersion()}} : {}),

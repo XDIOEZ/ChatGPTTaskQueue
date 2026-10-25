@@ -46,7 +46,9 @@ function options(argv) {
   for(let i=0;i<argv.length;i++) {
     const part=argv[i];
     if(!part.startsWith("--")) reject("未知参数 "+part);
-    if(part==="--json" || part==="--urgent") {parsed[part.slice(2)]=true;continue;}
+    if(["--json","--urgent","--verified"].includes(part)) {
+      parsed[part.slice(2)]=true;continue;
+    }
     if(i+1>=argv.length || argv[i+1].startsWith("--")) reject("缺少参数 "+part+" 的值");
     if(part.slice(2) in parsed) reject("参数重复："+part);
     parsed[part.slice(2)]=argv[++i];
@@ -181,7 +183,8 @@ async function doctor() {
   try {
     const bridge=await httpJson("GET","/health");
     if(bridge.service!=="chatgpt-task-queue-bridge" ||
-        !bridge.features?.includes("team_channels"))
+        !bridge.features?.includes("team_channels") ||
+        !bridge.features?.includes("safe_tab_release"))
       problems.push("本机桥接器尚未更新到协作版本，请重启本机桥接器");
   }catch {problems.push("本机桥接器未运行");}
   return {ok:problems.length===0,pluginVersion,pairedExtension,
@@ -253,6 +256,7 @@ async function register(opts) {
   await requireOnline();
   const id=runId(opts.run),member=memberId(opts.member),chatUrl=fixedChatUrl(opts.chat);
   return locked(id,async(state)=>{
+    if(state.release?.status) reject("协作运行已经进入结束流程，不能新增成员");
     const existing=state.members[member];
     if(existing?.chatUrl && existing.chatUrl!==chatUrl)
       reject("成员已经绑定另一条对话；请使用唯一成员名，不能静默替换");
@@ -285,6 +289,7 @@ async function spawn(opts) {
   const id=runId(opts.run),member=memberId(opts.member),role=required(opts.role,"role");
   const task=messageText({text:opts.task,file:opts.file});
   const run=readRun(id);
+  if(run.release?.status) reject("协作运行已经进入结束流程，不能新建子对话");
   if(!run.members[run.lead]?.chatUrl)
     reject("主智能体还未登记对话 URL；请先 register --member "+run.lead+
       " --chat <对话URL>，确保新成员可以双向发送消息");
@@ -300,7 +305,7 @@ async function spawn(opts) {
   });
   try {
     const result=await api("POST","/v1/jobs",{
-      action:"new_chat",mode:"queue",channel:"team_spawn",target:{kind:"project",
+      action:"new_chat",mode:"queue",channel:"team_spawn",runId:id,target:{kind:"project",
         id:run.project.id,url:run.project.url},text:intro,
     });
     await locked(id,async(state)=>{
@@ -332,6 +337,7 @@ async function send(opts) {
   const messageId=crypto.randomUUID();
   let recipient=null;
   await locked(id,async(state)=>{
+    if(state.release?.status) reject("协作运行已结束或正在释放，不能再发送新任务");
     if(!state.members[from]) reject("发件成员未注册："+from);
     if(!state.members[from].chatUrl)
       reject("发件成员尚未获得正式对话 URL；先 sync 确认创建成功再发送消息");
@@ -355,7 +361,7 @@ async function send(opts) {
   if(header.length>12000) reject("包含消息头后超出插件长度限制");
   try {
     const result=await api("POST","/v1/jobs",{action:"continue",mode,
-      ...(mode==="queue"?{channel:"team"}:{}),
+      ...(mode==="queue"?{channel:"team",runId:id}:{}),
       target:{kind:"chat",url:recipient.chatUrl},text:header});
     await locked(id,async(state)=>{
       const message=state.messages.find(item=>item.id===messageId);
@@ -405,7 +411,7 @@ async function acknowledge(opts) {
   ].join("\n");
   try {
     const result=await api("POST","/v1/jobs",{
-      action:"continue",mode:"queue",channel:"team",
+      action:"continue",mode:"queue",channel:"team",runId:id,
       target:{kind:"chat",url:sender.chatUrl},
       text:header,
     });
@@ -445,6 +451,11 @@ async function sync(opts) {
     result:(await api("GET","/v1/jobs/"+item.jobId)).job})),
   ...ackChecks.map(async(item)=>({category:"ack",name:item.id,jobId:item.ackJobId,
     result:(await api("GET","/v1/jobs/"+item.ackJobId)).job}))]);
+  let release=null;
+  if(state.release?.status) {
+    try {release=(await api("GET","/v1/releases/"+id)).release;}
+    catch { /* An unknown status is not proof of completion. */ }
+  }
   return locked(id,async(latest)=>{
     for(const item of found) {
       if(item.category==="member") {
@@ -466,18 +477,74 @@ async function sync(opts) {
           message.ackDelivery=item.result.status;
       }
     }
-    return {save:found.length>0,state:latest,value:{
+    if(release) latest.release={
+      ...latest.release,status:release.status,requestId:release.id,
+      chats:release.chats,updatedAt:Date.now(),
+    };
+    return {save:found.length>0 || Boolean(release),state:latest,value:{
       ok:true,run:id,synced:found.length,
+      ...(latest.release?{release:latest.release}:{}),
       members:Object.fromEntries(Object.entries(latest.members).map(([name,m])=>
         [name,{role:m.role,chatUrl:m.chatUrl||null,
           ...(m.spawnStatus?{spawnStatus:m.spawnStatus}:{})}])),
     }};
   });
 }
+
+function assertTeamFinished(state) {
+  const members=Object.entries(state.members).filter(([name])=>name!==state.lead);
+  if(!members.length) reject("没有可以结束的子智能体成员");
+  if(!Object.values(state.members).every(member=>Boolean(member.chatUrl) &&
+      (!member.spawnJobId || member.spawnStatus==="created")))
+    reject("仍有成员未创建成功，不允许释放聊天窗口");
+  if(state.messages.some(message=>!message.ackAt ||
+      !["queued","steered"].includes(message.transport) ||
+      message.ackDelivery!=="queued"))
+    reject("仍有消息未 ACK、未完成入队或回复通知尚未确认");
+  for(const [name] of members) {
+    if(!state.messages.some(message=>message.from===name && message.to===state.lead &&
+        ["READY","VERIFIED"].includes(message.type) && message.ackAt))
+      reject("成员 "+name+" 未报告并确认 READY/VERIFIED，不允许结束团队");
+  }
+}
+
+async function finish(opts) {
+  await requireOnline();
+  const id=runId(opts.run);
+  if(opts.verified!==true)
+    reject("只有主智能体完成集成、CodeReviewFix 与测试后才能显式 --verified 释放窗口");
+  await sync({run:id});
+  const state=readRun(id);
+  assertTeamFinished(state);
+  const chats=[...new Set(Object.values(state.members).map(m=>fixedChatUrl(m.chatUrl)))];
+  await locked(id,async(latest)=>{
+    if(latest.release?.status && latest.release.status!=="submitting")
+      return {save:false,value:null};
+    latest.release={...latest.release,status:"submitting",submittedAt:Date.now()};
+    return {save:true,state:latest,value:null};
+  });
+  try {
+    // Idempotent per run. A lost HTTP reply never causes arbitrary extra
+    // releases; the bridge will return the existing run-scoped request.
+    const result=(await api("POST","/v1/releases",{runId:id,chats})).release;
+    await locked(id,async(latest)=>{
+      latest.release={status:result.status,requestId:result.id,
+        chats:result.chats,updatedAt:Date.now()};
+      return {save:true,state:latest,value:null};
+    });
+    return {ok:true,run:id,release:result,
+      note:"仅安全释放插件创建且队列已清空的后台标签；用户标签不会关闭"};
+  }catch(error) {
+    // Preserve the uncertain request and forbid new team work until the
+    // original run-scoped request has been inspected.
+    throw new Error("释放结果暂时未知；保留 submitting 状态，请运行 sync 核对："+error.message);
+  }
+}
 function conciseRun(state) {
   const messages=state.messages;
   const unacked=messages.filter(item=>!item.ackAt);
   return {ok:true,run:state.id,repo:state.repo,project:state.project,
+    ...(state.release?{release:state.release}:{}),
     members:Object.fromEntries(Object.entries(state.members).map(([name,member])=>
       [name,{role:member.role,chatUrl:member.chatUrl||null,
         ...(member.spawnStatus?{spawnStatus:member.spawnStatus}:{})}])),
@@ -511,6 +578,7 @@ function help() {
     "  node team.cjs ack --run <标识> --from <接收者> --message <消息ID> --text <确认>",
     "  node team.cjs inbox --run <标识> --member <成员>",
     "  node team.cjs status --run <标识>",
+    "  node team.cjs finish --run <标识> --verified 由主智能体完成审查与测试后安全释放后台聊天标签",
     "  send 可指定 --mode steer --urgent；正文可用 --file <UTF-8文件>；状态不明不自动重发。",
   ].join("\n");
 }
@@ -529,6 +597,7 @@ async function main(args) {
   if(command==="ack") return acknowledge(opts);
   if(command==="inbox") return inbox(opts);
   if(command==="status") return conciseRun(readRun(runId(opts.run)));
+  if(command==="finish") return finish(opts);
   reject("未知命令，请运行 help");
 }
 if(require.main===module) main(process.argv.slice(2)).then(output=>{
@@ -539,4 +608,5 @@ if(require.main===module) main(process.argv.slice(2)).then(output=>{
   process.exitCode=1;
 });
 module.exports={doctor,installedHere,install,uninstall,initialize,register,spawn,
-  send,acknowledge,sync,conciseRun,inbox,readRun,projectFromTargets,main};
+  send,acknowledge,sync,finish,assertTeamFinished,
+  conciseRun,inbox,readRun,projectFromTargets,main};

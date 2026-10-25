@@ -1,3 +1,19 @@
+### v0.49.59：任务完成后安全释放 AI 创建的聊天标签
+
+- **普通远程任务自动释放**：只有原生 `FINISHED` 已持久确认、对应任务存在完成记录、整个对话队列及定时规则清空、网页已停止生成且没有草稿/附件时，才关闭插件创建的后台标签。**不删除 ChatGPT 历史对话、不关闭用户的标签页或浏览器窗口。**
+- **协作团队完成后统一释放**：主智能体完成 CodeReviewFix、Git 集成和测试，所有成员的 `READY`/`VERIFIED` 均已确认，全部团队消息及 ACK 回执都确认为入队后执行：
+
+```powershell
+node skills/gpt-queue-agent-team/team.cjs finish --run <运行ID> --verified
+node skills/gpt-queue-agent-team/team.cjs sync --run <运行ID>
+node skills/gpt-queue-agent-team/team.cjs status --run <运行ID>
+```
+
+  `finish` 提交有幂等保护的释放请求，后台按安全条件逐一释放，并在 `release.chats` 显示 `closed / skipped / pending / review_required`。如果队列仍在运行或浏览器检测到附件、草稿，就推迟关闭。
+- **不误关用户页面**：关闭对象必须是扩展自身登记的后台标签；任何被用户手动切换到前台、改过地址、置顶或仍有未完成工作/不确定错误的标签，都保留。多人复用的聊天通信页需要所有关联协作运行结束才可释放。
+- **防积压和断线恢复**：每轮限制检查数量、轮转释放目标，避免大量标签阻塞队列；MV3 重启后根据持久任务归属与完成日志继续安全核对。旧版本没有登记来源的标签不会被自动关闭。
+- 升级后重启本机桥接服务，在 Edge `edge://extensions` 或 Chrome `chrome://extensions` 重新加载扩展并刷新聊天；再运行 `team.cjs doctor`。版本或在线门槛未通过时不允许团队释放。
+
 ### v0.49.58：长任务压力测试与队列自恢复
 
 - 多智能体长流程压力测试暴露了**浏览器标签消息请求无超时、远程调度 `running` 持续锁住**的问题：一条 `CQ_REMOTE_EXECUTE` 或标签读取 Promise 若一直不返回，后续 30 秒调度轮询与扩展目标心跳都不能正常运行，Skill 按在线门槛安全停用。
