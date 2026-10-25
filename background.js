@@ -1,6 +1,6 @@
 /* global chrome */
 "use strict";
-importScripts("image-store.js", "handoff.js");
+importScripts("image-store.js", "handoff.js", "remote-dispatch.js");
 
 // One serialized service worker owns every conversation's queue. The storage
 // envelope is shared, but task dispatch and scheduler state are per-chat.
@@ -212,6 +212,7 @@ function blankSession(key, url = null, tabId = null) {
     countRateTimes: [],
     history: [],
     recentSubmissions: [],
+    remoteSteerConfirmedIds: [],
     firstSeenAt: null,
     firstMessageAt: null,
     handoff: CQHandoff.defaults(),
@@ -4522,10 +4523,32 @@ async function handle(message, sender) {
       if (submittedRecently(state, requestId, fingerprint)) break;
       if (pendingCount(state) >= maxPending) throw new Error(`待执行队列最多 ${maxPending} 条`);
       requirePrompt(message.text, Boolean(message.images?.length));
+      if (message.remoteJobId) {
+        if (!requestId || message.remoteJobId !== requestId)
+          throw new Error("远程任务提交标识不一致");
+        if (existing && !targetMatches(state,sender,url)) {
+          // New remote queue work runs in its own background tab. Transfer
+          // ownership only at a safe boundary: never steal an in-flight turn.
+          const liveTab=await chrome.tabs.get(tabId);
+          if (!chatKey(url) || chatKey(state.url)!==chatKey(url) ||
+              safeUrl(liveTab.url)!==url || state.activeTaskId ||
+              state.steeringTaskId || state.halted || state.queuePaused ||
+              handoffBusy(state) || state.handoffSourceKey) {
+            throw new Error("目标旧对话正在执行、暂停或交接；等待安全空闲后再由新标签发送");
+          }
+          state.tabId=tabId;
+          state.url=url;
+        }
+      }
       const images = await attachImages([], null, message.images || [], newImageIds);
       if (!state.url) state.url = url;
       if (state.tabId == null) state.tabId = tabId;
-      state.tasks.push(newTask(requirePrompt(message.text, images.length > 0), null, images));
+      const task = newTask(requirePrompt(message.text, images.length > 0), null, images);
+      // Stable local-bridge id enables uncertain-reply reconciliation.
+      if (message.remoteJobId) {
+        task.remoteJobId = requestId;
+      }
+      state.tasks.push(task);
       markSubmission(state, requestId, fingerprint);
       changed = true;
       break;
@@ -4602,6 +4625,7 @@ async function handle(message, sender) {
       break;
     }
 
+    case "REMOTE_STEER_CLAIM":
     case "STEER_PROMPT_CLAIM":
     case "STEER_CLAIM": {
       if (!targetMatches(state, sender, url) || state.halted || handoffBusy(state)) {
@@ -4610,11 +4634,22 @@ async function handle(message, sender) {
       if (state.steeringTaskId) {
         throw new Error("已有消息正在发送，请稍后再引导");
       }
+      const fromRemote = message.type === "REMOTE_STEER_CLAIM";
       const fromComposer = message.type === "STEER_PROMPT_CLAIM";
       if (fromComposer && (safeUrl(sender.tab?.url) && safeUrl(sender.tab.url) !== url ||
           message.images?.length)) throw new Error("原生草稿或页面已变化，未创建引导任务");
-      if (fromComposer && pendingCount(state) >= maxPending) throw new Error("队列已满，请先处理现有任务再引导");
-      const task = fromComposer ? newTask(requireText(message.text)) :
+      if ((fromComposer || fromRemote) && pendingCount(state) >= maxPending)
+        throw new Error("队列已满，请先处理现有任务再引导");
+      let remoteRequestId=null,remoteFingerprint=null;
+      if (fromRemote) {
+        if (safeUrl(sender.tab?.url) !== url) throw new Error("远程引导目标页面已切换");
+        remoteRequestId=requireSubmissionId(message.requestId);
+        if (!remoteRequestId) throw new Error("远程引导需要唯一提交标识");
+        remoteFingerprint=await submissionFingerprint(message.type,message,remoteRequestId);
+        if (submittedRecently(state,remoteRequestId,remoteFingerprint))
+          throw new Error("远程引导已经创建过；未重试以避免重复发送");
+      }
+      const task = fromComposer || fromRemote ? newTask(requireText(message.text)) :
         state.tasks.find((item) => item.id === message.id);
       if (!task || task.status !== "pending") throw new Error("只能引导待发送的队列任务");
       if (["handoff_summary","handoff_intro"].includes(task.kind)) {
@@ -4628,8 +4663,12 @@ async function handle(message, sender) {
       if (active && ["handoff_summary","handoff_intro"].includes(active.kind)) {
         throw new Error("正在交接上下文，请等待交接完成后再引导");
       }
-      if (fromComposer) {
+      if (fromComposer || fromRemote) {
         task.steerFromComposer = true;
+        if (fromRemote) {
+          task.remoteJobId=remoteRequestId;
+          markSubmission(state,remoteRequestId,remoteFingerprint);
+        }
         state.tasks.push(task);
       }
       // Reserve first, then try native steering or stop/send only as fallback.
@@ -4715,6 +4754,14 @@ async function handle(message, sender) {
         active.steerCount = (active.steerCount || 0) + 1;
         active.lastSteerText = task.text;
         active.lastSteerAt = Date.now();
+      }
+      // Only an observed native user turn may mark a remote steer delivered.
+      // An idempotent claim or canceled reservation is never success evidence.
+      if (typeof task.remoteJobId === "string") {
+        const previous = Array.isArray(state.remoteSteerConfirmedIds)
+          ? state.remoteSteerConfirmedIds : [];
+        state.remoteSteerConfirmedIds = [...previous.filter(id => id !== task.remoteJobId),
+          task.remoteJobId].slice(-60);
       }
       // Exactly once: remove the steered item so the ordinary queue cannot
       // send it a second time, regardless of which pending index it occupied.
@@ -5426,6 +5473,7 @@ async function handle(message, sender) {
     REORDER_TASK: "task_reordered", CLAIM: "claim", SENT: "sent",
     FINISHED: "finished", RELEASE_CLAIM: "deferred",
     STEER_CLAIM: steerDeferred ? "steer_deferred" : "steer_claim",
+    REMOTE_STEER_CLAIM:"steer_claim",
     STEER_PROMPT_CLAIM:"steer_claim", STEER_PAUSING: "steer_pausing",
     STEER_CLICKED: "steer_clicked",
     STEER_CANCEL: "steer_cancel", STEER_CONFIRM: "steer_confirm",
@@ -5475,7 +5523,7 @@ async function handle(message, sender) {
       ["ENQUEUE","ENQUEUE_FAVORITE","ADD_TASK","EDIT_TASK","PIN_TASK","REORDER_TASK",
        "DELETE_TASK","DISMISS_WAITING","CLAIM","SENT","FINISHED","STEER_CONFIRM",
        "STEER_UNCONFIRMED","STOPPED","USER_RESUMED","RECOVER_ON_VOICE","UNCERTAIN_SEND",
-       "FAIL","SKIP_FAILED","ACK_RECOVERY","RELEASE_CLAIM","STEER_PROMPT_CLAIM",
+       "FAIL","SKIP_FAILED","ACK_RECOVERY","RELEASE_CLAIM","STEER_PROMPT_CLAIM","REMOTE_STEER_CLAIM",
        "STEER_CLAIM","STEER_CANCEL","STEER_PAUSING","STEER_CLICKED"].includes(message.type)) {
     checkpointHandoffTasks(store,state);
   }
@@ -5682,8 +5730,13 @@ async function onScheduleTick() {
 async function startup() {
   const existing = await chrome.alarms.get(ALARM_NAME);
   if (!existing) await chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+  // Chrome 120+ supports 30-second alarms, surviving MV3 worker suspension.
+  const remoteAlarm=await chrome.alarms.get(CQRemoteDispatch.ALARM);
+  if (!remoteAlarm) await chrome.alarms.create(CQRemoteDispatch.ALARM, {periodInMinutes:0.5});
   await onScheduleTick();
   await exclusive(async () => cleanupUnusedImages(await readStore()));
+  void CQRemoteDispatch.tick().catch((error) =>
+    console.warn("[ChatQueue] 启动远程任务检查失败",error));
 }
 
 function startSafely() {
@@ -5706,6 +5759,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
     void onScheduleTick().catch((error) =>
       console.error("[ChatQueue] 后台检查失败，已保留原队列与图片", error));
+  }
+  if (alarm.name === CQRemoteDispatch.ALARM) {
+    void CQRemoteDispatch.tick().catch((error) =>
+      console.warn("[ChatQueue] 远程任务轮询失败，保留未确认任务",error));
   }
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {

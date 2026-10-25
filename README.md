@@ -1,3 +1,24 @@
+### v0.49.56：AI 远程为指定对话创建任务 / 引导 / 项目新对话
+
+- 新增本机 Node 桥接器 `remote-bridge.cjs` 和浏览器扩展调度器 `remote-dispatch.js`。通过 HomePC2 在电脑执行命令，AI 即可给指定旧对话入队、直接引导当前任务，或在指定 ChatGPT 项目里创建独立新对话；不通过远程服务、不直接篡改 Chrome 本地队列数据库。
+- **普通任务（包含给旧对话追加普通队列）总是在已有浏览器窗口新开一个不抢焦点的后台标签页**，不会沿用你手头正在用的旧标签页；只有明确 `--mode steer` 引导旧对话时才使用该对话原有标签页，不另开页。旧对话还有运行中的队列时等待安全接管，不强行抢占原任务。
+- 每个新任务在打开标签前保存不可撤销的开页意图，再将创建的标签 ID 绑定任务；重试只使用已绑定标签或唯一 URL 标记查找，不能安全确认时停止自动开页并要求人工核对，避免疯狂新开浏览器。原队列仍保留提交幂等、发送前检查、发送结果不明确时不重复发送等保护。
+- 首次运行：安装 Node.js 18+，在本目录运行 `node remote-bridge.cjs install`（启动仅绑定 `127.0.0.1:43578` 的服务并注册当前 Windows 用户登录自启动）；之后在 Edge 的 `edge://extensions` 或 Chrome 的 `chrome://extensions` 重新加载本扩展，并刷新 ChatGPT 标签页。桥接器自动绑定首次接入的扩展 ID；如重新安装导致扩展 ID 改变，手动运行 `node remote-bridge.cjs reset-pairing` 后重启桥接器连接。
+- 常用命令：
+
+```powershell
+node remote-bridge.cjs targets
+node remote-bridge.cjs bind --project FlatWorld --url "https://chatgpt.com/g/g-p-项目ID/project"
+node remote-bridge.cjs bind --chat "液体系统对话" --url "https://chatgpt.com/g/g-p-项目ID/c/对话ID"
+node remote-bridge.cjs enqueue --chat "液体系统对话" --text "修复液体系统"
+node remote-bridge.cjs enqueue --chat "液体系统对话" --mode steer --text "按新思路继续修复"
+node remote-bridge.cjs new --project FlatWorld --text "添加硅矿生产路线"
+node remote-bridge.cjs status
+```
+
+- `--chat` / `--project` 可用本地别名、唯一 ID 或完整官方链接；长提示词可改用 `--file <UTF-8 文件路径>`。CLI/HTTP 接口只允许本机带随机令牌访问，浏览器扩展接口还需身份配对；远程 AI 通过 HomePC2 运行 CLI 即可，无需暴露公网端口。
+- 状态区分：`queued` 仅表示任务安全入队，不等于 ChatGPT 已发送；`steered` 需要原生用户消息成功观察；`created` 需要确认项目新对话的首条真实消息。浏览器关闭、标签目标改变或提交结果不确定时进入核对/失败状态，不自动重复发送。仅支持文字任务，图片仍使用既有界面。
+
 ### v0.49.55：原生图片入队后的附件清理兼容
 
 - 原生附件移除控件改用局部专用判断，兼容悬停透明/隐藏的明确 Remove、Close/关闭和普通双对角 SVG 叉号。仍只在当前输入框的一张附件卡片内查找唯一操作，禁止跨共享多图容器猜选，不放宽全局发送按钮可用性，不点击 Send/Stop/Voice、禁用或语义隐藏控件，也不直接删除预览 DOM。

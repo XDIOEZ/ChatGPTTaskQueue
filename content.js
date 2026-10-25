@@ -4988,9 +4988,62 @@
     }
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TOGGLE_PANEL") { queueExpanded = !queueExpanded; render(); }
     if (message.type === "QUEUE_WAKE") { void heartbeat(); }
+    if (["CQ_REMOTE_EXECUTE","CQ_REMOTE_INSPECT"].includes(message.type)) {
+      const run=async () => {
+        if (sender.id !== chrome.runtime.id ||
+            !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(message.id||"") ||
+            validUrl(message.targetUrl) !== validUrl(location.href)) {
+          throw new Error("远程任务来源或页面地址已变化");
+        }
+        if (message.type === "CQ_REMOTE_INSPECT") {
+          const snapshot=conversationSnapshot();
+          if (message.mode === "steer") {
+            const confirmed = Boolean(boundHere() && pageChatKey(location.href) &&
+              state?.remoteSteerConfirmedIds?.includes(message.id));
+            const task = state?.tasks?.find(item=>item.remoteJobId===message.id);
+            return {ok:true,observed:confirmed,
+              uncertain:Boolean(!confirmed && (task?.status==="error" ||
+                state?.haltReason==="steer_unconfirmed"))};
+          }
+          return {ok:true,observed:Boolean(boundHere() && pageChatKey(location.href) &&
+            snapshot.userCount===1 &&
+            normalize(snapshot.lastUserText)===normalize(message.text) &&
+            state?.recentSubmissions?.some(entry=>entry.id===message.id))};
+        }
+        if (!state || !boundHere()) throw new Error("队列尚未绑定当前页面");
+        if (typeof message.text!=="string" || !message.text.trim() ||
+            message.text.length>12000) throw new Error("远程提示词无效");
+        if (message.action==="new_chat" && !isProjectOverview() ||
+            message.action==="continue" && !pageChatKey(location.href)) {
+          throw new Error("远程任务指定的对话类型不符");
+        }
+        if (message.mode==="queue") {
+          const result=await rpc("ADD_TASK",{
+            text:message.text,requestId:message.id,remoteJobId:message.id,
+          });
+          const task=result.state?.tasks?.find(item=>item.remoteJobId===message.id);
+          if (!task && !result.state?.recentSubmissions?.some(item=>item.id===message.id))
+            throw new Error("远程入队没有持久化确认");
+          render();
+          requestQueueWake();
+          return {ok:true,status:"queued",taskId:task?.id};
+        }
+        if (message.action==="continue" && message.mode==="steer") {
+          await steerQueuedTask(null,null,message.text,message.id);
+          // The native Send click alone is not proof of delivery.
+          const confirmed=Boolean(state?.remoteSteerConfirmedIds?.includes(message.id));
+          return {ok:true,status:confirmed ? "steered" : "waiting",
+            taskId:state?.tasks?.find(item=>item.remoteJobId===message.id)?.id};
+        }
+        throw new Error("远程发送模式无效");
+      };
+      void run().then(sendResponse).catch(error=>
+        sendResponse({ok:false,error:String(error.message||error).slice(0,320)}));
+      return true;
+    }
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -5655,9 +5708,11 @@
     return true;
   }
 
-  async function steerQueuedTask(id, nativeDraft = null) {
+  async function steerQueuedTask(id, nativeDraft = null, remoteText = null, remoteRequestId = null) {
     const fromComposer = Boolean(nativeDraft);
-    const actionKey = fromComposer ? "steer-prompt" : `steer-task:${id}`;
+    const fromRemote = typeof remoteText === "string";
+    const actionKey = fromRemote ? `steer-remote:${remoteRequestId}` :
+      fromComposer ? "steer-prompt" : `steer-task:${id}`;
     if (pendingUiActions.has(actionKey)) return;
     if (!state || !boundHere() || state.halted) {
       throw new Error("当前对话不可引导，请返回原对话并确认没有暂停");
@@ -5724,8 +5779,10 @@
     try {
       // Reserve a typed instruction atomically. Enqueue-then-claim would let
       // a normal dispatcher take it between the two storage operations.
-      const claim = await rpc(fromComposer ? "STEER_PROMPT_CLAIM" : "STEER_CLAIM", {
-        ...(fromComposer ? {text: nativeDraft.text} : {id}),
+      const claim = await rpc(fromRemote ? "REMOTE_STEER_CLAIM" :
+        fromComposer ? "STEER_PROMPT_CLAIM" : "STEER_CLAIM", {
+        ...(fromRemote ? {text:remoteText,requestId:remoteRequestId} :
+          fromComposer ? {text: nativeDraft.text} : {id}),
         userCount: before.userCount, lastUserId: before.lastUserId,
         busy: before.busy,
       }, originalScope);
@@ -5735,7 +5792,7 @@
       }
       reserved = claim.dispatch;
       if (!reserved) throw new Error("任务无法锁定，未尝试发送");
-      if (fromComposer) id = reserved.id;
+      if (fromComposer || fromRemote) id = reserved.id;
       if (!sendScopeCurrent(originalScope) || state.halted || !editor.isConnected ||
           !sameNativeEditor() || sessionKey !== originalSession ||
           location.href !== originalUrl || composerChanged ||

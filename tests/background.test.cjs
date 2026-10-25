@@ -10,6 +10,7 @@ const { TextEncoder } = require("node:util");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
 const handoffSource = fs.readFileSync(path.join(__dirname, "..", "handoff.js"), "utf8");
+const remoteDispatchSource = fs.readFileSync(path.join(__dirname, "..", "remote-dispatch.js"), "utf8");
 const A = "https://chatgpt.com/c/dialogue-a";
 const B = "https://chatgpt.com/c/dialogue-b";
 const voiceProof = {
@@ -543,6 +544,8 @@ async function harness(initialStorage = {}, options = {}) {
     importScripts(...scripts) {
       for (const script of scripts) {
         if (script === "handoff.js") vm.runInNewContext(handoffSource, sandbox);
+        else if (script === "remote-dispatch.js")
+          vm.runInNewContext(remoteDispatchSource, sandbox);
         else assert.equal(script, "image-store.js");
       }
     },
@@ -7690,4 +7693,75 @@ test("未发送交接重试拒绝已授权、已发、等待、用户暂停和�
     assert.equal(source.handoff.phase,"failed",mismatch);
     assert.equal(destination.schedules.length,0,mismatch);
   }
+});
+
+test("远程普通任务使用新标签接管空闲队列，旧标签不能继续自动领取且不会重复入队",async()=>{
+  const env=await harness();
+  await env.send("ENQUEUE",{text:"已有待发任务"},11,A);
+  env.navigate(13,A);
+  await env.send("HELLO",{},13,A);
+  const requestId="77777777-7777-4777-8777-777777777777";
+  const args={text:"AI 从新标签追加的任务",requestId,remoteJobId:requestId};
+  const result=await env.send("ADD_TASK",args,13,A,{url:A});
+  assert.equal(result.ok,true);
+  assert.equal(result.state.tabId,13);
+  assert.deepEqual(Array.from(result.state.tasks,t=>t.text),
+    ["已有待发任务","AI 从新标签追加的任务"]);
+  assert.equal((await env.send("CLAIM",{ready:true},11,A)).dispatch,null,
+    "旧标签已不是队列所有者");
+  const claimed=await env.send("CLAIM",{ready:true},13,A);
+  assert.equal(claimed.dispatch.text,"已有待发任务","保留 FIFO 顺序");
+  const duplicate=await env.send("ADD_TASK",args,13,A,{url:A});
+  assert.equal(duplicate.ok,true);
+  assert.equal(duplicate.state.tasks.length,2);
+});
+
+test("远程新标签不得抢走正在发送或引导中的旧对话队列",async()=>{
+  const env=await harness();
+  await env.send("ENQUEUE",{text:"已经执行中的任务"},11,A);
+  const claimed=await env.send("CLAIM",{ready:true},11,A);
+  assert.equal(claimed.ok,true);
+  assert.ok(claimed.dispatch);
+  env.navigate(13,A);
+  await env.send("HELLO",{},13,A);
+  const requestId="66666666-6666-4666-8666-666666666666";
+  const denied=await env.send("ADD_TASK",{
+    text:"不能抢占旧对话",remoteJobId:requestId,requestId,
+  },13,A,{url:A});
+  assert.equal(denied.ok,false);
+  assert.match(denied.error,/正在执行/);
+  const original=env.stored["cq.state.v2"].conversations["chat:dialogue-a"];
+  assert.equal(original.tabId,11);
+  assert.equal(original.tasks.length,1);
+  assert.equal(original.recentSubmissions.some(x=>x.id===requestId),false);
+});
+
+test("远程引导只在真正观察到发送的用户消息后确认，丢回执也不会重复提交",async()=>{
+  const env=await harness();
+  const requestId="55555555-5555-4555-8555-555555555555";
+  const result=await env.send("REMOTE_STEER_CLAIM",{
+    text:"补充引导内容",requestId,userCount:0,busy:false,
+  },11,A,{url:A});
+  assert.equal(result.ok,true);
+  const id=result.dispatch.id;
+  assert.equal(result.state.tasks.find(t=>t.id===id).remoteJobId,requestId);
+  assert.equal((await env.send("STEER_CLICKED",{id},11,A)).ok,true);
+  const premature=await env.send("STEER_CONFIRM",{
+    id,userCount:1,lastUserText:"其他人的消息",
+  },11,A);
+  assert.equal(premature.ok,false);
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:dialogue-a"]
+    .remoteSteerConfirmedIds.length,0);
+  const done=await env.send("STEER_CONFIRM",{
+    id,userCount:1,lastUserText:"补充引导内容",newUserElement:true,
+  },11,A);
+  assert.equal(done.ok,true);
+  assert.equal(done.state.remoteSteerConfirmedIds.includes(requestId),true);
+  assert.equal(done.state.tasks.some(t=>t.id===id),false);
+  const duplicate=await env.send("REMOTE_STEER_CLAIM",{
+    text:"补充引导内容",requestId,userCount:1,busy:false,
+  },11,A,{url:A});
+  assert.equal(duplicate.ok,false);
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:dialogue-a"]
+    .remoteSteerConfirmedIds.filter(x=>x===requestId).length,1);
 });
