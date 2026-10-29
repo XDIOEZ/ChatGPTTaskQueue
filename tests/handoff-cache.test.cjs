@@ -11,6 +11,7 @@ const {webcrypto}=require("node:crypto");
 const {TextEncoder}=require("node:util");
 const workerSource=fs.readFileSync(path.join(__dirname,"..","background.js"),"utf8");
 const handoffSource=fs.readFileSync(path.join(__dirname,"..","handoff.js"),"utf8");
+const remoteDispatchSource=fs.readFileSync(path.join(__dirname,"..","remote-dispatch.js"),"utf8");
 const SOURCE="https://chatgpt.com/g/g-p-cache-project/c/cache-source";
 const PROJECT="https://chatgpt.com/g/g-p-cache-project/project";
 const DESTINATION="https://chatgpt.com/g/g-p-cache-project/c/cache-destination";
@@ -35,6 +36,7 @@ function fixture(initial={}) {
     importScripts(...names){
       for(const name of names){
         if(name==="handoff.js")vm.runInContext(handoffSource,context);
+        else if(name==="remote-dispatch.js")vm.runInContext(remoteDispatchSource,context);
         else assert.equal(name,"image-store.js");
       }
     },

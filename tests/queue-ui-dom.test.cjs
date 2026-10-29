@@ -21,6 +21,7 @@ test("真实 Chrome：移除队列冗余工具栏，保留状态筛选、长文�
       "  function boundHere() { return true; }\n  function unusedOriginalBoundHere() {");
     fs.writeFileSync(path.join(dir, "content.js"), content);
     fs.copyFileSync(path.join(__dirname, "..", "panel.css"), path.join(dir, "panel.css"));
+    fs.copyFileSync(path.join(__dirname, "..", "agent-policy.js"), path.join(dir, "agent-policy.js"));
     fs.writeFileSync(path.join(dir, "index.html"), `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <link rel="stylesheet" href="./panel.css">
@@ -32,6 +33,7 @@ test("真实 Chrome：移除队列冗余工具栏，保留状态筛选、长文�
 const initialLongText = "一个很长的队列消息：" + "中".repeat(255) + "needle 最重要的关键字";
 const dangerous = '<img src=x onerror=alert(1)>内容不能变成 HTML';
 const requests = [];
+const queueSubmissions = [];
 const dismissed = [];
 const state = {
   key:"draft:1",halted:false,queuePaused:false,compactView:false,activeTaskId:"a",
@@ -48,6 +50,11 @@ const state = {
 window.chrome = {
   runtime:{getManifest(){return {version:"9.8.7"};},onMessage:{addListener(){}},async sendMessage(message) {
     requests.push(message.type);
+    if(message.type === "ENQUEUE") {
+      queueSubmissions.push(message);
+      state.tasks.push({id:"new-"+queueSubmissions.length,
+        text:message.text,status:"pending",images:[]});
+    }
     if (message.type === "DISMISS_WAITING") {
       dismissed.push(message);
       state.tasks=state.tasks.filter(task=>task.id!==message.id);
@@ -64,6 +71,7 @@ const rows=()=>[...document.querySelectorAll("#cq-extension-root .cq-list [data-
 const filter=(name)=>q('[data-action="filter-tasks"][data-filter="'+name+'"]').click();
 const wait=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
 </script>
+<script src="./agent-policy.js"></script>
 <script src="./content.js"></script>
 <script>
 setTimeout(async()=>{
@@ -76,10 +84,11 @@ setTimeout(async()=>{
     result.versionBadge=q('.cq-toolbar > .cq-version-badge')?.textContent==="v9.8.7" &&
       q('.cq-toolbar')?.lastElementChild?.classList.contains('cq-version-badge') &&
       q('.cq-version-badge')?.getAttribute('aria-label')==="插件版本 9.8.7";
+    q('[data-action="toggle-handoff"]').click();
     result.handoffActionSafeguard=q('[data-action="handoff-now"]')?.disabled===true &&
-      q('[data-action="handoff-now"]')?.textContent.includes("接力") &&
-      q('[data-action="handoff-now"]')?.getAttribute("title")?.includes("原生项目") &&
+      /接力|交接/.test(q('[data-action="handoff-now"]')?.textContent||"") &&
       !requests.includes("HANDOFF_NOW");
+    q('[data-action="toggle-handoff"]').click();
     result.defaultDraggable=q('[data-task-id="p1"]')?.draggable===true &&
       q('[data-task-id="a"]')?.draggable===false;
     result.originalOrder=rows().join(",")==="a,p1,p2,e,p3,i";
@@ -196,6 +205,32 @@ setTimeout(async()=>{
       q(".cq-empty").textContent.includes("按 Enter") &&
       q(".cq-empty").textContent.includes("加入队列") &&
       !q(".cq-queue-tools");
+    const longTask="请重构物品与生产系统，同时整合食物及装备数值编辑、"+
+      "修复运行时更新并提供自动化测试。".repeat(6);
+    q('[data-action="toggle-settings"]').click();
+    q('[data-action="show-settings-page"][data-page="general"]').click();
+    q('[data-action="toggle-queue-composer"]').click();
+    result.teamToggleDefault=q('#cq-auto-team-enabled')?.checked===true;
+    q('#cq-queue-draft').value=longTask;
+    q('#cq-queue-draft').dispatchEvent(new Event("input",{bubbles:true}));
+    q('[data-action="save-queue-composer"]').click();
+    await wait(120);
+    result.teamHintSubmitted=queueSubmissions.length===1 &&
+      queueSubmissions[0].text.startsWith(longTask) &&
+      queueSubmissions[0].text.includes("[队列插件：自动协作]");
+    q('[data-action="toggle-settings"]').click();
+    q('[data-action="show-settings-page"][data-page="general"]').click();
+    q('[data-action="toggle-queue-composer"]').click();
+    const toggle=q('#cq-auto-team-enabled');
+    toggle.checked=false;
+    toggle.dispatchEvent(new Event("change",{bubbles:true}));
+    q('#cq-queue-draft').value=longTask;
+    q('#cq-queue-draft').dispatchEvent(new Event("input",{bubbles:true}));
+    q('[data-action="save-queue-composer"]').click();
+    await wait(120);
+    result.teamToggleHonored=queueSubmissions.length===2 &&
+      queueSubmissions[1].text===longTask &&
+      localStorage.getItem("cq.agentTeamAuto.v1")==="0";
   } catch (error) {result.error=error.stack || error.message;}
   result.ok=["counts","handoffActionSafeguard","defaultDraggable","originalOrder",
     "waitingDismissButton","generatingCannotDismiss","idleCanDismiss","dismissWaiting",
@@ -204,7 +239,8 @@ setTimeout(async()=>{
     "expandedLongText","collapsedAgain","xssEscaped","statusDoesNotMutate",
     "legacyCompact","noCompactControl","comfortableRestored",
     "containerResponsive","noHorizontalOverflow","wideRestoresLabels",
-    "emptyFilter","resetFilterFocus","emptyQueue"].every(key=>result[key]===true);
+    "emptyFilter","resetFilterFocus","emptyQueue","teamToggleDefault",
+    "teamHintSubmitted","teamToggleHonored"].every(key=>result[key]===true);
   document.body.dataset.check=JSON.stringify(result);
 },300);
 </script></body></html>`);

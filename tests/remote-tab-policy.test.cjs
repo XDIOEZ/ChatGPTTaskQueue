@@ -12,6 +12,7 @@ const projectUrl="https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/pro
 const projectId="g-p-1234567890abcdef1234567890abcdef";
 const targetChat={kind:"chat",id:"chat-123",url:chatUrl};
 const targetProject={kind:"project",id:projectId,url:projectUrl};
+const targetPersonal={kind:"personal",id:"personal",url:"https://chatgpt.com/"};
 const jobId="12345678-1234-4234-8234-123456789abc";
 
 function harness() {
@@ -78,6 +79,13 @@ function harness() {
       projectStart(url){
         const id=this.projectId(url);return id?"https://chatgpt.com/g/"+id+"/project":null;
       },
+      scopeId(url){
+        try {
+          const path=new URL(url).pathname;
+          return this.projectId(url) ||
+            (/^(?:\/|\/c\/[^/]+)$/.test(path)?"personal":null);
+        } catch {return null;}
+      },
     },
     chatKey(url){
       const match=/\/c\/([^/]+)$/.exec(new URL(url).pathname);
@@ -134,6 +142,39 @@ test("项目新任务也创建独立标签，旧对话引导只用旧标签",asy
   env.setOwner(999);
   await assert.rejects(()=>env.remote.findOrOpen(steer,targetChat),/已有的标签页/);
   assert.equal(env.created.length,1,"找不到旧标签时必须报错，不得新建代替");
+});
+
+test("普通新聊天可远程创建，首次跳转后仍属原任务，不能串入项目对话",async()=>{
+  const env=harness();
+  const job={id:jobId,action:"new_chat",mode:"queue",text:"在普通聊天里新建任务",
+    target:targetPersonal};
+  const chosen=env.remote.pickTarget(job,[]);
+  assert.equal(chosen.kind,"personal");
+  assert.equal(chosen.url,"https://chatgpt.com/");
+  const tab=await env.remote.findOrOpen(job,chosen);
+  assert.equal(tab.active,false);
+  assert.equal(env.created.length,1);
+  assert.equal(new URL(tab.url).pathname,"/");
+  assert.equal((await env.remote.findOrOpen({...job,tabId:tab.id},chosen)).id,tab.id);
+  tab.url="https://chatgpt.com/c/new-ordinary-chat";
+  await env.remote.onTabNavigated(tab.id,tab.url);
+  assert.equal(env.storage["cq.remote.ownedTabs.v1"][String(tab.id)].visited,false,
+    "普通首页首发变成正式聊天属于自然跳转，不是用户接管标签");
+  const result=await env.remote.executeJob({...job,tabId:tab.id,taskId:"task-final"});
+  assert.equal(result.status,"created");
+  assert.equal(result.chatUrl,"https://chatgpt.com/c/new-ordinary-chat");
+  assert.equal(env.created.length,1,"跳转为正式普通聊天后不能重复开页");
+
+  tab.url="https://chatgpt.com/g/"+projectId+"/c/new-ordinary-chat";
+  await env.remote.onTabNavigated(tab.id,tab.url);
+  assert.equal(env.storage["cq.remote.ownedTabs.v1"][String(tab.id)].visited,true,
+    "自动创建的普通聊天跳到别的项目必须永久禁止自动关闭");
+  await assert.rejects(()=>env.remote.findOrOpen({...job,tabId:tab.id},chosen),
+    /已切换目标/);
+  assert.equal(env.created.length,1);
+  assert.throws(()=>env.remote.pickTarget({...job,target:{
+    kind:"personal",id:"personal",url:projectUrl,
+  }},[]),/普通新对话目标/);
 });
 
 test("已记录发送/开页意图与标签ID的任务，目标页关闭或改路由都不重开",async()=>{

@@ -1,4 +1,4 @@
 interface:
   display_name: "GPT 队列协作团队"
-  short_description: "插件在线才启动：Git 独立工作树 + 点对点消息 + ACK 协作"
-  default_prompt: "使用 $gpt-queue-agent-team。先通过 HomePC2 调用队列协作 doctor 验证插件在线，再按 Git 模块所有权启动可并行的成员对话。所有跨模块发现、接口、阻塞和 CodeReviewFix 必须双向交换消息并追踪 ACK；完成审查、验证、Git 集成及全部 ACK 后调用 finish --run <运行ID> --verified 安全释放成员后台聊天标签，不关闭用户窗口。"
+  short_description: "长任务主动检查插件：普通/项目多对话 + 消息 ACK + 结果整合"
+  default_prompt: "请先判断是否有值得并行的独立工作流；短任务不拆。使用 $gpt-queue-agent-team，先通过 PCC 或 HomePC2 运行 doctor 确认插件在线，然后用 init --auto --lead-chat <正式对话URL> 注册普通或项目聊天团队，spawn 2～4 个独立成员，sync 获取成员对话，send / ack 双向跟进；主智能体负责整合、审查和验证。非 Git 任务可不指定 repo；Git 任务隔离文件所有权。所有 READY / VERIFIED 与消息 ACK 确认后才 finish --verified，保留用户原标签。"

@@ -115,14 +115,22 @@ function validateJob(input) {
   if (!target || typeof target!=="object" || Array.isArray(target))
     fail("请指定 target 对象");
   if ((action==="continue" && target.kind!=="chat") ||
-      (action==="new_chat" && target.kind!=="project"))
-    fail("已有对话用 chat，新建对话用 project");
+      (action==="new_chat" && !["project","personal"].includes(target.kind)))
+    fail("已有对话用 chat，新建对话用 project 或 personal");
   const selector=target.id||target.url||target.name;
   if (typeof selector!=="string" || !selector.trim() || selector.length>512)
     fail("必须提供 target.id / target.url / target.name");
   if (target.url && (!/^https:\/\/chatgpt\.com\//.test(target.url) &&
       !/^https:\/\/chat\.openai\.com\//.test(target.url)))
     fail("只允许官方 ChatGPT 地址");
+  if (target.kind==="personal") {
+    if (target.id && target.id!=="personal") fail("普通新对话的 ID 必须是 personal");
+    if (target.url) {
+      const parsed=new URL(target.url);
+      if (parsed.pathname!=="/" || parsed.search || parsed.hash)
+        fail("普通新对话必须使用 ChatGPT 首页地址");
+    }
+  }
   const mode=input.mode || "queue";
   if (!["queue","steer"].includes(mode) || (action==="new_chat" && mode!=="queue"))
     fail("新对话仅支持 queue；已有对话支持 queue / steer");
@@ -131,6 +139,10 @@ function validateJob(input) {
       (channel==="team" && (action!=="continue" || mode!=="queue")) ||
       (channel==="team_spawn" && (action!=="new_chat" || mode!=="queue")))
     fail("channel 类型不合法：team 用于已有对话消息，team_spawn 用于团队新对话");
+  if(input.captureResult!=null && typeof input.captureResult!=="boolean")
+    fail("captureResult 必须是布尔值");
+  if(input.captureResult===true && (channel!=="job" || mode!=="queue"))
+    fail("只有普通队列任务可以请求完成结果");
   const runId=input.runId;
   if(runId!=null && (!RELEASE_RUN_PATTERN.test(runId) || channel==="job"))
     fail("只有协作消息可以包含合法 runId");
@@ -138,21 +150,81 @@ function validateJob(input) {
     kind:target.kind,...(target.id?{id:target.id}:{}),
     ...(target.url?{url:target.url}:{}),...(target.name?{name:target.name}:{})
   },mode,...(channel!=="job"?{channel}:{}),
+    ...(input.captureResult===true?{captureResult:true}:{}),
     ...(runId?{runId}:{})};
 }
 function publicJob(job) {
   const {id,action,target,mode,status,createdAt,updatedAt,attempts,tabId,taskId,chatUrl,error,
-    openIntent,sendIntent,channel,runId}=job;
+    openIntent,sendIntent,channel,runId,captureResult,completionStatus,replyText,resultError,replyTruncated,resultDiagnostic,confirmationDiagnostic}=job;
   return {id,action,target,mode,status,createdAt,updatedAt,attempts,
     ...(tabId?{tabId}:{}),...(taskId?{taskId}:{}),
     ...(chatUrl?{chatUrl}:{}),...(error?{error}:{}),
-    ...(channel?{channel}:{}),...(runId?{runId}:{}),
+    ...(channel?{channel}:{}),...(runId?{runId}:{}),...(captureResult?{captureResult:true}:{}),
+    ...(completionStatus?{completionStatus}:{}),
+    ...(typeof replyText==="string"?{replyText}:{}),
+    ...(resultError?{resultError}:{}),...(replyTruncated?{replyTruncated:true}:{}),
+    ...(resultDiagnostic?{resultDiagnostic}:{}),
+    ...(confirmationDiagnostic?{confirmationDiagnostic}:{}),
     ...(openIntent===true?{openIntent:true}:{}),
     ...(sendIntent===true?{sendIntent:true}:{})};
 }
 function makeJob(input,now=Date.now()) {
-  return {...validateJob(input),id:crypto.randomUUID(),status:"pending",
+  const payload=validateJob(input);
+  const requestId=input.clientRequestId;
+  if(requestId!=null && (typeof requestId!=="string" ||
+      !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(requestId)))
+    fail("clientRequestId 必须是 UUID");
+  const submissionHash=requestId ? crypto.createHash("sha256")
+    .update(JSON.stringify(payload)).digest("hex") : null;
+  return {...payload,id:requestId||crypto.randomUUID(),
+    ...(submissionHash?{submissionHash}:{}),status:"pending",
     createdAt:now,updatedAt:now,attempts:0,leaseUntil:0};
+}
+
+function safeResultDiagnostic(value) {
+  if(!value || typeof value!=="object" || Array.isArray(value)) return null;
+  const allowedReasons=["ok","no_capture","last_role","no_user_baseline","user_count",
+    "user_folded","user_mismatch","assistant_text_missing","assistant_not_new","background_rejected"];
+  const result={reason:allowedReasons.includes(value.reason)?value.reason:"background_rejected"};
+  if(["user","assistant","other"].includes(value.lastRole)) result.lastRole=value.lastRole;
+  for(const key of ["baselineUserCount","userCount","baselineAssistantCount","assistantCount","assistantTextLength"])
+    if(Number.isInteger(value[key]) && value[key]>=0 && value[key]<=1000000) result[key]=value[key];
+  for(const key of ["userFolded","userMatches","newerId","newerCount","boundHere","chatRoute","recentSubmission"])
+    if(typeof value[key]==="boolean") result[key]=value[key];
+  return result;
+}
+
+function recordCompletion(job, input, now=Date.now()) {
+  if(!input || input.id!==job.id || typeof input.taskId!=="string" ||
+      !input.taskId || input.taskId.length>=128 ||
+      !["completed","result_unavailable"].includes(input.completionStatus))
+    fail("完成结果格式无效");
+  if(job.captureResult!==true) fail("该任务未请求收集结果",409);
+  if(job.taskId && job.taskId!==input.taskId) fail("完成结果与队列任务不匹配",409);
+  if(input.completionStatus==="completed" &&
+      (typeof input.replyText!=="string" || !input.replyText.trim() || input.replyText.length>20000))
+    fail("完成结果正文无效");
+  if(input.completionStatus==="result_unavailable" && input.replyText!=null)
+    fail("无法确认的结果不能包含正文");
+  const normalized={completionStatus:input.completionStatus,
+    ...(input.completionStatus==="completed"?{replyText:input.replyText}:{}),
+    ...(input.replyTruncated===true?{replyTruncated:true}:{}),
+    ...(input.completionStatus==="result_unavailable"?{resultError:
+      typeof input.resultError==="string" && input.resultError.trim()
+        ? input.resultError.slice(0,350) : "无法确认最终回复属于该任务，请查看对应对话。",
+      ...(safeResultDiagnostic(input.resultDiagnostic)?
+        {resultDiagnostic:safeResultDiagnostic(input.resultDiagnostic)}:{})}:{})};
+  if(job.completionStatus) {
+    for(const [key,value] of Object.entries(normalized))
+      if(JSON.stringify(job[key])!==JSON.stringify(value)) fail("该任务已有不同的完成结果",409);
+    return publicJob(job);
+  }
+  job.taskId ||= input.taskId;
+  Object.assign(job,normalized);
+  if(typeof input.chatUrl==="string" && /^https:\/\/chatgpt\.com\//.test(input.chatUrl))
+    job.chatUrl=input.chatUrl;
+  job.updatedAt=now;
+  return publicJob(job);
 }
 
 function releaseChatUrl(value) {
@@ -370,6 +442,28 @@ function updateJob(job,result,now=Date.now()) {
   if (typeof result.taskId==="string" && result.taskId.length<128) job.taskId=result.taskId;
   if (typeof result.error==="string") job.error=result.error.slice(0,350);
   else if(TERMINAL.has(result.status)) delete job.error;
+  if(job.captureResult===true && result.confirmationDiagnostic &&
+      typeof result.confirmationDiagnostic==="object" && !Array.isArray(result.confirmationDiagnostic)) {
+    const safe={};
+    for(const key of ["boundHere","chatRoute","userMatches","recentSubmission"])
+      if(typeof result.confirmationDiagnostic[key]==="boolean") safe[key]=result.confirmationDiagnostic[key];
+    for(const key of ["userCount","domUserCount"]) {
+      const count=result.confirmationDiagnostic[key];
+      if(Number.isInteger(count) && count>=0 && count<=1000000) safe[key]=count;
+    }
+    const shapes=result.confirmationDiagnostic.userNodeShapes;
+    if(Array.isArray(shapes)) safe.userNodeShapes=shapes.slice(0,5).map(shape=>({
+      ...Object.fromEntries(["inMain","visible","hasId","sameIdAsLast","sameTextAsLast",
+        "sameContainerAsLast","sameOwnerAsLast"].filter(key=>typeof shape?.[key]==="boolean")
+        .map(key=>[key,shape[key]])),
+      path:Array.isArray(shape?.path)?shape.path.slice(0,10).map(part=>({
+        tag:["div","section","article","main","h1","h2","h3","h4","h5","h6","span","p","other"]
+          .includes(part?.tag)?part.tag:"other",
+        mask:Number.isInteger(part?.mask) && part.mask>=0 && part.mask<1024?part.mask:0,
+      })):[],
+    }));
+    job.confirmationDiagnostic=safe;
+  }
   return publicJob(job);
 }
 function output(res,code,data) {
@@ -391,11 +485,23 @@ function makeServer() {
         if (!url.pathname.startsWith("/v1/extension/")) fail("CORS 不允许",403);
         res.writeHead(204);res.end();return;
       }
-      if (req.method==="GET" && url.pathname==="/health")
+      if (req.method==="GET" && url.pathname==="/health") {
+        const store=load();
         return output(res,200,{ok:true,service:"chatgpt-task-queue-bridge",
-          version:3,features:["extension_version","team_channels","safe_tab_release"]});
+          version:3,features:["extension_version","team_channels","safe_tab_release",
+            "idempotent_submission","completion_results"],
+          extensionVersion:store.extensionVersion||null,extensionUpdatedAt:store.targetsAt||null});
+      }
       if (url.pathname.startsWith("/v1/extension/")) {
         requireExtension(req);
+        if(req.method==="POST" && url.pathname==="/v1/extension/results/report") {
+          const message=await readJson(req,100000),store=load();
+          const job=store.jobs.find(x=>x.id===message.id);
+          if(!job) fail("任务不存在",404);
+          const result=recordCompletion(job,message);
+          save(store);
+          return output(res,200,{ok:true,job:result});
+        }
         if(req.method==="GET" && url.pathname==="/v1/extension/releases/poll") {
           const store=load(),request=claimReleaseRequest(store);
           if(request || store.releases.some(r=>r.status==="review_required")) save(store);
@@ -476,14 +582,22 @@ function makeServer() {
       if (req.method==="POST" && url.pathname==="/v1/jobs") {
         const store=load();
         const item=makeJob(await readJson(req));
+        const existing=store.jobs.find(j=>j.id===item.id);
+        if(existing) {
+          if(!item.submissionHash || existing.submissionHash!==item.submissionHash)
+            fail("同一请求 ID 对应了不同任务",409);
+          return output(res,200,{ok:true,job:publicJob(existing)});
+        }
         applyKnownTarget(item,store);
         // Never silently delete pending work just to accept one more task.
         if(store.jobs.filter(j=>!TERMINAL.has(j.status)).length>=MAX_JOBS)
           fail("待处理任务数量已满",409);
         store.jobs.push(item);
         if(store.jobs.length>MAX_JOBS*2) {
-          const recent=store.jobs.filter(j=>TERMINAL.has(j.status)).slice(-MAX_JOBS);
-          store.jobs=[...store.jobs.filter(j=>!TERMINAL.has(j.status)),...recent]
+          const awaiting=j=>Boolean(j.submissionHash && !j.completionStatus &&
+            !["failed","review_required","cancelled"].includes(j.status));
+          const recent=store.jobs.filter(j=>TERMINAL.has(j.status) && !awaiting(j)).slice(-MAX_JOBS);
+          store.jobs=[...store.jobs.filter(j=>!TERMINAL.has(j.status) || awaiting(j)),...recent]
             .sort((a,b)=>a.createdAt-b.createdAt);
         }
         save(store);return output(res,201,{ok:true,job:publicJob(item)});
@@ -556,8 +670,15 @@ function argsToJob(command,args) {
   const content=arg("--file")?fs.readFileSync(path.resolve(arg("--file")),"utf8"):arg("--text");
   if(command==="enqueue") return {action:"continue",target:{kind:"chat",name:arg("--chat")},
     text:content,mode:arg("--mode")||"queue"};
-  if(command==="new") return {action:"new_chat",target:{kind:"project",name:arg("--project")},
-    text:content,mode:"queue"};
+  if(command==="new") {
+    if(args.includes("--personal") && args.includes("--project"))
+      fail("普通新对话与项目新对话不能同时指定");
+    if(args.includes("--personal")) return {action:"new_chat",
+      target:{kind:"personal",id:"personal",url:"https://chatgpt.com/"},
+      text:content,mode:"queue"};
+    return {action:"new_chat",target:{kind:"project",name:arg("--project")},
+      text:content,mode:"queue"};
+  }
   fail("未知任务指令");
 }
 async function cli(argv) {
@@ -575,6 +696,7 @@ async function cli(argv) {
       "  node remote-bridge.cjs targets             查看可识别的对话与项目",
       "  node remote-bridge.cjs enqueue --chat <名称|ID|URL> --text <提示词> [--mode queue|steer]",
       "  node remote-bridge.cjs new --project <名称|ID|URL> --text <提示词>",
+      "  node remote-bridge.cjs new --personal --text <提示词>  在普通聊天中新建对话",
       "  node remote-bridge.cjs bind --project <名称> --url <项目主页地址>",
       "  node remote-bridge.cjs bind --chat <名称> --url <现有对话地址>",
       "  node remote-bridge.cjs submit --json <文件> 结构化创建任务",
@@ -582,7 +704,7 @@ async function cli(argv) {
       "  node remote-bridge.cjs cancel-unclaimed --json <JSON数组文件> 仅取消尚未领取的任务",
       "  node remote-bridge.cjs quarantine-uncertain --json <JSON数组文件> 停止已过租约的不确定任务重试",
       "  node remote-bridge.cjs reset-pairing       改变浏览器扩展安装 ID 后重新配对",
-      "  可以用 --file <UTF-8文件> 代替 --text；指定项目新聊天不会创建新项目。",
+      "  可以用 --file <UTF-8文件> 代替 --text；--personal 创建普通聊天，不进入项目。",
     ].join("\n")+"\n");return;
   }
   if(command==="install") {
@@ -633,6 +755,6 @@ async function cli(argv) {
 if(require.main===module) cli(process.argv.slice(2)).catch(error=>{
   process.stderr.write("操作失败："+error.message+"\n");process.exitCode=1;
 });
-module.exports={validateJob,makeJob,dispatchNext,updateJob,
+module.exports={validateJob,makeJob,dispatchNext,updateJob,recordCompletion,
   cancelUnclaimedJobs,quarantineUncertainJobs,
   createReleaseRequest,claimReleaseRequest,reportReleaseRequest,makeServer,ROOT,PORT};

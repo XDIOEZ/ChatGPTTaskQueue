@@ -11,18 +11,18 @@ const browser = process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
   : "/usr/bin/google-chrome");
 
-test("真实 Chrome：接力按钮打开设置页，保存循环与倒计时，手动命令仅入队一次", {
+test("真实 Chrome：普通聊天的自动接力按钮可点击、保存倒计时，手动命令只入队一次", {
   skip: !fs.existsSync(browser) && "Chrome is not installed",
 }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cq-manual-handoff-ui-"));
   try {
     let content = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
-    // The browser fixture loads file://. Simulate the path portion of an
-    // existing native-project chat only for its UI eligibility check.
-    const pathnameSource = "      .test(new URL(location.href).pathname);";
-    assert.ok(content.includes(pathnameSource),"Project-chat eligibility expression moved");
-    content = content.replace(pathnameSource,
-      '      .test("/g/g-p-empty-ui/c/known-chat");');
+    // The fixture loads file://; simulate an ordinary existing /c/ chat
+    // only for the UI eligibility decision, not the authenticated worker.
+    const eligibilitySource = "    const projectChat = Boolean(pageChatKey(location.href) && handoffScopeId(location.href));";
+    assert.ok(content.includes(eligibilitySource),"Chat eligibility expression moved");
+    content = content.replace(eligibilitySource,
+      '    const projectChat = Boolean(pageChatKey("https://chatgpt.com/c/known-chat") && handoffScopeId("https://chatgpt.com/c/known-chat"));');
     // file:// has no legitimate conversation owner; its normal binding gate
     // is covered by worker tests. Keep this DOM test focused on the button.
     content = content.replace("  function boundHere() {",
@@ -32,7 +32,7 @@ test("真实 Chrome：接力按钮打开设置页，保存循环与倒计时，�
     content = content.replace(initCall,
       "  window.__cqHandoffProbe={snapshot:conversationSnapshot,extract:extractHandoffReply," +
       "completion:handoffCompletionEvidence,ready:updateVoiceReadiness," +
-      "composerReady:handoffComposerReady,send:sendTask,hover:updateHandoffHover};\n  void init();\n})();");
+      "composerReady:handoffComposerReady,send:sendTask,hover:updateHandoffHover,match:handoffTextMatch};\n  void init();\n})();");
     fs.writeFileSync(path.join(dir, "content.js"),content);
     fs.copyFileSync(path.join(__dirname, "..", "panel.css"),path.join(dir,"panel.css"));
     fs.writeFileSync(path.join(dir, "index.html"), `<!doctype html>
@@ -257,7 +257,7 @@ setTimeout(async()=>{
      // The worker used to drop kind in dispatch, despite the owned record
      // being an internal handoff. Only dictation is present in this fixture.
      summaryTask.status="dispatching";
-     summaryTask.kind="handoff_intro";
+     summaryTask.kind="handoff_summary";
      summaryTask.text="任务主题：回复帖子\\n"+snapshot.lastAssistantText;
      const nativeSend=document.createElement("button");
      nativeSend.type="button";
@@ -273,10 +273,10 @@ setTimeout(async()=>{
      document.querySelector("form").append(nativeSend);
      await probe.send({id:summaryTask.id,text:summaryTask.text,images:[]});
      checks.ownedHandoffDispatch=nativeSendClicks===1 && calls.includes("SENT") &&
-       submittedText===summaryTask.text;
+       probe.match(summaryTask.text,submittedText).matches===true;
   }catch(error){checks.error=String(error);}
   checks.ok=["emptyQueue","enabled","estimatedAge","disabledTooltip","nativeMessageTime",
-     "opensSettings","disabledSaveAcknowledged","savedCountdown","savedPersistedFeedback",
+     "opensSettings","startSavesAndEnables","savedCountdown","savedPersistedFeedback",
      "nextTriggerCountdown","countdownUpdates","exhaustedTooltip","startAcknowledged","onlyOnce","queued",
      "manualPreservesAuto","handoffTooltip","explicitCancel",
      "collapsedFailureExplained","failedNotice","failedRecovery","shortSummary","longSummary","plainReply","virtualizedTurn",

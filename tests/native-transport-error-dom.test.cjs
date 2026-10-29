@@ -20,12 +20,14 @@ test("原生消息传输超时先隔离并等待错误消失后继续；不点�
   try {
     const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8")
       .replace(/\r\n/g, "\n");
-    const guard = "if (!state || !sessionKey || !validUrl(location.href)) return false;";
+    const guard = "  function boundHere() {";
     const end = "  void init();\n})();";
     assert.ok(source.includes(guard) && source.includes(end));
     fs.writeFileSync(path.join(folder, "content.js"), source
+      // The fixture is file://, not an official /c/<id> chat. Its transport
+      // state-machine tests must not depend on the separate URL ownership gate.
       .replace(guard,
-        "if (!state || !sessionKey || (!validUrl(location.href) && !location.href.startsWith('file:'))) return false;")
+        "  function boundHere() { return true; }\n  function unmodifiedBoundHereForTransportFixture() {")
       .replace('return Boolean(sessionKey?.startsWith("draft:") && !pageChatKey(location.href));',
         'return location.protocol === "file:" ? false : Boolean(sessionKey?.startsWith("draft:") && !pageChatKey(location.href));')
       .replace(end, `  window.__nativeErrorTest = {
@@ -137,7 +139,7 @@ window.chrome={
 </script>
 <script src="./content.js"></script>
 <script>
-let proseIgnored=false,nativeDetected=false,heldWhileError=false;
+let proseIgnored=false,nativeDetected=false,retrylessDetected=false,heldWhileError=false;
 setTimeout(()=>{
   const h=window.__nativeErrorTest;
   const bubble=document.querySelector('[data-testid="user-message"]');
@@ -146,6 +148,16 @@ setTimeout(()=>{
   proseIgnored=!h.detect();
   errorBox.style.display='';
   nativeDetected=h.detect();
+  // The screenshot's red timeout is NOT a clickable native Retry control.
+  const retryless=document.createElement('div');
+  retryless.style.color='rgb(238,64,64)';
+  retryless.style.border='1px solid rgb(173,40,40)';
+  retryless.textContent='消息传输超时。请重试。';
+  errorBox.style.display='none';
+  document.querySelector('main').insertBefore(retryless,document.querySelector('form'));
+  retrylessDetected=h.detect();
+  retryless.remove();
+  errorBox.style.display='';
   // A Voice button next to a persistent transport error must not resume work.
   h.ready(h.snapshot());h.forceStable();
 },350);
@@ -163,6 +175,7 @@ setTimeout(async()=>{
   await h.heartbeat();
   const flags={
     detectsNativeTimeout:nativeDetected,
+    detectsRetrylessRedTimeout:retrylessDetected,
     persistentErrorHoldsQueue:heldWhileError,
     proseNotNativeError:proseIgnored,
     firstQuarantined:log.failed.length===1&&log.failed[0]==='bad'&&

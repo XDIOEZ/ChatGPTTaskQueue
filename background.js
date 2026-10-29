@@ -232,6 +232,26 @@ function blankStore() {
   };
 }
 
+function persistRemoteOutcome(store, task, url, outcome) {
+  if (typeof task?.remoteJobId !== "string" || task.remoteCaptureResult!==true) return;
+  if (!Array.isArray(store.remoteResults)) store.remoteResults = [];
+  if (store.remoteResults.some(item=>item.id===task.remoteJobId)) return;
+  store.remoteResults.push({id:task.remoteJobId,taskId:task.id,chatUrl:url,...outcome});
+}
+
+function safeRemoteDiagnostic(value) {
+  if (!value || typeof value!=="object" || Array.isArray(value)) return null;
+  const allowedReasons = ["ok","no_capture","last_role","no_user_baseline","user_count",
+    "user_folded","user_mismatch","assistant_text_missing","assistant_not_new","background_rejected"];
+  const result = {reason:allowedReasons.includes(value.reason)?value.reason:"background_rejected"};
+  if (["user","assistant","other"].includes(value.lastRole)) result.lastRole=value.lastRole;
+  for(const key of ["baselineUserCount","userCount","baselineAssistantCount","assistantCount","assistantTextLength"])
+    if(Number.isInteger(value[key]) && value[key]>=0 && value[key]<=1000000) result[key]=value[key];
+  for(const key of ["userFolded","userMatches","newerId","newerCount","boundHere","chatRoute","recentSubmission"])
+    if(typeof value[key]==="boolean") result[key]=value[key];
+  return result;
+}
+
 function chatKey(url) {
   const normal = safeUrl(url);
   if (!normal) return null;
@@ -249,11 +269,22 @@ function isProjectOverview(url) {
     /^\/g\/g-p-[a-zA-Z0-9-]+(?:\/project)?$/.test(new URL(normal).pathname));
 }
 
+// Personal handoffs use the native new-chat homepage; project handoffs use
+// the selected project's new-chat page. Both are scoped to the same tab.
+function isHandoffStartPage(url) {
+  const normal = safeUrl(url);
+  return Boolean(normal && (isProjectOverview(normal) ||
+    new URL(normal).pathname === "/"));
+}
+
 function draftProjectId(url) {
   const normal = safeUrl(url);
   if (!normal) return null;
-  const match = new URL(normal).pathname.match(/^\/g\/(g-p-[a-zA-Z0-9-]+)(?:\/project|\/c\/[a-zA-Z0-9-]+)?$/);
-  return match ? CQHandoff.normalizeProjectId(match[1]) : null;
+  const pathname = new URL(normal).pathname;
+  const match = pathname.match(/^\/g\/(g-p-[a-zA-Z0-9-]+)(?:\/project|\/c\/[a-zA-Z0-9-]+)?$/);
+  if (match) return CQHandoff.normalizeScopeId(match[1]);
+  return pathname === "/" || /^\/c\/[a-zA-Z0-9-]+\/?$/.test(pathname)
+    ? CQHandoff.PERSONAL_SCOPE : null;
 }
 
 function sameDraftScope(firstUrl, secondUrl) {
@@ -576,9 +607,9 @@ async function recordHandoffDebugAdoption(store, observation, sender, url, messa
 }
 
 function handoffDebugAdoptionMetadata(store, sender, url) {
-  const project = CQHandoff.projectId(url);
+  const project = CQHandoff.scopeId(url);
   const candidates = Object.values(store.conversations).filter(state =>
-    project && chatKey(state.url) && state.tabId === sender.tab?.id && CQHandoff.projectId(state.url) === project &&
+    project && chatKey(state.url) && state.tabId === sender.tab?.id && CQHandoff.scopeId(state.url) === project &&
     ["navigating","bootstrapping","failed"].includes(state.handoff?.phase));
   return {candidateCount:candidates.length,candidates:candidates.slice(0,12).map(source => {
     const destination = store.conversations[source.handoff.destinationKey];
@@ -645,7 +676,7 @@ async function observeHandoffDebugStore(store) {
 function handoffDebugSource(store, sender, url) {
   if (!Number.isInteger(sender.tab?.id) ||
       sender.frameId != null && sender.frameId !== 0 || !safeUrl(url)) return null;
-  const project = CQHandoff.projectId(url);
+  const project = CQHandoff.scopeId(url);
   if (!project) return null;
   const direct = store.conversations[chatKey(url)];
   if (direct?.handoff && !direct.handoffSourceKey &&
@@ -653,7 +684,7 @@ function handoffDebugSource(store, sender, url) {
       direct.handoff.phase !== "completed") return direct;
   return Object.values(store.conversations).filter(state =>
     chatKey(state.url) && state.tabId === sender.tab.id &&
-    CQHandoff.projectId(state.url) === project &&
+    CQHandoff.scopeId(state.url) === project &&
     state.handoff && HANDOFF_DEBUG_PHASES.has(state.handoff.phase) &&
     state.handoff.phase !== "completed")
     .sort((a,b) => (b.handoff.changedAt || 0)-(a.handoff.changedAt || 0))[0] || null;
@@ -762,8 +793,8 @@ function handoffDebugReportSource(store, sender, url) {
   const linked = store.conversations[destination?.handoffSourceKey];
   if (linked?.handoff && destination.tabId === sender.tab?.id && linked.tabId === sender.tab.id &&
       linked.handoff.destinationKey === destination.key && linked.handoff.token === destination.handoffToken &&
-      CQHandoff.projectId(linked.url) === CQHandoff.projectId(url)) return linked;
-  return isProjectOverview(url) ? handoffDebugSource(store,sender,url) : null;
+      CQHandoff.scopeId(linked.url) === CQHandoff.scopeId(url)) return linked;
+  return isHandoffStartPage(url) ? handoffDebugSource(store,sender,url) : null;
 }
 
 async function handoffDebugReport(message, sender) {
@@ -806,9 +837,9 @@ async function handoffDebugReport(message, sender) {
       }
     } catch { /* Export stored state even when current tab metadata is unavailable. */ }
   }
-  const relatedSources = new Set(!all && store && CQHandoff.projectId(url)
+  const relatedSources = new Set(!all && store && CQHandoff.scopeId(url)
     ? Object.values(store.conversations).filter(item => item.tabId === sender.tab?.id &&
-      CQHandoff.projectId(item.url) === CQHandoff.projectId(url) && item.handoff?.destinationKey &&
+      CQHandoff.scopeId(item.url) === CQHandoff.scopeId(url) && item.handoff?.destinationKey &&
       ["navigating","bootstrapping","failed"].includes(item.handoff.phase)).map(item => item.key) : []);
   const selected = data.runs.filter(run => all ||
     key && (run.sourceKey === key || run.destinationKey === key) || source && run.sourceKey === source.key ||
@@ -2163,16 +2194,16 @@ function tabOwnsConversationWork(store, state, tab) {
   // creates the destination draft. This does not transfer dispatch ownership.
   const handoff = state.handoff;
   if (handoff?.phase === "navigating" && chatKey(state.url) === state.key &&
-      CQHandoff.projectId(state.url) === CQHandoff.normalizeProjectId(handoff.projectId) &&
-      CQHandoff.projectId(handoff.projectUrl) === CQHandoff.normalizeProjectId(handoff.projectId) &&
-      CQHandoff.isProjectStart(url, handoff.projectId)) return true;
+      CQHandoff.scopeId(state.url) === CQHandoff.normalizeScopeId(handoff.projectId) &&
+      CQHandoff.scopeId(handoff.projectUrl) === CQHandoff.normalizeScopeId(handoff.projectId) &&
+      CQHandoff.isScopeStart(url, handoff.projectId)) return true;
   const destination = store.conversations[handoff?.destinationKey];
   if (handoff?.phase === "bootstrapping" && destination &&
       destination.tabId === tab.id && destination.handoffSourceKey === state.key &&
       destination.handoffToken === handoff.token &&
-      (CQHandoff.isProjectStart(url, handoff.projectId) ||
-       chatKey(url) === destination.key && CQHandoff.projectId(url) ===
-         CQHandoff.normalizeProjectId(handoff.projectId))) return true;
+      (CQHandoff.isScopeStart(url, handoff.projectId) ||
+       chatKey(url) === destination.key && CQHandoff.scopeId(url) ===
+         CQHandoff.normalizeScopeId(handoff.projectId))) return true;
   // The first native Send can publish /c/<id> before its user bubble mounts.
   // Only the already owned draft/token chain may bridge that hydration gap.
   const pending = pendingHandoffDraftForChat(store, {tab}, url);
@@ -2468,11 +2499,11 @@ function handoffAdoptionCandidate(store, sender, url, draftKey = `draft:${sender
   else if (!Number.isInteger(tabId) || draft.tabId !== tabId || source.tabId !== tabId ||
       safeUrl(sender.tab?.url) && safeUrl(sender.tab.url) !== url ||
       target && target.tabId !== tabId) result.reason = "owner_mismatch";
-  else if (!chatKey(url) || !CQHandoff.projectId(url) ||
-      CQHandoff.projectId(url) !== CQHandoff.normalizeProjectId(handoff.projectId) ||
-      CQHandoff.projectId(source.url) !== CQHandoff.projectId(url) ||
+  else if (!chatKey(url) || !CQHandoff.scopeId(url) ||
+      CQHandoff.scopeId(url) !== CQHandoff.normalizeScopeId(handoff.projectId) ||
+      CQHandoff.scopeId(source.url) !== CQHandoff.scopeId(url) ||
       !sameDraftScope(draft.url,url) ||
-      !CQHandoff.isProjectStart(draft.url,handoff.projectId) ||
+      !CQHandoff.isScopeStart(draft.url,handoff.projectId) ||
       target && !sameDraftScope(target.url,url)) result.reason = "project_mismatch";
   else if (handoff.phase !== "bootstrapping" || handoff.cancelRequested) result.reason = "source_phase";
   else if (!handoff.token || handoff.token !== draft.handoffToken) result.reason = "token_mismatch";
@@ -2494,7 +2525,7 @@ function handoffAdoptionCandidate(store, sender, url, draftKey = `draft:${sender
 function handoffAdoptionCandidates(store, sender, url) {
   const keys = new Set([`draft:${sender.tab?.id}`]);
   for (const source of Object.values(store.conversations)) {
-    if (source.tabId === sender.tab?.id && CQHandoff.projectId(source.url) === CQHandoff.projectId(url) &&
+    if (source.tabId === sender.tab?.id && CQHandoff.scopeId(source.url) === CQHandoff.scopeId(url) &&
         source.handoff?.destinationKey?.startsWith("draft:")) keys.add(source.handoff.destinationKey);
   }
   return [...keys].map(key => handoffAdoptionCandidate(store,sender,url,key));
@@ -2529,18 +2560,26 @@ function selectHandoffAdoption(store, sender, url, text, userCount, folded = fal
     matchCount:0,observation};
 }
 
-function pendingHandoffDraftForChat(store, sender, url) {
+function pendingHandoffDraftForChat(store, sender, url, observedUserText = null) {
   const nextKey = chatKey(url);
   const tabId = sender.tab?.id;
   if (!nextKey || !Number.isInteger(tabId)) return null;
   const draftKey = `draft:${tabId}`;
   const draft = store.conversations[draftKey];
   const active = draft?.tasks?.find((task) => task.id === draft.activeTaskId);
-  // The first project message can change the SPA route before its bubble
-  // mounts. Retain the owned draft until that exact message confirms adoption.
+  // A real first user bubble with different content is not merely a
+  // hydration delay. Never show/claim the personal homepage's pending task
+  // as belonging to that unrelated ordinary chat.
+  const personalFirstTurnMismatch = CQHandoff.scopeId(draft?.url) === CQHandoff.PERSONAL_SCOPE &&
+    typeof observedUserText === "string" && observedUserText.trim() &&
+    !sameMessage(active?.text, observedUserText);
+  // A first message from a project composer OR ordinary new-chat homepage
+  // can change the SPA route before its bubble mounts. Keep the owned draft
+  // until the exact first message confirms adoption; never adopt unrelated
+  // conversation history solely because the URL belongs to the same scope.
   if (!store.conversations[nextKey] && draft && !draft.handoffSourceKey && ownerMatches(draft, sender) && active &&
       ["dispatching","waiting"].includes(active.status) &&
-      isProjectOverview(draft.url) && draftCanAdoptChat(draft, url)) {
+      !personalFirstTurnMismatch && isHandoffStartPage(draft.url) && draftCanAdoptChat(draft, url)) {
     return {key:draftKey,state:draft,active};
   }
   const candidate = handoffAdoptionCandidate(store,sender,url);
@@ -2647,14 +2686,14 @@ function handoffQueueFor(store, source, destination = null) {
       entry.sourceKey !== source.key || source.key !== chatKey(source.url) ||
       entry.queueId !== handoff.queueId ||
       !entry.token || entry.token !== handoff.token ||
-      !entry.projectId || entry.projectId !== CQHandoff.projectId(source.url) ||
+      !entry.projectId || entry.projectId !== CQHandoff.scopeId(source.url) ||
       !Array.isArray(entry.schedules) || !entry.settings ||
       typeof entry.settings !== "object" || Array.isArray(entry.settings)) return null;
   if (destination && (destination.handoffCacheKey !== source.key ||
       destination.handoffSourceKey !== source.key ||
       destination.handoffQueueId !== entry.queueId || destination.handoffToken !== entry.token ||
       entry.destinationKey !== destination.key || handoff.destinationKey !== destination.key ||
-      entry.projectId !== CQHandoff.projectId(destination.url))) return null;
+      entry.projectId !== CQHandoff.scopeId(destination.url))) return null;
   return entry;
 }
 
@@ -2699,7 +2738,7 @@ function createHandoffQueue(store, source, now = Date.now()) {
   store.handoffQueues ||= {};
   store.handoffQueues[source.key] = {
     version:1,sourceKey:source.key,queueId:source.handoff.queueId,token:source.handoff.token,
-    projectId:CQHandoff.projectId(source.url),destinationKey:null,
+    projectId:CQHandoff.scopeId(source.url),destinationKey:null,
     createdAt:now,updatedAt:now,schedules:JSON.parse(JSON.stringify(source.schedules)),
     taskSnapshotVersion:1,tasks:handoffOrdinaryTasks(source),
     settings:handoffQueueSettings(source),
@@ -2757,7 +2796,7 @@ function maintainHandoffQueues(store) {
   // after a transient source-state problem.
   for (const source of Object.values(store.conversations)) {
     const handoff = source.handoff;
-    if (source.handoffSourceKey || !chatKey(source.url) || !CQHandoff.projectId(source.url) ||
+    if (source.handoffSourceKey || !chatKey(source.url) || !CQHandoff.scopeId(source.url) ||
         !["queued","due","summarizing","opening","navigating","bootstrapping","failed"].includes(handoff?.phase)) continue;
     if (!handoff.queueId && !store.handoffQueues[source.key]) {
       handoff.queueId = id();
@@ -2840,7 +2879,7 @@ function maybeRequestHandoff(store, state, now = Date.now()) {
   if (state.parkedDraft) return false;
   const handoff = state.handoff;
   if (!handoff || state.handoffSourceKey || !chatKey(state.url) ||
-      !CQHandoff.projectId(state.url)) return false;
+      !CQHandoff.scopeId(state.url)) return false;
   // Convert an older unsent due state into the same durable queue command.
   if (handoff.phase === "due") {
     return enqueueHandoff(store,state,handoff.manualRequested ? "manual" : "automatic",now);
@@ -3071,20 +3110,20 @@ function timeoutHandoff(state, now = Date.now()) {
 }
 
 function attachProjectHandoff(store, sender, url) {
-  const projectId = CQHandoff.projectId(url);
+  const projectId = CQHandoff.scopeId(url);
   const tabId = sender.tab?.id;
   if (!Number.isInteger(tabId) || !projectId ||
-      !CQHandoff.isProjectStart(url,projectId)) return false;
+      !CQHandoff.isScopeStart(url,projectId)) return false;
   const source = Object.values(store.conversations).find((session) =>
     session.tabId === tabId && session.handoff?.phase === "navigating" &&
-    CQHandoff.normalizeProjectId(session.handoff.projectId) === projectId &&
-    CQHandoff.projectId(session.url) === projectId &&
-    CQHandoff.projectId(session.handoff.projectUrl) === projectId);
+    CQHandoff.normalizeScopeId(session.handoff.projectId) === projectId &&
+    CQHandoff.scopeId(session.url) === projectId &&
+    CQHandoff.scopeId(session.handoff.projectUrl) === projectId);
   if (!source) return false;
   // An in-flight handoff started on an older version can still contain a
   // slugged project ID. Normalize it before creating the destination draft.
   source.handoff.projectId = projectId;
-  source.handoff.projectUrl = CQHandoff.projectStart(url);
+  source.handoff.projectUrl = CQHandoff.scopeStart(url);
   const draftKey = `draft:${tabId}`;
   const existing = store.conversations[draftKey];
   if (existing && (existing.tasks.length || existing.schedules.length ||
@@ -3115,7 +3154,7 @@ function activeProjectHandoffDraft(store, key, sender, url) {
   const source = store.conversations[draft?.handoffSourceKey];
   const handoff = source?.handoff;
   return Boolean(draft && source && handoff && draft.tabId === sender.tab?.id &&
-    CQHandoff.isProjectStart(url, handoff.projectId) &&
+    CQHandoff.isScopeStart(url, handoff.projectId) &&
     handoff.phase === "bootstrapping" && handoff.destinationKey === key &&
     handoff.token === draft.handoffToken && handoffQueueFor(store,source,draft) && draft.tasks.some((task) =>
       task.kind === "handoff_intro"));
@@ -3128,7 +3167,7 @@ function finishHandoffTransfer(store, destination, task, url) {
       handoff.phase !== "bootstrapping" ||
       handoff.token !== destination.handoffToken ||
       source.tabId !== destination.tabId ||
-      CQHandoff.normalizeProjectId(handoff.projectId) !== CQHandoff.projectId(url) ||
+      CQHandoff.normalizeScopeId(handoff.projectId) !== CQHandoff.scopeId(url) ||
       handoff.destinationKey !== destination.key ||
       destination.tasks.length !== 1 || destination.tasks[0].id !== task.id) {
     throw new Error("无法验证同项目对话接力关系，旧队列保持不变");
@@ -4022,8 +4061,8 @@ async function handle(message, sender) {
     draftScopeChanged = true;
   }
   let projectHandoffAttached = false;
-  if (isProjectOverview(url)) {
-    // Ordinary project starts use the same owned draft queue as a new chat.
+  if (isHandoffStartPage(url)) {
+    // The native personal or project new-chat page owns the receiving draft.
     // An internal handoff must keep its isolated introduction-only gate.
     projectHandoffAttached = message.type === "HELLO" &&
       attachProjectHandoff(store, sender, url);
@@ -4033,7 +4072,7 @@ async function handle(message, sender) {
           "REPLY_COMPLETED","STOPPED","USER_RESUMED",
           "RECOVER_ON_VOICE","CANCEL_HANDOFF","DELETE_TASK","SKIP_FAILED","ACK_RECOVERY",
           "RETRY_UNSENT_HANDOFF"].includes(message.type)) {
-      throw new Error("项目主页仅允许正在进行的内部上下文接力");
+      throw new Error("新对话入口仅允许正在进行的内部上下文接力");
     }
   }
   const confirmingHandoff = message.type === "CONFIRM_HANDOFF";
@@ -4056,7 +4095,7 @@ async function handle(message, sender) {
   // A recovery probe is not a reservation or permission to bind an unrelated
   // ordinary chat to a pending draft merely because the project matches.
   const pendingNewChat = !confirmingHandoff && !adopted &&
-    pendingHandoffDraftForChat(store,sender,url);
+    pendingHandoffDraftForChat(store,sender,url,message.lastUserText);
   const effectiveKey = pendingNewChat?.key || key;
   let changed = adopted || destinationNoted ||
     projectHandoffAttached || draftScopeChanged;
@@ -4107,7 +4146,7 @@ async function handle(message, sender) {
         source.handoff?.phase === "bootstrapping" && !source.handoff.cancelRequested &&
         !state.halted && !state.queuePaused && source.handoff.token &&
         source.handoff.token === state.handoffToken && source.handoff.destinationKey === state.key &&
-        CQHandoff.projectId(source.url) === CQHandoff.projectId(url) &&
+        CQHandoff.scopeId(source.url) === CQHandoff.scopeId(url) &&
         CQHandoff.textMatch(intro.text,message.lastUserText).matches);
       break;
     }
@@ -4323,8 +4362,8 @@ async function handle(message, sender) {
       if (typeof message.enabled !== "boolean") throw new Error("接力开关参数无效");
       const minutes = CQHandoff.requireMinutes(message.intervalMinutes);
       const repeatCount = CQHandoff.requireRepeatCount(message.repeatCount ?? -1);
-      if (message.enabled && (!chatKey(url) || !CQHandoff.projectId(url))) {
-        throw new Error("仅支持 ChatGPT 原生项目内的已建立对话；请先在项目内打开一个聊天");
+      if (message.enabled && (!chatKey(url) || !CQHandoff.scopeId(url))) {
+        throw new Error("请在已建立的普通聊天或项目聊天中开启自动交接");
       }
       const handoff = handoffState(state);
       if (!["idle","queued","completed"].includes(handoff.phase)) {
@@ -4354,8 +4393,8 @@ async function handle(message, sender) {
 
     case "HANDOFF_NOW": {
       if (!targetMatches(state, sender, url) || !chatKey(url) ||
-          !CQHandoff.projectId(url)) {
-        throw new Error("只能在 ChatGPT 原生项目里的已建立对话中添加交接命令");
+          !CQHandoff.scopeId(url)) {
+        throw new Error("只能在已建立的普通聊天或项目聊天中添加交接命令");
       }
       if (state.handoffSourceKey) throw new Error("新对话正在接收交接，不能重复创建接力");
       const handoff = handoffState(state);
@@ -4383,7 +4422,7 @@ async function handle(message, sender) {
       const task = state.tasks.find(item => item.id === message.id);
       const cache = handoffQueueFor(store,source,state);
       const liveTab = await chrome.tabs.get(tabId);
-      if (!targetMatches(state,sender,url) || !isProjectOverview(url) ||
+      if (!targetMatches(state,sender,url) || !isHandoffStartPage(url) ||
           safeUrl(liveTab.url) !== url || liveTab.discarded === true ||
           message.userRequested !== true || message.nativeBusy !== false || message.userCount !== 0 ||
           state.queuePaused || state.haltReason === "user" || state.activeTaskId || state.steeringTaskId ||
@@ -4417,9 +4456,9 @@ async function handle(message, sender) {
         throw new Error("交接导航尚未准备好");
       }
       const handoff = state.handoff;
-      const projectId = CQHandoff.projectId(url);
-      if (!projectId || projectId !== CQHandoff.normalizeProjectId(handoff.projectId) ||
-          projectId !== CQHandoff.projectId(handoff.projectUrl)) {
+      const projectId = CQHandoff.scopeId(url);
+      if (!projectId || projectId !== CQHandoff.normalizeScopeId(handoff.projectId) ||
+          projectId !== CQHandoff.scopeId(handoff.projectUrl)) {
         throw new Error("无法确认当前项目，已停止自动切换");
       }
       if (Number.isInteger(handoff.sourceUserCount) &&
@@ -4431,7 +4470,7 @@ async function handle(message, sender) {
       // ChatGPT uses a canonical /project link even if the current /c/ URL
       // includes a human-readable slug; repair old staged handoffs as well.
       handoff.projectId = projectId;
-      handoff.projectUrl = CQHandoff.projectStart(url);
+      handoff.projectUrl = CQHandoff.scopeStart(url);
       if (!handoffQueueFor(store,state)) throw new Error("本轮接力缓存缺失或不匹配，已停止导航");
       checkpointHandoffQueue(store,state,false);
       handoff.phase = "navigating";
@@ -4547,6 +4586,8 @@ async function handle(message, sender) {
       // Stable local-bridge id enables uncertain-reply reconciliation.
       if (message.remoteJobId) {
         task.remoteJobId = requestId;
+        if (message.remoteCaptureResult===true) task.remoteCaptureResult = true;
+        if (message.remoteNewChat===true) task.remoteNewChat = true;
       }
       state.tasks.push(task);
       markSubmission(state, requestId, fingerprint);
@@ -5002,14 +5043,14 @@ async function handle(message, sender) {
         } else if (valid && task.kind === "handoff_intro") {
           const source = store.conversations[state.handoffSourceKey];
           const handoff = source?.handoff;
-          const projectId = CQHandoff.normalizeProjectId(handoff?.projectId);
+          const projectId = CQHandoff.normalizeScopeId(handoff?.projectId);
           valid = Boolean(source && source.tabId === state.tabId &&
             typeof handoff?.token === "string" && handoff.token &&
             handoff.token === state.handoffToken && handoff.destinationKey === state.key &&
             handoff.phase === "bootstrapping" && projectId &&
-            CQHandoff.projectId(source.url) === projectId &&
-            CQHandoff.projectId(state.url) === projectId &&
-            CQHandoff.projectId(url) === projectId);
+            CQHandoff.scopeId(source.url) === projectId &&
+            CQHandoff.scopeId(state.url) === projectId &&
+            CQHandoff.scopeId(url) === projectId);
         }
         if (!valid) {
           dispatchBlockedReason = "resume_handoff_mismatch";
@@ -5116,20 +5157,20 @@ async function handle(message, sender) {
       }
       if (task.kind === "handoff_summary") {
         if (state.handoff?.phase !== "summarizing" || state.handoff.cancelRequested ||
-            !chatKey(url) || !CQHandoff.projectId(url) || !handoffQueueFor(store,state) ||
+            !chatKey(url) || !CQHandoff.scopeId(url) || !handoffQueueFor(store,state) ||
             task.handoffQueueId !== state.handoff.queueId) {
           throw new Error("交接总结已取消或状态失效，拒绝发送");
         }
       } else {
         const source = store.conversations[state.handoffSourceKey];
         const handoff = source?.handoff;
-        const projectId = CQHandoff.normalizeProjectId(handoff?.projectId);
+        const projectId = CQHandoff.normalizeScopeId(handoff?.projectId);
         if (!source || source.tabId !== tabId || !handoff?.token ||
             handoff.token !== state.handoffToken || handoff.destinationKey !== state.key ||
             handoff.phase !== "bootstrapping" || handoff.cancelRequested || !projectId ||
             !handoffQueueFor(store,source,state) || task.handoffQueueId !== handoff.queueId ||
-            CQHandoff.projectId(source.url) !== projectId ||
-            CQHandoff.projectId(state.url) !== projectId || CQHandoff.projectId(url) !== projectId) {
+            CQHandoff.scopeId(source.url) !== projectId ||
+            CQHandoff.scopeId(state.url) !== projectId || CQHandoff.scopeId(url) !== projectId) {
           throw new Error("接收交接关系已失效或已取消，拒绝发送");
         }
       }
@@ -5271,8 +5312,8 @@ async function handle(message, sender) {
           if (!handoffQueueFor(store,state)) throw new Error("本轮接力缓存缺失或不匹配，旧队列已保留");
           handoff.sourceUserCount = Number.isInteger(message.userCount)
             ? message.userCount : null;
-          handoff.projectId = CQHandoff.projectId(url);
-          handoff.projectUrl = CQHandoff.projectStart(url);
+          handoff.projectId = CQHandoff.scopeId(url);
+          handoff.projectUrl = CQHandoff.scopeStart(url);
           if (!handoff.projectId) throw new Error("无法确认原生项目归属");
           handoff.phase = "opening";
           handoff.changedAt = Date.now();
@@ -5293,6 +5334,25 @@ async function handle(message, sender) {
         state.lastQueueSettledAt = Date.now();
         changed = true;
         break;
+      }
+      if (typeof task.remoteJobId === "string" && task.remoteCaptureResult===true) {
+        const result = message.remoteResult;
+        const newerId = Boolean(task.baselineAssistantId && result?.assistantId &&
+          task.baselineAssistantId !== result.assistantId);
+        const newerCount = Number.isInteger(task.baselineAssistantCount) &&
+          Number.isInteger(result?.assistantCount) && result.assistantCount > task.baselineAssistantCount;
+        const belongs = result?.completionStatus === "completed" &&
+          Number.isInteger(task.baselineUserCount) && result.userCount === task.baselineUserCount + 1 &&
+          (result.mirrorIgnored!==true || task.remoteNewChat===true &&
+            task.baselineUserCount===0 && result.rawUserCount===2 && result.userCount===1) &&
+          sameMessage(task.text,result.lastUserText) && (newerId || newerCount) &&
+          typeof result.replyText === "string" && result.replyText.trim() && result.replyText.length <= 20000;
+        persistRemoteOutcome(store,task,url,{
+          completionStatus:belongs?"completed":"result_unavailable",
+          ...(belongs?{replyText:result.replyText,
+            ...(result.replyTruncated===true?{replyTruncated:true}:{})}:
+            {resultDiagnostic:safeRemoteDiagnostic(result?.resultDiagnostic) ||
+              {reason:"background_rejected"}})});
       }
       // Remove exactly this task and release the lock; the source keeps all
       // pending work until the destination introduction is confirmed.
@@ -5320,6 +5380,7 @@ async function handle(message, sender) {
         if (task.status === "waiting") state.lastQueueSettledAt = Date.now();
         task.status = "interrupted"; // Never resend an interrupted message.
         task.error = "已停止生成，未确认完成；此任务不会自动重发。";
+        persistRemoteOutcome(store,task,url,{completionStatus:"result_unavailable",resultError:task.error});
         state.activeTaskId = null;
       }
       const steering = state.tasks.find((item) => item.id === state.steeringTaskId);
@@ -5425,6 +5486,8 @@ async function handle(message, sender) {
       const wasWaiting = task.status === "waiting";
       task.status = "error";
       task.error = String(message.error || "发送失败，可能已经发送，请人工确认").slice(0, 240);
+      persistRemoteOutcome(store,task,failed.url || url,
+        {completionStatus:"result_unavailable",resultError:task.error});
       failed.activeTaskId = null;
       failed.halted = true;
       failed.haltReason = "failure";
@@ -5688,7 +5751,10 @@ async function onScheduleTick() {
       const scheduled = dueSchedules(state, Date.now(), queueLimit(store));
       if (scheduled) checkpointScheduledHandoffQueue(store,state);
       const inconsistent = checkInFlightIntegrity(state);
+      const activeBeforeTimeout = state.tasks.find(task=>task.id===state.activeTaskId);
       const timedOut = checkTimeout(state);
+      if(timedOut && activeBeforeTimeout) persistRemoteOutcome(store,activeBeforeTimeout,state.url,
+        {completionStatus:"result_unavailable",resultError:activeBeforeTimeout.error});
       const steerTimedOut = checkSteerTimeout(state);
       if (steerTimedOut) checkpointHandoffTasks(store,state);
       const handoffDue = maybeRequestHandoff(store,state);

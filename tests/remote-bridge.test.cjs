@@ -102,6 +102,18 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
     id:newJobId,status:"created",tabId:20,chatUrl:chatUrl,
   },"extension",extensionOrigin)).data.job.status,"created");
   assert.equal((await call("GET","/v1/jobs/"+newJobId)).data.job.chatUrl,chatUrl);
+  const personal=await call("POST","/v1/jobs",{
+    action:"new_chat",target:{kind:"personal",id:"personal",url:"https://chatgpt.com/"},
+    text:"普通聊天新任务",
+  });
+  assert.equal(personal.code,201);
+  assert.equal(personal.data.job.target.kind,"personal");
+  assert.equal((await call("GET","/v1/extension/poll",undefined,"extension",
+    extensionOrigin)).data.job.id,personal.data.job.id);
+  assert.equal((await call("POST","/v1/extension/report",{
+    id:personal.data.job.id,status:"created",tabId:21,
+    chatUrl:"https://chatgpt.com/c/personal-first",
+  },"extension",extensionOrigin)).data.job.status,"created");
   const unclaimed=await call("POST","/v1/jobs",{
     action:"continue",target:{kind:"chat",id:"chat-123"},text:"cancel stress",
   });
@@ -154,6 +166,15 @@ test("本机桥接请求：身份、目标别名、任务入队、结果回执",
 });
 
 test("输入校验和租约重试：类型、长度、终态不会重复领取",()=>{
+  assert.equal(bridge.validateJob({action:"new_chat",target:{
+    kind:"personal",id:"personal",url:"https://chatgpt.com/",
+  },text:"ordinary"}).target.kind,"personal");
+  assert.throws(()=>bridge.validateJob({action:"new_chat",target:{
+    kind:"personal",id:"personal",url:projectUrl,
+  },text:"wrong scope"}),/首页/);
+  assert.throws(()=>bridge.validateJob({action:"new_chat",target:{
+    kind:"personal",id:"not-personal",url:"https://chatgpt.com/",
+  },text:"wrong id"}),/personal/);
   assert.equal(bridge.validateJob({action:"continue",mode:"queue",channel:"team",
     target:{kind:"chat",name:"A"},text:"team"}).channel,"team");
   assert.equal(bridge.validateJob({action:"new_chat",channel:"team_spawn",

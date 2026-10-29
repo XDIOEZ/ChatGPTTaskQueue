@@ -52,8 +52,20 @@ globalThis.CQRemoteDispatch = (() => {
 
   function pickTarget(job,list) {
     const target=job.target;
-    if(!target || !["chat","project"].includes(target.kind))
+    if(!target || !["chat","project","personal"].includes(target.kind))
       throw new Error("远程目标类型无效");
+    // The ordinary new-chat homepage is a built-in destination. It requires
+    // no project binding and can only resolve to the official site root.
+    if(target.kind==="personal") {
+      const url=target.url || "https://chatgpt.com/";
+      const normal=safeUrl(url);
+      if(target.id && target.id!=="personal" || !normal ||
+          new URL(normal).pathname!=="/" ||
+          new URL(url).pathname!=="/" || new URL(url).search)
+        throw new Error("普通新对话目标必须是 ChatGPT 首页");
+      return {kind:"personal",id:"personal",url:normal,
+        name:target.name||"普通聊天"};
+    }
     const reference=target.url || target.id || target.name;
     if(typeof reference!=="string" || !reference.trim())
       throw new Error("未指定对话或项目");
@@ -148,6 +160,7 @@ globalThis.CQRemoteDispatch = (() => {
   function sameScope(tab,target) {
     if (!safeUrl(tab?.url)) return false;
     if (target.kind==="chat") return chatKey(tab.url)?.slice(5)===target.id;
+    if (target.kind==="personal") return CQHandoff.scopeId(tab.url)==="personal";
     return CQHandoff.projectId(tab.url)===target.id;
   }
 
@@ -189,12 +202,18 @@ globalThis.CQRemoteDispatch = (() => {
         ...(job.runId?[job.runId]:[])])];
       entries[key]={tabId:tab.id,kind:current?.kind||kind,
         jobId:current?.jobId||job.id,
-        chatId:current?.chatId|| (kind!=="team_spawn"
-          ? job.target?.id||chatKey(tab.url)?.slice(5) : null),
+        chatId:current?.chatId|| (job.action==="new_chat"
+          ? chatKey(tab.url)?.slice(5)||null
+          : job.target?.id||chatKey(tab.url)?.slice(5)||null),
         projectId:current?.projectId||
           (job.action==="new_chat"
             ? CQHandoff.normalizeProjectId(job.target?.id)
             : CQHandoff.projectId(tab.url))||null,
+        // Before a first message creates the chat ID, keep the intended
+        // new-chat scope. Native / -> /c/<id> navigation is not a user visit.
+        // Activation still marks the tab visited, so it cannot be auto-closed.
+        newChatScope:current?.newChatScope||
+          (job.action==="new_chat" ? CQHandoff.scopeId(job.target?.url) : null),
         taskId:current?.taskId||null,
         finished:current?.finished===true,
         visited:current?.visited===true,runIds,
@@ -262,7 +281,8 @@ globalThis.CQRemoteDispatch = (() => {
       }
       if(!tab || tab.active || tab.pinned || tab.audible || tab.discarded ||
           tab.status!=="complete" ||
-          chatKey(tab.url)!=="chat:"+chatId) {
+          chatKey(tab.url)!=="chat:"+chatId ||
+          entry.newChatScope && CQHandoff.scopeId(tab.url)!==entry.newChatScope) {
         reason="标签正在被用户使用、加载或目标已发生变化";
         continue;
       }
@@ -291,7 +311,8 @@ globalThis.CQRemoteDispatch = (() => {
       }
       const newest=await withTabResponseDeadline(chrome.tabs.get(tab.id));
       if(newest.active || newest.pinned || newest.audible ||
-          chatKey(newest.url)!=="chat:"+chatId) {
+          chatKey(newest.url)!=="chat:"+chatId ||
+          entry.newChatScope && CQHandoff.scopeId(newest.url)!==entry.newChatScope) {
         reason="用户已切换到该标签";continue;
       }
       if(!Number.isInteger(newest.windowId)) {
@@ -349,6 +370,28 @@ globalThis.CQRemoteDispatch = (() => {
     await api("/releases/report",{id:request.id,results});
   }
 
+  async function flushRemoteResults() {
+    const initial=await readStore();
+    const pending=Array.isArray(initial.remoteResults)?initial.remoteResults:[];
+    let firstError=null;
+    for(const item of pending) {
+      // The queue result is already durable before this request. Retrying
+      // the same id is safe, even if the previous HTTP response was lost.
+      try {
+        await api("/results/report",item);
+        await exclusive(async()=>{
+          const latest=await readStore();
+          if(!Array.isArray(latest.remoteResults)) return;
+          const index=latest.remoteResults.findIndex(x=>x.id===item.id && x.taskId===item.taskId);
+          if(index<0) return;
+          latest.remoteResults.splice(index,1);
+          await saveStore(latest);
+        });
+      } catch(error) {firstError ||= error;}
+    }
+    if(firstError) throw firstError;
+  }
+
   async function onTaskFinished(tabId,taskId) {
     if(!Number.isInteger(tabId) || typeof taskId!=="string") return;
     await editOwnedTabs(entries=>{
@@ -356,6 +399,8 @@ globalThis.CQRemoteDispatch = (() => {
       if(!entry || entry.kind!=="job" || entry.taskId!==taskId) return false;
       entry.finished=true;
     });
+    try {await flushRemoteResults();}
+    catch(error) {console.warn("[ChatQueue] 远程结果稍后重试",error);}
     await releaseFinishedJobs();
   }
 
@@ -367,7 +412,10 @@ globalThis.CQRemoteDispatch = (() => {
     if(!safeUrl(url)) return noteTabVisited(tabId);
     const entries=await ownedTabs(),entry=entries[String(tabId)];
     if(!entry) return;
-    if(entry.chatId && chatKey(url)==="chat:"+entry.chatId) return;
+    if(entry.chatId && chatKey(url)==="chat:"+entry.chatId &&
+        (!entry.newChatScope || CQHandoff.scopeId(url)===entry.newChatScope)) return;
+    if(!entry.chatId && entry.newChatScope &&
+        CQHandoff.scopeId(url)===entry.newChatScope) return;
     if(!entry.chatId && entry.projectId &&
         CQHandoff.projectId(url)===entry.projectId) return;
     await noteTabVisited(tabId);
@@ -508,7 +556,7 @@ globalThis.CQRemoteDispatch = (() => {
       tabId:tab.id,error:"等待 ChatGPT 标签页加载"};
     const response=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
       type:"CQ_REMOTE_EXECUTE",id:job.id,action:job.action,
-      text:job.text,mode:job.mode,targetUrl:tab.url,
+      text:job.text,mode:job.mode,targetUrl:tab.url,captureResult:job.captureResult===true,
     }));
     if (!response || !response.ok)
       throw new Error(response?.error||"扩展页面尚未初始化");
@@ -517,12 +565,16 @@ globalThis.CQRemoteDispatch = (() => {
 
   async function inspectCreatedChat(job,target,tab) {
     const url=safeUrl(tab?.url);
-    if(!url || !chatKey(url) || CQHandoff.projectId(url)!==target.id)
+    if(!url || !chatKey(url) || !sameScope(tab,target))
       return {status:"waiting",tabId:tab.id,error:"首条消息尚未建立新对话"};
+    let confirmationDiagnostic = null;
     try {
       const result=await withTabResponseDeadline(chrome.tabs.sendMessage(tab.id,{
         type:"CQ_REMOTE_INSPECT",id:job.id,text:job.text,targetUrl:tab.url,
+        captureDiagnostics:job.captureResult===true,
       }));
+      if(result?.ok && result.confirmationDiagnostic)
+        confirmationDiagnostic=result.confirmationDiagnostic;
       if(result?.ok && result.observed === true) {
         await noteOwnedTask(tab.id,job,job.taskId,url);
         if(job.channel==="team_spawn") {
@@ -532,10 +584,12 @@ globalThis.CQRemoteDispatch = (() => {
           try {await rememberTeamChannel(chatKey(url).slice(5),tab.id);}
           catch(error) {console.warn("[ChatQueue] 团队通道绑定稍后恢复",error);}
         }
-        return {status:"created",chatUrl:url,tabId:tab.id,taskId:job.taskId};
+        return {status:"created",chatUrl:url,tabId:tab.id,taskId:job.taskId,
+          ...(confirmationDiagnostic?{confirmationDiagnostic}:{})};
       }
     } catch { /* ChatGPT may still be hydrating the new route. */ }
-    return {status:"waiting",tabId:tab.id,error:"等待确认新对话首条消息"};
+    return {status:"waiting",tabId:tab.id,error:"等待确认新对话首条消息",
+      ...(confirmationDiagnostic?{confirmationDiagnostic}:{})};
   }
 
   async function inspectSteeredChat(job,tab) {
@@ -561,7 +615,7 @@ globalThis.CQRemoteDispatch = (() => {
         !["continue","new_chat"].includes(job.action)) throw new Error("无效的远程任务");
     const target=pickTarget(job,targets);
     if(job.action==="continue" && target.kind!=="chat" ||
-        job.action==="new_chat" && target.kind!=="project")
+        job.action==="new_chat" && !["project","personal"].includes(target.kind))
       throw new Error("目标类型与任务不匹配");
 
     const store=await withTabResponseDeadline(readStore());
@@ -623,6 +677,8 @@ globalThis.CQRemoteDispatch = (() => {
     try {
       try {await refreshTargets();}
       catch {return;} // Bridge not running / extension hasn't connected.
+      try {await flushRemoteResults();}
+      catch(error) {console.warn("[ChatQueue] 远程结果稍后重试",error);}
       try {await releaseFinishedJobs();}
       catch(error) {console.warn("[ChatQueue] 后台标签自动释放暂时延迟",error);}
       try {
@@ -646,7 +702,7 @@ globalThis.CQRemoteDispatch = (() => {
     } finally { running=false; }
   }
 
-  return {ALARM,tick,listTargets,pickTarget,findOrOpen,executeJob,
+  return {ALARM,tick,listTargets,pickTarget,findOrOpen,executeJob,flushRemoteResults,
     onTaskFinished,onTabActivated,onTabNavigated,onTabRemoved,
     releaseOwnedChat,releaseFinishedJobs};
 })();

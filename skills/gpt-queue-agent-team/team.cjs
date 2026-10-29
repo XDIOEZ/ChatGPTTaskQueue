@@ -21,6 +21,9 @@ const TEAM_ROOT = process.env.CQ_TEAM_DATA_DIR ||
     "ChatGPTTaskQueue","team-skill");
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(),".codex");
 const REGISTRATION = path.join(CODEX_HOME,"skills",SKILL);
+const GLOBAL_AGENTS = path.join(CODEX_HOME,"AGENTS.md");
+const AUTO_BEGIN = "<!-- GPT_QUEUE_AUTO_TEAM_BEGIN -->";
+const AUTO_END = "<!-- GPT_QUEUE_AUTO_TEAM_END -->";
 const PORT = Number(process.env.CQ_BRIDGE_PORT) || 43578;
 const MAX_AGE_MS = 120000;
 const VALID_RUN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{2,63}$/;
@@ -46,7 +49,7 @@ function options(argv) {
   for(let i=0;i<argv.length;i++) {
     const part=argv[i];
     if(!part.startsWith("--")) reject("未知参数 "+part);
-    if(["--json","--urgent","--verified"].includes(part)) {
+    if(["--json","--urgent","--verified","--auto","--personal"].includes(part)) {
       parsed[part.slice(2)]=true;continue;
     }
     if(i+1>=argv.length || argv[i+1].startsWith("--")) reject("缺少参数 "+part+" 的值");
@@ -81,6 +84,12 @@ function projectIdFromUrl(url) {
   return new URL(url).pathname.match(/^\/g\/(g-p-[a-zA-Z0-9-]+)/)?.[1]
     .match(/^(g-p-[a-f0-9]{32})(?:-[a-z0-9-]+)?$/i)?.[1] ||
     new URL(url).pathname.match(/^\/g\/(g-p-[a-zA-Z0-9-]+)/)?.[1] || null;
+}
+// A team belongs to exactly one native ChatGPT scope. Ordinary and project
+// conversations are never interchangeable, even when using the same tab.
+function conversationScope(url) {
+  const chat=fixedChatUrl(url);
+  return projectIdFromUrl(chat)||"personal";
 }
 function safeReadJson(file) {return JSON.parse(fs.readFileSync(file,"utf8"));}
 function statePath(id) {return path.join(TEAM_ROOT,"runs",runId(id)+".json");}
@@ -220,6 +229,53 @@ function uninstall() {
   fs.rmdirSync(REGISTRATION);
   return {ok:true,uninstalled:true,sourcePreserved:SKILL_ROOT};
 }
+
+function autoRoutingInstructions() {
+  const executable=path.join(SKILL_ROOT,"team.cjs");
+  return [
+    AUTO_BEGIN,
+    "## ChatGPT 队列：长任务自动协作（用户已启用）",
+    "收到需要实际执行的任务后，先判断是否有至少两项真正独立、可并行的工作，且多对话的收益显著高于通信成本。短任务、纯问答、明确要求单人处理的任务不要拆分。",
+    "对于值得拆分的任务，主动尝试通过 PCC 或 HomePC2 执行以下命令检查插件：",
+    "`node \""+executable+"\" doctor`",
+    "只有 doctor.ok === true，且已获知本轮主 ChatGPT 对话的真实 URL 时，才允许启动队列协作。没有真实主对话地址、工具不可用、扩展离线或权限不足，直接单智能体完成，不得伪称已创建子智能体。",
+    "先阅读 `"+path.join(SKILL_ROOT,"SKILL.md")+"`，再用 `node \""+executable+"\" init --auto --run <唯一运行ID> --lead-chat <当前真实聊天URL> [--repo <Git仓库目录>]` 注册团队。`--auto` 会根据主对话 URL 在普通聊天或原生项目内建立成员，不得跨范围。",
+    "优先只创建 2～4 个互不争用同一文件或同一职责的成员，使用 spawn、sync、send、ack 和 status 协作；主智能体负责拆解、整合、评审和交付。队列里的 queued 不是对端已收到/执行的证明。",
+    "多轮交流和可靠接收按 Skill 规则执行；对于未知发送结果不得自动重新开页或重复发送。任务完成且所有回执/验证条件满足后才可 finish；不要释放用户手动打开的标签。",
+    AUTO_END,
+  ].join("\n");
+}
+
+// Only maintain the delimited portion of the existing global AGENTS.md.
+// The user's other instructions must remain intact even on repeated installs.
+function configureAutoRouting(enabled) {
+  fs.mkdirSync(CODEX_HOME,{recursive:true});
+  if(fs.existsSync(GLOBAL_AGENTS) && fs.lstatSync(GLOBAL_AGENTS).isSymbolicLink())
+    reject("全局 AGENTS.md 是符号链接；为避免修改未知文件，已停止自动配置");
+  const before=fs.existsSync(GLOBAL_AGENTS)?fs.readFileSync(GLOBAL_AGENTS,"utf8"):"";
+  const start=before.indexOf(AUTO_BEGIN),end=before.indexOf(AUTO_END);
+  if((start<0)!==(end<0) || start>=0 &&
+      (end<start || before.indexOf(AUTO_BEGIN,start+AUTO_BEGIN.length)>=0 ||
+       before.indexOf(AUTO_END,end+AUTO_END.length)>=0))
+    reject("全局 AGENTS.md 的队列管理段标记不完整或重复；拒绝覆盖其他规则");
+  const existing=start>=0;
+  const beginning=existing?before.slice(0,start):before;
+  const ending=existing?before.slice(end+AUTO_END.length):"";
+  const separator=!existing && beginning ? beginning.endsWith("\n")?"\n":"\n\n" : "";
+  const after=enabled ? existing
+    ? beginning+autoRoutingInstructions()+ending
+    : beginning+separator+autoRoutingInstructions()+"\n"
+    : existing ? beginning+ending : beginning;
+  if(after===before) return {ok:true,enabled,alreadyConfigured:true,path:GLOBAL_AGENTS};
+  // Atomic replacement, preserving unrelated instructions and permissions.
+  const temporary=GLOBAL_AGENTS+"."+process.pid+"."+crypto.randomBytes(4).toString("hex")+".tmp";
+  const mode=fs.existsSync(GLOBAL_AGENTS)?fs.statSync(GLOBAL_AGENTS).mode:0o600;
+  try {
+    fs.writeFileSync(temporary,after,{mode});
+    fs.renameSync(temporary,GLOBAL_AGENTS);
+  }finally {if(fs.existsSync(temporary)) fs.unlinkSync(temporary);}
+  return {ok:true,enabled,path:GLOBAL_AGENTS,changed:true};
+}
 function projectFromTargets(name,targets) {
   const lookup=required(name,"项目名称或 URL").toLowerCase();
   const unique=new Map((targets||[]).filter(item=>item.kind==="project" &&
@@ -229,7 +285,7 @@ function projectFromTargets(name,targets) {
     "找不到指定项目，请先在插件桥接器绑定项目名称");
   const project=[...unique.values()][0];
   checkProjectUrl(project.url);
-  return {id:project.id,url:project.url,name:project.name};
+  return {kind:"project",id:project.id,url:project.url,name:project.name};
 }
 function gitRoot(repo) {
   const folder=path.resolve(required(repo,"Git 仓库路径"));
@@ -240,10 +296,27 @@ function gitRoot(repo) {
 }
 async function initialize(opts) {
   await requireOnline();
-  const id=runId(opts.run),repo=gitRoot(opts.repo),lead=memberId(opts.lead||"lead");
-  const targets=(await api("GET","/v1/targets")).targets;
-  const project=projectFromTargets(opts.project,targets);
+  const id=runId(opts.run),repo=opts.repo?gitRoot(opts.repo):null,
+    lead=memberId(opts.lead||"lead");
   const leadChat=opts["lead-chat"]?fixedChatUrl(opts["lead-chat"]):null;
+  if(opts.auto && (opts.personal || opts.project))
+    reject("--auto 会根据主对话自动识别范围，不可同时指定 --project 或 --personal");
+  if(opts.personal && opts.project) reject("普通聊天和项目聊天不能同时选择");
+  if(opts.auto && !leadChat) reject("自动选择作用域时必须提供主智能体真实对话 URL");
+  let project;
+  if(opts.personal || opts.auto && leadChat && conversationScope(leadChat)==="personal") {
+    const origin=leadChat?new URL(leadChat).origin:"https://chatgpt.com";
+    project={kind:"personal",id:"personal",url:origin+"/",name:"普通聊天"};
+  }else if(opts.auto && leadChat) {
+    const projectId=conversationScope(leadChat);
+    const origin=new URL(leadChat).origin;
+    project={kind:"project",id:projectId,url:origin+"/g/"+projectId+"/project",name:projectId};
+  }else {
+    const targets=(await api("GET","/v1/targets")).targets;
+    project=projectFromTargets(opts.project,targets);
+  }
+  if(leadChat && conversationScope(leadChat)!==project.id)
+    reject("主对话不属于所选范围，拒绝跨项目或普通聊天组队");
   return locked(id,async(current)=>{
     if(current) reject("协作运行已经存在；不能覆盖已有成员和消息");
     const state={version:1,id,repo,project,lead,createdAt:Date.now(),
@@ -270,7 +343,7 @@ function workerIntro(run,member,role,task) {
   return [
     "[GPT Queue Agent Team | 子智能体独立任务]",
     "运行标识："+run.id+"；成员："+member+"；角色："+role,
-    "Git 仓库："+run.repo,
+    run.repo?"Git 仓库："+run.repo:"非 Git 协作：只处理分配的资料/任务，不修改他人的代码",
     "团队项目："+run.project.name,
     "主智能体："+run.lead,
     "任务："+task,
@@ -279,7 +352,7 @@ function workerIntro(run,member,role,task) {
     "1. 先用 HomePC2 执行 node \""+executable+"\" doctor；未通过立即停止本协作。",
     "2. 执行 node \""+executable+"\" sync --run "+run.id+" 注册新对话；通过队列 send 给主智能体报告 PLAN。",
     "3. 每当发现根因、接口变化、阻塞、审查反馈，主动 send 给受影响的团队成员；对收到的消息用 ack --message <消息ID> 表明已知晓，并说明下一步。",
-    "4. 仅操作自己授权的 Git 工作树/文件，跨模块契约先交换并确认；完成代码后提供 commit SHA、测试证据、CodeReviewFix 状态。",
+    "4. 仅操作自己授权的工作树/文件，跨模块契约先交换并确认；有 Git 仓库时提供 commit SHA、测试证据、CodeReviewFix 状态；研究任务提供事实来源和结论。",
     "   未被分配独立 worktree 和文件所有权时，只能调查与沟通，不得和其他成员同时直接修改主工作区。",
     "5. 不能把 queued 当作其他成员已经读懂；不能绕过插件通信门槛，不向未知对话发送；不要等待全部调查才开始独立任务。",
   ].join("\n");
@@ -305,7 +378,7 @@ async function spawn(opts) {
   });
   try {
     const result=await api("POST","/v1/jobs",{
-      action:"new_chat",mode:"queue",channel:"team_spawn",runId:id,target:{kind:"project",
+      action:"new_chat",mode:"queue",channel:"team_spawn",runId:id,target:{kind:run.project.kind||"project",
         id:run.project.id,url:run.project.url},text:intro,
     });
     await locked(id,async(state)=>{
@@ -464,8 +537,8 @@ async function sync(opts) {
         member.spawnStatus=item.result.status;
         if(item.result.status==="created" && item.result.chatUrl) {
           const chat=fixedChatUrl(item.result.chatUrl);
-          if(projectIdFromUrl(chat)!==latest.project.id)
-            reject("新成员对话不属于该项目，已阻止错项目登记");
+          if(conversationScope(chat)!==latest.project.id)
+            reject("新成员对话不属于该项目或普通聊天范围，已阻止错范围登记");
           member.chatUrl=chat;
         }
       }else {
@@ -570,7 +643,10 @@ function help() {
     "GPT 队列协作（仅当扩展在线）:",
     "  node team.cjs doctor",
     "  node team.cjs install | uninstall",
+    "  node team.cjs install-auto | uninstall-auto  安装/撤销全局长任务自动协作规则（离线也可配置；执行仍需 doctor 在线）",
     "  node team.cjs init --run <标识> --repo <Git路径> --project <已绑定项目> [--lead lead --lead-chat <URL>]",
+    "  node team.cjs init --auto --run <标识> --lead-chat <正式聊天URL> [--repo <Git路径>]  自动判断普通/项目作用域",
+    "  node team.cjs init --personal --run <标识> --lead-chat <普通聊天URL> [--repo <Git路径>]",
     "  node team.cjs spawn --run <标识> --member <成员> --role <职责> --task <描述>",
     "  node team.cjs sync --run <标识>",
     "  node team.cjs register --run <标识> --member <成员> --chat <会话URL> [--role <职责>]",
@@ -588,6 +664,8 @@ async function main(args) {
   if(command==="doctor") return doctor();
   if(command==="install") return install();
   if(command==="uninstall") return uninstall();
+  if(command==="install-auto") return configureAutoRouting(true);
+  if(command==="uninstall-auto") return configureAutoRouting(false);
   await requireOnline();
   if(command==="init") return initialize(opts);
   if(command==="register") return register(opts);
@@ -609,4 +687,4 @@ if(require.main===module) main(process.argv.slice(2)).then(output=>{
 });
 module.exports={doctor,installedHere,install,uninstall,initialize,register,spawn,
   send,acknowledge,sync,finish,assertTeamFinished,
-  conciseRun,inbox,readRun,projectFromTargets,main};
+  conciseRun,inbox,readRun,projectFromTargets,configureAutoRouting,main};

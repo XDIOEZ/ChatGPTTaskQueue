@@ -394,7 +394,7 @@ for (const [label,summaryBody] of [
     const result=await finishQueuedHandoff(env,sourceUrl,destinationUrl,summaryBody);
     assert.equal(result.ok,true);
     assert.equal(result.state.handoff.phase,"idle");
-    assert.deepEqual(result.state.tasks.map(task=>task.text),["继续剩余工作"]);
+    assert.deepEqual(Array.from(result.state.tasks,task=>task.text),["继续剩余工作"]);
     env.advance(180);
     assert.equal((await env.send("CLAIM",{ready:true},11,destinationUrl)).dispatch.text,
       "继续剩余工作");
@@ -623,6 +623,58 @@ async function harness(initialStorage = {}, options = {}) {
     simulateExtensionUpdate, retryVersionRefresh, tabSafety, updateProbes, failProbes,
   };
 }
+
+test("普通聊天首页首条队列任务跳转正式聊天前保留草稿，确认后完整继承队列与自动规则",async()=>{
+  const env=await harness();
+  const home="https://chatgpt.com/";
+  const ordinary="https://chatgpt.com/c/plain-first-chat";
+  env.navigate(13,home);
+  await env.send("HELLO",{},13,home);
+  const schedule=await env.send("ADD_SCHEDULE",{
+    text:"后续定时任务",intervalMinutes:30,repeatCount:3,
+  },13,home);
+  assert.equal(schedule.ok,true,schedule.error);
+  const queued=await env.send("ENQUEUE",{text:"普通聊天的第一条任务"},13,home);
+  assert.equal(queued.ok,true,queued.error);
+  const claim=await env.send("CLAIM",{ready:true,userCount:0},13,home);
+  assert.equal(claim.dispatch?.text,"普通聊天的第一条任务");
+  const sent=await env.send("SENT",{id:claim.dispatch.id},13,home);
+  assert.equal(sent.ok,true,sent.error);
+
+  env.navigate(13,ordinary);
+  const early=await env.send("HELLO",{lastUserText:"",userCount:0},13,ordinary);
+  assert.equal(early.sessionKey,"draft:13","原生消息尚未出现时不能丢失临时队列");
+  assert.equal(early.state.activeTaskId,claim.dispatch.id);
+  assert.equal(early.state.schedules.length,1);
+  const adopted=await env.send("HELLO",{
+    lastUserText:"普通聊天的第一条任务",userCount:1,
+  },13,ordinary);
+  assert.equal(adopted.sessionKey,"chat:plain-first-chat");
+  assert.equal(adopted.state.activeTaskId,claim.dispatch.id);
+  assert.equal(adopted.state.tasks[0].status,"waiting");
+  assert.equal(adopted.state.schedules.length,1);
+  assert.equal(adopted.state.schedules[0].text,"后续定时任务");
+  assert.equal(env.stored["cq.state.v2"].conversations["draft:13"],undefined);
+});
+
+test("普通聊天临时队列不能被项目对话或其他标签抢走",async()=>{
+  const env=await harness();
+  const home="https://chatgpt.com/";
+  env.navigate(13,home);
+  await env.send("ENQUEUE",{text:"仅属于普通聊天"},13,home);
+  const claim=await env.send("CLAIM",{ready:true,userCount:0},13,home);
+  await env.send("SENT",{id:claim.dispatch.id},13,home);
+  const project="https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/foreign";
+  env.navigate(13,project);
+  const wrongScope=await env.send("HELLO",{lastUserText:"仅属于普通聊天",userCount:1},13,project);
+  assert.equal(wrongScope.sessionKey,"chat:foreign");
+  assert.ok(env.stored["cq.state.v2"].conversations["draft:13"]);
+  const ordinary="https://chatgpt.com/c/other-tab-chat";
+  env.navigate(12,ordinary);
+  const wrongTab=await env.send("HELLO",{lastUserText:"仅属于普通聊天",userCount:1},12,ordinary);
+  assert.equal(wrongTab.sessionKey,"chat:other-tab-chat");
+  assert.ok(env.stored["cq.state.v2"].conversations["draft:13"]);
+});
 
 test("未查看的已完成回复跨队列续发、页面刷新和后台重启保持标记，查看后清除", async () => {
   const env = await harness();
@@ -1908,7 +1960,7 @@ test("管理页只能暂停或恢复后续自动发送，不能解除异常隔�
     key:"chat:dialogue-a",paused:false,
   });
   assert.equal(blocked.ok,false);
-  assert.match(blocked.error,/人工核对/);
+  assert.match(blocked.error,/核对/);
   assert.equal((await halted.send("GET")).state.queuePaused,true);
   assert.equal((await halted.send("GET")).state.halted,true);
   assert.equal((await halted.send("CLAIM",{ready:true})).dispatch,null);
@@ -5997,6 +6049,69 @@ test("领取任务后语音按钮临时消失，未点击发送应安全回队�
   assert.equal(restored.state.schedules[0].runCount,1);
 });
 
+test("普通聊天：自动接力通过普通新聊天接续，保留队列与规则，不跨标签或项目", async () => {
+  const env=await harness();
+  const sourceUrl="https://chatgpt.com/c/personal-old";
+  const home="https://chatgpt.com/";
+  const destinationUrl="https://chatgpt.com/c/personal-new";
+  env.navigate(11,sourceUrl);
+  const configured=await env.send("SET_HANDOFF",{
+    enabled:true,intervalMinutes:1,repeatCount:2,
+  },11,sourceUrl);
+  assert.equal(configured.ok,true);
+  env.advance(61);
+  const due=await env.send("SCHEDULE_PULSE",{},11,sourceUrl);
+  assert.equal(due.state.tasks[0].kind,"handoff_summary");
+  assert.equal(due.state.handoff.remainingCount,2);
+  const task=await env.send("ENQUEUE",{text:"延续的普通聊天待办"},11,sourceUrl);
+  const originalTaskId=task.state.tasks.at(-1).id;
+  const rule=await env.send("ADD_SCHEDULE",{
+    text:"保留原定时规则",intervalMinutes:180,repeatCount:4,
+  },11,sourceUrl);
+  const originalRuleId=rule.state.schedules[0].id;
+  const claim=await env.send("CLAIM",{ready:true,userCount:2},11,sourceUrl);
+  assert.equal(claim.dispatch.kind,"handoff_summary");
+  await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
+  env.advance(3);
+  const summary=await env.send("FINISHED",{
+    id:claim.dispatch.id,...handoffProof,userCount:3,
+    handoffSummary:"任务主题：继续个人聊天\n保留任务、定时规则和所有安全校验。",
+  },11,sourceUrl);
+  assert.equal(summary.state.handoff.phase,"opening");
+  assert.equal(summary.state.handoff.projectId,"personal");
+  assert.equal(summary.state.handoff.projectUrl,home);
+  assert.equal((await env.send("HANDOFF_NAVIGATE",{userCount:3},11,sourceUrl)).ok,true);
+
+  env.navigate(12,home);
+  const otherTab=await env.send("HELLO",{},12,home);
+  assert.equal(otherTab.state.tasks.length,0,"其他标签不得获得接力内容");
+  env.navigate(11,"https://chatgpt.com/g/g-p-unrelated/project");
+  const otherProject=await env.send("HELLO",{projectVisitId:"wrong-project"},11,
+    "https://chatgpt.com/g/g-p-unrelated/project");
+  assert.equal(otherProject.state.tasks.length,0,"项目新聊天不得接收普通聊天接力");
+  env.navigate(11,home);
+  const attached=await env.send("HELLO",{},11,home);
+  assert.equal(attached.state.tasks.length,1);
+  assert.equal(attached.state.tasks[0].kind,"handoff_intro");
+  const intro=await env.send("CLAIM",{ready:true,userCount:0},11,home);
+  assert.equal(intro.dispatch.kind,"handoff_intro");
+  await env.send("SENT",{id:intro.dispatch.id},11,home);
+  env.navigate(11,destinationUrl);
+  const adopted=await env.send("HELLO",{lastUserText:intro.dispatch.text},11,destinationUrl);
+  assert.equal(adopted.sessionKey,"chat:personal-new");
+  assert.equal(adopted.state.tasks[0].kind,"handoff_intro");
+  env.advance(3);
+  const completed=await env.send("FINISHED",{
+    id:intro.dispatch.id,...voiceProof,
+  },11,destinationUrl);
+  assert.equal(completed.ok,true);
+  assert.equal(completed.state.tasks[0].id,originalTaskId);
+  assert.equal(completed.state.schedules[0].id,originalRuleId);
+  assert.equal(completed.state.handoff.enabled,true);
+  assert.equal(completed.state.handoff.remainingCount,1);
+  assert.equal(env.stored["cq.state.v2"].conversations["chat:personal-old"].tasks.length,0);
+});
+
 test("上下文接力：原生项目内生成总结、同标签新建对话并原子迁移图文队列与定时规则", async () => {
   const env = await harness();
   const project = "g-p-example-handoff";
@@ -6902,7 +7017,7 @@ test("手动接力：空队列总结不合法时保留当前对话，取消后�
   env.advance(3);
   const failed=await env.send("FINISHED",{
     id:summary.dispatch.id,...handoffProof,
-    handoffLastUserText:summary.dispatch.text,handoffSummary:"错误内容",
+    handoffLastUserText:summary.dispatch.text,handoffSummary:"   ",
   },11,url);
   assert.equal(failed.state.handoff.phase,"failed");
   assert.equal(failed.state.tasks[0].status,"error");
@@ -6914,10 +7029,12 @@ test("手动接力：空队列总结不合法时保留当前对话，取消后�
   assert.equal(retried.state.handoff.phase,"queued");
 });
 
-test("交接命令：项目错误拒绝入队，暂停允许入队但阻止执行，取消不丢普通任务", async () => {
+test("交接命令：未建立聊天拒绝入队，暂停允许入队但阻止执行，取消不丢普通任务", async () => {
   const env=await harness();
   const projectUrl="https://chatgpt.com/g/g-p-on-demand/c/source-safe";
-  assert.equal((await env.send("HANDOFF_NOW")).ok,false,"普通聊天不能触发");
+  env.navigate(11,"https://chatgpt.com/");
+  assert.equal((await env.send("HANDOFF_NOW",{},11,"https://chatgpt.com/")).ok,false,
+    "首页尚未建立聊天，不应创建交接命令");
   env.navigate(11,projectUrl);
   assert.equal((await env.send("HANDOFF_NOW",{},11,projectUrl)).ok,true,
     "项目中的空队列可以手动接力");
@@ -7077,7 +7194,7 @@ test("接力失败取消时可要求暂停原队列，防止误入队的重复�
   env.advance(3);
   const failed=await env.send("FINISHED",{
     id:claim.dispatch.id,...handoffProof,
-    handoffSummary:"未完成的接力总结",handoffLastUserText:claim.dispatch.text,
+    handoffSummary:"   ",handoffLastUserText:claim.dispatch.text,
   },11,url);
   assert.equal(failed.state.handoff.phase,"failed");
   const recovered=await env.send("CANCEL_HANDOFF",{reviewed:true,pauseAfter:true},11,url);
@@ -7087,12 +7204,13 @@ test("接力失败取消时可要求暂停原队列，防止误入队的重复�
   assert.equal((await env.send("CLAIM",{ready:true},11,url)).dispatch,null);
 });
 
-test("上下文接力：空队列到期也入队，非项目拒绝，总结缺失时原队列仍保留", async () => {
+test("上下文接力：空队列到期也入队，未建立对话拒绝，总结缺失时原队列仍保留", async () => {
   const env=await harness();
   const sourceUrl="https://chatgpt.com/g/g-p-safe-project/c/old-safe";
+  env.navigate(11,"https://chatgpt.com/");
   const outside=await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60});
   assert.equal(outside.ok,false);
-  assert.match(outside.error,/原生项目/);
+  assert.match(outside.error,/已建立/);
   env.navigate(11,sourceUrl);
   await env.send("SET_HANDOFF",{enabled:true,intervalMinutes:60},11,sourceUrl);
   env.advance(3601);
@@ -7105,7 +7223,7 @@ test("上下文接力：空队列到期也入队，非项目拒绝，总结缺�
   await env.send("SENT",{id:claim.dispatch.id},11,sourceUrl);
   env.advance(3);
   const invalid=await env.send("FINISHED",{
-    id:claim.dispatch.id,...handoffProof,handoffSummary:"不完整的总结",
+    id:claim.dispatch.id,...handoffProof,handoffSummary:"   ",
     handoffLastUserText:claim.dispatch.text,
   },11,sourceUrl);
   assert.equal(invalid.state.handoff.phase,"failed");
@@ -7352,7 +7470,7 @@ test("接力接收草稿 A→B→A 按项目隔离，晚到确认不会污染新
   const sourceRuleId=conversations["chat:source"].schedules[0].id;
   env.navigate(11,projectB);
   const next=await env.send("HELLO",{projectVisitId:"project-b-visit"},11,projectB);
-  assert.equal(next.ok,true);
+  assert.equal(next.ok,true,next.error);
   assert.equal(next.sessionKey,"draft:11");
   assert.equal(next.state.tasks.length,0);
   assert.equal(next.state.handoffSourceKey,undefined);
@@ -7764,4 +7882,112 @@ test("远程引导只在真正观察到发送的用户消息后确认，丢回�
   assert.equal(duplicate.ok,false);
   assert.equal(env.stored["cq.state.v2"].conversations["chat:dialogue-a"]
     .remoteSteerConfirmedIds.filter(x=>x===requestId).length,1);
+});
+
+test("远程任务结果按完成事务持久化，旧回复不能冒充新回复",async()=>{
+  for(const matching of [true,false]) {
+    const env=await harness({}, {structuredStorage:true});
+    const remoteId=matching?"aaaaaaaa-1234-4234-8234-123456789abc":
+      "bbbbbbbb-1234-4234-8234-123456789abc";
+    await env.send("HELLO",{},11,A,{url:A});
+    const queued=await env.send("ADD_TASK",{
+      text:"请完成任务",requestId:remoteId,remoteJobId:remoteId,remoteCaptureResult:true,
+    },11,A,{url:A});
+    assert.equal(queued.ok,true,queued.error);
+    const claim=await env.send("CLAIM",{ready:true,userCount:1,assistantCount:1,
+      lastAssistantId:"old"},11,A,{url:A});
+    assert.ok(claim.dispatch);
+    await env.send("SENT",{id:claim.dispatch.id},11,A,{url:A});
+    env.advance(4);
+    env.failNextWrite("before");
+    const result={completionStatus:"completed",replyText:"最终回复",
+      userCount:2,lastUserText:"请完成任务",assistantCount:matching?2:1,
+      assistantId:matching?"new":"old"};
+    const failed=await env.send("FINISHED",{
+      id:claim.dispatch.id,...voiceProof,remoteResult:result,
+    },11,A,{url:A});
+    assert.equal(failed.ok,false);
+    assert.equal(env.stored["cq.state.v2"].remoteResults,undefined);
+    const finished=await env.send("FINISHED",{
+      id:claim.dispatch.id,...voiceProof,remoteResult:result,
+    },11,A,{url:A});
+    assert.equal(finished.ok,true,finished.error);
+    const outbox=env.stored["cq.state.v2"].remoteResults;
+    assert.equal(outbox.length,1);
+    assert.equal(outbox[0].id,remoteId);
+    assert.equal(outbox[0].completionStatus,matching?"completed":"result_unavailable");
+    assert.equal(outbox[0].replyText,matching?"最终回复":undefined);
+    const restarted=await harness(structuredClone(env.stored), {structuredStorage:true});
+    assert.equal(restarted.stored["cq.state.v2"].remoteResults.length,1);
+  }
+});
+
+test("远程新对话的隐藏镜像修正只适用于零基线和指定原始计数",async()=>{
+  for (const scenario of [
+    {name:"new",flag:true,raw:2,expected:"completed"},
+    {name:"old",flag:false,raw:2,expected:"result_unavailable"},
+    {name:"invalid",flag:true,raw:3,expected:"result_unavailable"},
+  ]) {
+    const env=await harness({}, {structuredStorage:true});
+    const remoteId="aaaaaaaa-1234-4234-8234-123456789abc";
+    await env.send("HELLO",{},11,A,{url:A});
+    const queued=await env.send("ADD_TASK",{text:"请完成任务",requestId:remoteId,
+      remoteJobId:remoteId,remoteCaptureResult:true,remoteNewChat:scenario.flag},11,A,{url:A});
+    assert.equal(queued.ok,true,scenario.name);
+    assert.equal(queued.state.tasks[0].remoteNewChat===true,scenario.flag);
+    const claim=await env.send("CLAIM",{ready:true,userCount:0,assistantCount:0},11,A,{url:A});
+    assert.ok(claim.dispatch,scenario.name);
+    await env.send("SENT",{id:claim.dispatch.id},11,A,{url:A});
+    env.advance(4);
+    const result={completionStatus:"completed",replyText:"最终回复",userCount:1,
+      rawUserCount:scenario.raw,mirrorIgnored:true,lastUserText:"请完成任务",assistantCount:1};
+    const finished=await env.send("FINISHED",{id:claim.dispatch.id,...voiceProof,remoteResult:result},11,A,{url:A});
+    assert.equal(finished.ok,true,scenario.name);
+    const outcome=env.stored["cq.state.v2"].remoteResults[0];
+    assert.equal(outcome.completionStatus,scenario.expected,scenario.name);
+    assert.equal(outcome.replyText,scenario.expected==="completed"?"最终回复":undefined,scenario.name);
+  }
+});
+
+test("远程新对话首页跳转后保留镜像修正标记并完成结果",async()=>{
+  const env=await harness({}, {structuredStorage:true});
+  const home="https://chatgpt.com/", remoteId="aaaaaaaa-1234-4234-8234-123456789abc";
+  await env.send("HELLO",{},13,home,{url:home});
+  const added=await env.send("ADD_TASK",{text:"请完成任务",requestId:remoteId,
+    remoteJobId:remoteId,remoteCaptureResult:true,remoteNewChat:true},13,home,{url:home});
+  assert.equal(added.ok,true,added.error);
+  const claim=await env.send("CLAIM",{ready:true,userCount:0,assistantCount:0},13,home,{url:home});
+  assert.ok(claim.dispatch);
+  await env.send("SENT",{id:claim.dispatch.id},13,home,{url:home});
+  env.navigate(13,A);
+  const adopted=await env.send("HELLO",{lastUserText:"请完成任务",userCount:2},13,A,{url:A});
+  assert.equal(adopted.ok,true,adopted.error);
+  assert.equal(adopted.state.tasks.find(task=>task.id===claim.dispatch.id).remoteNewChat,true);
+  env.advance(4);
+  const finished=await env.send("FINISHED",{id:claim.dispatch.id,...voiceProof,
+    remoteResult:{completionStatus:"completed",replyText:"最终回复",userCount:1,rawUserCount:2,
+      mirrorIgnored:true,lastUserText:"请完成任务",assistantCount:1}},13,A,{url:A});
+  assert.equal(finished.ok,true,finished.error);
+  assert.equal(env.stored["cq.state.v2"].remoteResults[0].completionStatus,"completed");
+});
+
+test("远程任务超时或停止时回报不可确认，而不是一直等待或宣称完成",async()=>{
+  for(const mode of ["timeout","stopped","failure"]) {
+    const env=await harness({}, {structuredStorage:true});
+    const remoteId={timeout:"cccccccc-1234-4234-8234-123456789abc",
+      stopped:"dddddddd-1234-4234-8234-123456789abc",
+      failure:"eeeeeeee-1234-4234-8234-123456789abc"}[mode];
+    await env.send("HELLO",{},11,A,{url:A});
+    await env.send("ADD_TASK",{text:"任务",requestId:remoteId,remoteJobId:remoteId,remoteCaptureResult:true},11,A,{url:A});
+    const claim=await env.send("CLAIM",{ready:true,userCount:1,assistantCount:1},11,A,{url:A});
+    await env.send("SENT",{id:claim.dispatch.id},11,A,{url:A});
+    if(mode==="timeout") {env.advance(46*60);await env.tick(1);}
+    else if(mode==="stopped") await env.send("STOPPED",{},11,A,{url:A});
+    else await env.send("FAIL",{id:claim.dispatch.id,error:"模拟失败"},11,A,{url:A});
+    const outbox=env.stored["cq.state.v2"].remoteResults;
+    assert.equal(outbox.length,1);
+    assert.equal(outbox[0].id,remoteId);
+    assert.equal(outbox[0].completionStatus,"result_unavailable");
+    assert.ok(outbox[0].resultError);
+  }
 });

@@ -4,7 +4,7 @@
 // Deliberately independent of chrome.runtime and queue initialization. Old
 // content scripts lose their runtime bridge when an unpacked extension reloads.
 (() => {
-  const VERSION = "0.49.55";
+  const VERSION = "0.49.64";
   const previous = globalThis.__cqLoadRecoveryGuardian;
   if (previous?.version === VERSION) { previous.scan(); return; }
   previous?.stop?.();
@@ -21,7 +21,7 @@
     '[data-user-message-bubble], [data-markdown-text-style="assistant-message"], ' +
     '[data-testid="user-message"], [data-testid="message-content"], ' +
     '[data-testid*="writing-block"], [data-testid*="artifact"], .markdown, pre, code, blockquote';
-  // Native transport notices may be inside the latest assistant turn, but
+  // Native transport/unknown-error notices may be inside the latest turn, but
   // authored text, quoted examples, sidebars and plugin UI are never errors.
   const nativeForeign = '#cq-extension-root, aside, nav, header, [role="navigation"], ' +
     '[role="dialog"], [aria-modal="true"], [role="menu"], ' +
@@ -89,6 +89,28 @@
   let transportErrorNode = null;
   let transportErrorKind = null;
   let disconnectObservation = null;
+  // Some ChatGPT builds show a compact red timeout banner whose "请重试"
+  // is plain text, NOT a native Retry button or role=alert. Its exact short
+  // error message and native danger styling must both be present. Never use
+  // an arbitrary assistant/user quote as evidence for a browser refresh.
+  const retrylessTimeout = /^(?:消息(?:传输|发送|投递)超时(?:[。.!！\s]*请(?:稍后)?重试[。.!！\s]*)?|(?:message|response)\s+(?:transport|transmission|delivery)\s+(?:timed?\s*out|timeout)(?:[.!\s]*(?:please\s+)?(?:retry|try\s+again)[.!\s]*)?)$/i;
+  function dangerColor(value) {
+    const match = String(value || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/i);
+    if (!match) return false;
+    const [,r,g,b] = match.map(Number);
+    return r >= 120 && r > g * 1.25 && r > b * 1.15;
+  }
+  function nativeDangerCue(element, main) {
+    for (let node = element, depth = 0; node && node !== main && depth < 5;
+        node = node.parentElement, depth++) {
+      const classes = typeof node.className === "string" ? node.className : "";
+      if (/(?:^|[\s_-])(?:text|border|bg)[-_](?:red|rose|danger|error)(?:[-_\d]|\b)|(?:^|[\s_-])(?:error|danger)(?:\b|[-_])/i.test(classes)) return true;
+      const style = getComputedStyle(node);
+      if ([style.color,style.borderColor,style.borderTopColor,
+           style.borderLeftColor,style.backgroundColor].some(dangerColor)) return true;
+    }
+    return false;
+  }
   function detectTransportError(now = Date.now()) {
     transportErrorNode = null;
     transportErrorKind = null;
@@ -103,14 +125,14 @@
         Boolean(lastTurn.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING));
     const errorText = (element) => {
       const text = normal(element.innerText || element.textContent);
-      return text.length <= 350 && /消息(?:传输|发送|投递)超时|(?:message|response)\s+(?:transport|transmission|delivery)\s+(?:timed?\s*out|timeout)/i.test(text);
+      return text.length <= 350 && /消息(?:传输|发送|投递)超时|(?:message|response)\s+(?:transport|transmission|delivery)\s+(?:timed?\s*out|timeout)|\bunknown\s+error\b/i.test(text);
     };
     for (const element of main.querySelectorAll('[role="alert"], [data-testid*="error"], [data-state="error"]')) {
       if (current(element) && !element.querySelector(nativeForeign) && errorText(element)) {
         transportErrorNode = element;
-        transportErrorKind = "timeout";
+        transportErrorKind = "error";
         disconnectObservation = null;
-        errorButton = element.querySelector('button, [role="button"]');
+        errorButton = element.querySelector('button, [role="button"]') || element;
         return true;
       }
     }
@@ -123,12 +145,35 @@
         if (normal(surface.innerText || surface.textContent).length > 350) break;
         if (errorText(surface)) {
           transportErrorNode = surface;
-          transportErrorKind = "timeout";
+          transportErrorKind = "error";
           disconnectObservation = null;
           errorButton = button;
           return true;
         }
       }
+    }
+    // Native retryless red timeout after the last assistant reply (or inside
+    // the last turn but outside authored Markdown). Restrict to an exact,
+    // compact visible notice, with genuine error styling; no fuzzy scanning
+    // of arbitrary conversation prose or a generic "请重试" string.
+    for (const element of main.querySelectorAll('div, p, span, [role="status"]')) {
+      // Cheap shape/text filters first: computed visibility walks ancestors
+      // and is expensive on large conversations with many rendered turns.
+      if (element.childElementCount > 4) continue;
+      const text = normal(element.textContent);
+      if (text.length > 100 || !retrylessTimeout.test(text) ||
+          !current(element) || element.closest('form, [contenteditable], [role="textbox"]') ||
+          element.querySelector(`${nativeForeign}, form, [contenteditable], [role="textbox"]`) ||
+          !nativeDangerCue(element,main)) continue;
+      // Prefer the innermost matching element: a large shared ancestor could
+      // contain the same text but does not identify a single error notice.
+      if ([...element.children].some(child => retrylessTimeout.test(normal(child.textContent)) &&
+          current(child))) continue;
+      transportErrorNode = element;
+      transportErrorKind = "error";
+      disconnectObservation = null;
+      errorButton = element; // Also provides a local anchor for refresh status.
+      return true;
     }
     // This native interrupted-connection card has neither Retry nor alert.
     // Search only the current reply's UI leaves, pruning authored surfaces
@@ -226,7 +271,11 @@
   function scanTransport(now, href, url) {
     // Observe connection recovery/progress between scheduled refresh checks.
     const found = detectTransportError(now);
-    if (now < nextTransportCheckAt) return false;
+    if (now < nextTransportCheckAt) {
+      if (!found) return false; // Keep the independent 60-second load-error recovery active.
+      showStatus(`检测到传输错误，${Math.ceil((nextTransportCheckAt - now) / 1000)} 秒后检查能否安全刷新`);
+      return true;
+    }
     nextTransportCheckAt = now + TRANSPORT_CHECK_INTERVAL_MS;
     if (!found) return false;
     const expectedError = transportErrorNode;

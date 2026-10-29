@@ -79,6 +79,27 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
   process.env.CQ_BRIDGE_PORT=String(server.address().port);
   const team=require("../skills/gpt-queue-agent-team/team.cjs");
 
+  const globalRules=path.join(codexHome,"AGENTS.md");
+  fs.mkdirSync(codexHome,{recursive:true});
+  fs.writeFileSync(globalRules,"保留我原来的其他协作规则。\n","utf8");
+  const installedAuto=team.configureAutoRouting(true);
+  assert.equal(installedAuto.changed,true);
+  const autoText=fs.readFileSync(globalRules,"utf8");
+  assert.match(autoText,/保留我原来的其他协作规则/);
+  assert.match(autoText,/长任务自动协作/);
+  assert.match(autoText,/doctor/);
+  assert.match(autoText,/init --auto/);
+  assert.equal(team.configureAutoRouting(true).alreadyConfigured,true,
+    "重复配置不得反复追加或改写原有指令");
+  assert.equal(fs.readFileSync(globalRules,"utf8"),autoText);
+  fs.writeFileSync(globalRules,autoText.replace("<!-- GPT_QUEUE_AUTO_TEAM_END -->",""));
+  assert.throws(()=>team.configureAutoRouting(false),/不完整/,
+    "损坏标记必须拒绝清理，而不是覆盖用户其余规则");
+  fs.writeFileSync(globalRules,autoText);
+  assert.equal(team.configureAutoRouting(false).enabled,false);
+  assert.doesNotMatch(fs.readFileSync(globalRules,"utf8"),/GPT_QUEUE_AUTO_TEAM_BEGIN/);
+  assert.match(fs.readFileSync(globalRules,"utf8"),/保留我原来的其他协作规则/);
+
   assert.equal((await team.doctor()).ok,false,"只有桥接服务不够，扩展必须配对并在线");
   await assert.rejects(()=>team.install(),/扩展/);
   const pairedId="abcdefghijklmnopabcdefghijklmnop";
@@ -194,6 +215,43 @@ test("多智能体协作：插件门槛、Git 项目、子对话、双向 ACK、
   await assert.rejects(()=>team.main(["send","--run",run,"--from","main",
     "--to","worker","--type","DISCOVERY","--text","禁止离线"]),/Skill/);
   assert.equal(posted.length,5,"离线时不允许绕过门槛发送");
+  fs.writeFileSync(path.join(bridgeDir,"jobs.json"),JSON.stringify({
+    version:1,extensionVersion:require("../manifest.json").version,
+    targetsAt:Date.now(),jobs:[],targets:[],
+  }));
+  const ordinaryLead="https://chatgpt.com/c/personal-lead";
+  const ordinaryWorker="https://chatgpt.com/c/personal-worker";
+  const auto=await team.initialize({run:"plain-auto-01",auto:true,
+    "lead-chat":ordinaryLead});
+  assert.equal(auto.project.kind,"personal");
+  assert.equal(auto.project.id,"personal");
+  assert.equal(auto.repo,null,"非开发任务无需伪造 Git 仓库");
+  const personalJob=await team.spawn({run:"plain-auto-01",member:"researcher",
+    role:"researcher",task:"只调查 A 模块；将结论发给主对话"});
+  assert.equal(posted.at(-1).target.kind,"personal");
+  assert.equal(posted.at(-1).target.url,"https://chatgpt.com/");
+  jobs.get(personalJob.spawnJobId).status="created";
+  jobs.get(personalJob.spawnJobId).chatUrl=ordinaryWorker;
+  assert.equal((await team.sync({run:"plain-auto-01"})).members.researcher.chatUrl,
+    ordinaryWorker);
+  const report=await team.send({run:"plain-auto-01",from:"researcher",
+    to:"lead",type:"DISCOVERY",text:"已完成调查，重要结论 A"});
+  assert.equal(report.ok,true);
+  assert.equal(posted.at(-1).target.url,ordinaryLead);
+  await assert.rejects(()=>team.initialize({run:"plain-reject-01",auto:true}),
+    /真实对话 URL/);
+  await assert.rejects(()=>team.initialize({run:"plain-reject-02",personal:true,
+    "lead-chat":leadUrl}),/不属于所选范围/);
+  await assert.rejects(()=>team.initialize({run:"plain-reject-03",auto:true,
+    project:"FlatWorld","lead-chat":ordinaryLead}),/不可同时指定/);
+  const cross=await team.initialize({run:"project-auto-01",auto:true,
+    "lead-chat":leadUrl});
+  assert.equal(cross.project.id,projectId);
+  const crossMember=await team.spawn({run:"project-auto-01",member:"worker",
+    role:"reviewer",task:"检查实现中的数据契约"});
+  jobs.get(crossMember.spawnJobId).status="created";
+  jobs.get(crossMember.spawnJobId).chatUrl=ordinaryWorker;
+  await assert.rejects(()=>team.sync({run:"project-auto-01"}),/错项目|错范围/);
   const removed=team.uninstall();
   assert.equal(removed.uninstalled,true);
   assert.equal(fs.existsSync(installed.registration),false);

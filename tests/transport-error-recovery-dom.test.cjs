@@ -55,6 +55,11 @@ document.addEventListener("click",event=>{
   const retry='<button type="button" data-native-retry>重试</button>';
   const alert='<div id="transport-error" role="alert">消息传输超时。请重试。</div>';
   const compact='<div id="transport-error"><span>消息传输超时。请重试。</span>'+retry+'</div>';
+  // Screenshot variant: the red card contains only a plain-text instruction
+  // "请重试。". It has no button, role=alert, or data-testid for errors.
+  const retryless='<div class="rounded border-red-800" style="border:1px solid rgb(165,45,45)">'+
+    '<span style="color:rgb(246,73,73)">消息传输超时。请重试。</span></div>';
+  const neutralText='<div><span>消息传输超时。请重试。</span></div>';
   // Native disconnected notice has neither Retry nor role=alert. It lives
   // beside the authored markdown, not inside the assistant's prose.
   const disconnected='<div id="disconnected-notice">连接已中断，正在等待完整答复</div>';
@@ -103,6 +108,40 @@ document.addEventListener("click",event=>{
     const beforeLate=window.__reloads.length;
     scan(epoch+300000);
     checks.newErrorAtScheduledCheckRefreshes=window.__reloads.length===beforeLate+1;
+
+    probe=await fresh(page(retryless));
+    checks.retrylessRedNoticeDetected=!!probe.detectTransportError();
+    const beforeRetryless=window.__reloads.length;
+    scan(epoch+299999);
+    checks.retrylessNotEarly=window.__reloads.length===beforeRetryless;
+    scan(epoch+300000);
+    checks.retrylessFiveMinuteRefresh=window.__reloads.length===beforeRetryless+1 &&
+      !!document.querySelector('[data-cq-load-recovery-status]');
+    scan(epoch+600000);
+    checks.retrylessNoDuplicate=window.__reloads.length===beforeRetryless+1;
+
+    // Screenshot arrangement: the red card follows the assistant toolbar as
+    // a sibling of the last turn, rather than living inside its message body.
+    probe=await fresh(page("").replace('</section>', '</section>'+retryless));
+    checks.retrylessAfterLatestTurnDetected=!!probe.detectTransportError();
+    const beforeSibling=window.__reloads.length;
+    scan(epoch+300000);
+    checks.retrylessAfterLatestTurnRefreshes=window.__reloads.length===beforeSibling+1;
+
+    probe=await fresh(page(retryless));
+    const beforeDraft=window.__reloads.length;
+    document.querySelector("#prompt-textarea").value="用户未保存的新草稿";
+    scan(epoch+300000);
+    checks.retrylessDraftProtection=window.__reloads.length===beforeDraft;
+    probe=await fresh(page(retryless));
+    document.querySelector("form").insertAdjacentHTML("beforeend",
+      '<div data-testid="file-chip">未保存截图.png</div>');
+    scan(epoch+300000);
+    checks.retrylessAttachmentProtection=window.__reloads.length===beforeDraft;
+    probe=await fresh(page(retryless));
+    probe.setGuard(()=>false);
+    scan(epoch+300000);
+    checks.retrylessQueueGuardProtection=window.__reloads.length===beforeDraft;
 
     probe=await fresh(page(disconnected));
     checks.disconnectedNativeTextDetected=!!probe.detectTransportError();
@@ -160,6 +199,13 @@ document.addEventListener("click",event=>{
     for(const [name,html] of [
       ["oldAssistant",page(alert).replace('</section>',
         '<article data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="a2"><div class="markdown">新的正常回答</div></div></article></section>')],
+      ["oldRetryless",page(retryless).replace('</section>',
+        '<article data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="a2"><div class="markdown">新的正常回答</div></div></article></section>')],
+      ["retrylessAuthored",page('<div class="markdown">'+retryless+'</div>')],
+      ["retrylessUser",'<main><div data-message-author-role="user">'+retryless+'</div>'+reply("")+composer+'</main>'],
+      ["retrylessSidebar",'<aside>'+retryless+'</aside>'+page("")],
+      ["retrylessNeutral",page(neutralText)],
+      ["retrylessHidden",page('<div hidden>'+retryless+'</div>')],
       ["authoredQuote",page('<div class="markdown">'+compact+'</div>')],
       ["codeQuote",page('<pre><code>'+compact+'</code></pre>')],
       ["userQuote",'<main><div data-message-author-role="user">'+compact+'</div>'+reply("")+composer+'</main>'],

@@ -12,6 +12,8 @@
   const NATIVE_ERROR_STABLE_MS = 1700;
   const CONVERSATION_LOAD_REFRESH_INTERVAL_MS = 60000;
   const CONVERSATION_LOAD_RECOVERY_KEY = "cq.conversationLoadRecovery.v1:";
+  const NATIVE_IMAGE_RECOVERY_KEY = "cq.nativeImageRecovery.v1:";
+  const NATIVE_IMAGE_RECOVERY_INTERVAL_MS = 60000;
   const TAB_DOT_STABLE_MS = 6500;
   const TAB_UNREAD_DOT = "🔴 ";
   const TAB_COMPLETED_MARK = "✅ ";
@@ -83,6 +85,16 @@
   let autoAdvancedOpen = false;
   try { autoAdvancedOpen = localStorage.getItem(AUTO_ADVANCED_STORAGE_KEY) === "1"; }
   catch { /* The panel still works when site storage is unavailable. */ }
+  const AUTO_TEAM_STORAGE_KEY = "cq.agentTeamAuto.v1";
+  let autoTeamEnabled = true;
+  try { autoTeamEnabled = localStorage.getItem(AUTO_TEAM_STORAGE_KEY) !== "0"; }
+  catch { /* The queue still works if local storage is unavailable. */ }
+
+  function prepareQueueTeamTask(text, url = location.href) {
+    const policy = globalThis.CQAgentPolicy;
+    return typeof policy?.prepare === "function"
+      ? policy.prepare(text, url, autoTeamEnabled) : text;
+  }
 
   function needsDeleteTaskConfirmation() {
     try {
@@ -113,6 +125,9 @@
   // Keep real File references captured before ChatGPT's uploader clears its
   // native file input. Never persist previews without their source bytes.
   let nativeComposerImages = null;
+  // An orphaned native preview has no trusted File reference. Never discard
+  // its unsent text or attachment just to make a refresh possible.
+  let nativeImageMismatch = null;
   let settingsOpen = false;
   let handoffOpen = false;
   let handoffMinutesDraft = "120";
@@ -410,6 +425,24 @@
     return match[1].replace(/^(g-p-[a-f0-9]{32})(?:-[a-z0-9-]+)?$/i, "$1");
   }
 
+  // The handoff can continue within a project, or between ordinary chats.
+  // These scopes are never interchangeable, even when the tab stays the same.
+  function handoffScopeId(url = location.href) {
+    const normal = validUrl(url);
+    if (!normal) return null;
+    const project = projectPageId(normal);
+    if (project) return project;
+    const path = new URL(normal).pathname;
+    return path === "/" || /^\/c\/[a-zA-Z0-9-]+$/.test(path)
+      ? "personal" : null;
+  }
+
+  function isHandoffLanding(url = location.href) {
+    const normal = validUrl(url);
+    return Boolean(normal && (isProjectOverview(normal) ||
+      new URL(normal).pathname === "/"));
+  }
+
   function boundHere() {
     if (!state || !sessionKey || !validUrl(location.href)) return false;
     if (isProjectOverview()) {
@@ -419,12 +452,29 @@
         (!state.projectVisitId || state.projectVisitId === projectVisitId);
     }
     const current = pageChatKey(location.href);
-    if (!current && isProjectOverview(state.url)) return false;
-    return current ? sessionKey === current : sessionKey.startsWith("draft:");
+    if (current) return sessionKey === current;
+    // The personal new-chat page uses the same per-tab draft mechanism as a
+    // project composer. Do not show an old project's or another origin's
+    // draft when this tab navigates back to the ordinary homepage.
+    return sessionKey.startsWith("draft:") &&
+      handoffScopeId(state.url) === "personal" &&
+      handoffScopeId(location.href) === "personal" &&
+      new URL(validUrl(state.url)).origin === new URL(validUrl(location.href)).origin;
   }
 
   function temporaryNewChat() {
     return Boolean(sessionKey?.startsWith("draft:") && !pageChatKey(location.href));
+  }
+
+  function nativeFirstEnterAllowed() {
+    // On a genuinely empty new-chat landing, let ChatGPT handle Enter itself.
+    // An established chat whose messages are still loading is NOT a new chat.
+    if (!state || !boundHere() || !temporaryNewChat() || !isHandoffLanding() ||
+        state.halted || state.handoffSourceKey || state.activeTaskId ||
+        state.steeringTaskId || state.tasks?.length || state.schedules?.length ||
+        workInProgress || composerActionInProgress) return false;
+    const snapshot = conversationSnapshot();
+    return !snapshot.userCount && !snapshot.assistantCount && !snapshot.busy;
   }
 
   function queueCount() {
@@ -647,7 +697,7 @@
         hasComposerAttachments(editor) || nativeUploadBusy(editor) ||
         !handoffTextMatch(task.text,editorText(editor)).matches) return false;
     if (task.kind === "handoff_intro" ? !state.handoffSourceKey || !state.handoffToken ||
-        !isProjectOverview() || projectPageId(state.url) !== projectPageId(location.href) :
+        !isHandoffLanding() || handoffScopeId(state.url) !== handoffScopeId(location.href) :
         state.handoffSourceKey || !["queued", "summarizing"].includes(state.handoff?.phase) ||
         state.handoff?.cancelRequested) return false;
     const record = handoffComposerRecords.get(task.id);
@@ -662,7 +712,7 @@
 
   function retryableUnsentHandoff() {
     if (!state?.handoffSourceKey || !state.handoffToken || !state.handoffQueueId ||
-        !boundHere() || !isProjectOverview() || state.activeTaskId || state.steeringTaskId ||
+        !boundHere() || !isHandoffLanding() || state.activeTaskId || state.steeringTaskId ||
         state.queuePaused || state.haltReason === "user" || state.tasks.length !== 1) return null;
     const task = state.tasks[0];
     if (task.kind !== "handoff_intro" || task.status !== "pending" || task.images?.length ||
@@ -798,6 +848,42 @@
       (element?.matches('[data-user-message-bubble="true"]') ? "user" : null);
   }
 
+  // Only structural booleans and fixed role markers; never expose message text,
+  // URLs, identifiers or arbitrary page attributes through the bridge.
+  function remoteUserNodeShapes(snapshot) {
+    const nodes = turns().filter((element) => turnRole(element) === "user").slice(-5);
+    const last = snapshot.lastUserElement;
+    const lastId = messageId(last);
+    const containerSelector = '[data-talvt-turn-state], [data-testid^="conversation-turn-"]';
+    const ownerSelector = '[data-chatgpt-search-message-ids], [data-message-id]';
+    function mask(element) {
+      return (element.hasAttribute('data-message-author-role') ? 1 : 0) |
+        (element.hasAttribute('data-turn') ? 2 : 0) |
+        (element.hasAttribute('data-conversation-role') ? 4 : 0) |
+        (element.hasAttribute('data-content-search-unit-key') ? 8 : 0) |
+        (element.hasAttribute('data-user-message-bubble') ? 16 : 0) |
+        (element.hasAttribute('data-chatgpt-search-message-ids') ? 32 : 0) |
+        (element.hasAttribute('data-message-id') ? 64 : 0) |
+        (element.hasAttribute('data-talvt-turn-state') ? 128 : 0) |
+        (element.matches('[data-testid^="conversation-turn-"]') ? 256 : 0) |
+        (element.matches('main, [role="main"]') ? 512 : 0);
+    }
+    return nodes.map((element) => {
+      const id = messageId(element), container = element.closest(containerSelector);
+      const owner = element.closest(ownerSelector);
+      const path = [];
+      for (let ancestor=element; ancestor && path.length<10; ancestor=ancestor.parentElement)
+        path.push({tag:/^(DIV|SECTION|ARTICLE|MAIN|H[1-6]|SPAN|P)$/.test(ancestor.tagName)
+          ? ancestor.tagName.toLowerCase() : 'other',mask:mask(ancestor)});
+      return {path,inMain:Boolean(element.closest('main, [role="main"]')),
+        visible:isVisible(element),hasId:Boolean(id),sameIdAsLast:Boolean(id && lastId && id===lastId),
+        sameTextAsLast:Boolean(normalize(messageText(element)) &&
+          normalize(messageText(element))===normalize(snapshot.lastUserText)),
+        sameContainerAsLast:Boolean(container && container===last?.closest(containerSelector)),
+        sameOwnerAsLast:Boolean(owner && owner===last?.closest(ownerSelector))};
+    });
+  }
+
   function turns() {
     const selector =
       '[data-message-author-role="assistant"], [data-message-author-role="user"],' +
@@ -883,8 +969,8 @@
     // handoff. Expanding is a read operation; ownership still requires the
     // worker's original token/project/full-message checks to pass.
     if (!state?.handoffSourceKey || !sessionKey?.startsWith("draft:") ||
-        !pageChatKey(location.href) || !projectPageId(state.url) ||
-        projectPageId(state.url) !== projectPageId(location.href) ||
+        !pageChatKey(location.href) || !handoffScopeId(state.url) ||
+        handoffScopeId(state.url) !== handoffScopeId(location.href) ||
         task?.kind !== "handoff_intro" || !["dispatching", "waiting"].includes(task.status) ||
         snapshot.userCount !== 1 || !snapshot.lastUserFolded ||
         composerActionInProgress || workInProgress) return snapshot;
@@ -917,7 +1003,7 @@
     // the first user bubble mounts. Keep checking that first bubble even
     // after the local UI has switched from draft to an ordinary empty chat.
     // This handshake never sends a message or claims a queued task.
-    if (!state || !boundHere() || !pageChatKey(location.href) || !projectPageId(location.href) ||
+    if (!state || !boundHere() || !pageChatKey(location.href) || !handoffScopeId(location.href) ||
         !sessionKey?.startsWith("chat:") || snapshot.userCount !== 1 ||
         !normalize(snapshot.lastUserText) || state.handoffSourceKey ||
         state.tasks.length || state.schedules.length || state.activeTaskId || state.steeringTaskId ||
@@ -1010,7 +1096,9 @@
       "[data-message-content-part]",
     ];
     for (const selector of selectors) {
-      const all = [...element.querySelectorAll(selector)];
+      // The authored-content selector can be on the assistant element itself.
+      const all = [...(element.matches(selector) ? [element] : []),
+        ...element.querySelectorAll(selector)];
       const topLevel = all.filter((node) => !all.some((other) => other !== node && other.contains(node)));
       if (topLevel.length) {
         const text = topLevel.map((node) => node.innerText || node.textContent || "").join("\n").trim();
@@ -1018,6 +1106,84 @@
       }
     }
     return "";
+  }
+
+  // A freshly created native chat can keep an invisible, ownerless copy of
+  // its first user bubble alongside the actual search-unit turn. Limit this
+  // adjustment to that precise observed structure and the submitted text.
+  // Do not alter turns() or ignore identifiable/visible historical messages.
+  function remoteFirstUserCount(snapshot, expectedText) {
+    if (snapshot?.userCount !== 2 || !normalize(expectedText)) return snapshot?.userCount;
+    const users = turns().filter(element => turnRole(element) === "user");
+    if (users.length !== 2) return snapshot.userCount;
+    const [shadow, actual] = users;
+    const owner = actual.closest('[data-chatgpt-search-message-ids]');
+    const ownerIds = owner?.getAttribute('data-chatgpt-search-message-ids')?.trim().split(/\s+/) || [];
+    const noOwner = !shadow.closest('[data-chatgpt-search-message-ids], [data-message-id], ' +
+      '[data-talvt-turn-state], [data-turn-id], [data-testid^="conversation-turn-"]') &&
+      !shadow.querySelector('[data-chatgpt-search-message-ids], [data-message-id], ' +
+        '[data-chatgpt-selection-message-id]') && !messageId(shadow);
+    const expected = normalize(expectedText);
+    const mirror = shadow.matches('div[data-user-message-bubble="true"]') &&
+      Boolean(shadow.closest('main, [role="main"]')) && !isVisible(shadow) && noOwner &&
+      !userMessageFolded(shadow) && normalize(messageText(shadow)) === expected;
+    const nativeTurn = actual === snapshot.lastUserElement && isVisible(actual) &&
+      Boolean(actual.closest('main, [role="main"]')) &&
+      actual.matches('[data-content-search-unit-key$=":user"]') &&
+      ownerIds.length === 1 && Boolean(ownerIds[0]) &&
+      Boolean(owner?.closest('[data-talvt-turn-state]')) && !snapshot.lastUserFolded &&
+      normalize(messageText(actual)) === expected;
+    return mirror && nativeTurn ? 1 : snapshot.userCount;
+  }
+
+  let remoteCompletionWait = null;
+
+  function remoteReplyDiagnostic(task, snapshot) {
+    const userMatches = normalize(snapshot?.lastUserText) === normalize(task?.text);
+    const newerId = Boolean(task?.baselineAssistantId && snapshot?.lastAssistantId &&
+      task.baselineAssistantId !== snapshot.lastAssistantId);
+    const newerCount = Number.isInteger(task?.baselineAssistantCount) &&
+      Number.isInteger(snapshot?.assistantCount) && snapshot.assistantCount > task.baselineAssistantCount;
+    let reason = "ok";
+    if (!task?.remoteJobId || task.remoteCaptureResult!==true) reason = "no_capture";
+    else if (snapshot?.lastRole !== "assistant") reason = "last_role";
+    else if (!Number.isInteger(task.baselineUserCount)) reason = "no_user_baseline";
+    else if (snapshot.userCount !== task.baselineUserCount + 1) reason = "user_count";
+    else if (snapshot.lastUserFolded) reason = "user_folded";
+    else if (!userMatches) reason = "user_mismatch";
+    else if (typeof snapshot.lastAssistantText !== "string" || !snapshot.lastAssistantText.trim()) reason = "assistant_text_missing";
+    else if (!newerId && !newerCount) reason = "assistant_not_new";
+    return {reason,lastRole:["user","assistant"].includes(snapshot?.lastRole)?snapshot.lastRole:"other",
+      baselineUserCount:Number.isInteger(task?.baselineUserCount)?task.baselineUserCount:null,
+      userCount:Number.isInteger(snapshot?.userCount)?snapshot.userCount:null,
+      baselineAssistantCount:Number.isInteger(task?.baselineAssistantCount)?task.baselineAssistantCount:null,
+      assistantCount:Number.isInteger(snapshot?.assistantCount)?snapshot.assistantCount:null,
+      userFolded:snapshot?.lastUserFolded===true,userMatches,
+      boundHere:boundHere(),chatRoute:Boolean(pageChatKey(location.href)),
+      recentSubmission:Boolean(state?.recentSubmissions?.some(entry=>entry.id===task?.remoteJobId)),
+      assistantTextLength:typeof snapshot?.lastAssistantText==="string"?snapshot.lastAssistantText.length:0,
+      newerId,newerCount};
+  }
+
+  function remoteReplyEvidence(task, snapshot) {
+    const userCount = task?.remoteNewChat===true && task.baselineUserCount===0
+      ? remoteFirstUserCount(snapshot,task.text) : snapshot?.userCount;
+    if (!task?.remoteJobId || task.remoteCaptureResult!==true || snapshot?.lastRole !== "assistant" ||
+        !Number.isInteger(task.baselineUserCount) ||
+        userCount !== task.baselineUserCount + 1 || snapshot.lastUserFolded ||
+        normalize(snapshot.lastUserText) !== normalize(task.text) ||
+        typeof snapshot.lastAssistantText !== "string" || !snapshot.lastAssistantText.trim()) return null;
+    const newerId = Boolean(task.baselineAssistantId && snapshot.lastAssistantId &&
+      task.baselineAssistantId !== snapshot.lastAssistantId);
+    const newerCount = Number.isInteger(task.baselineAssistantCount) &&
+      snapshot.assistantCount > task.baselineAssistantCount;
+    if (!newerId && !newerCount) return null;
+    const text = snapshot.lastAssistantText.trim();
+    return {completionStatus:"completed",replyText:text.slice(0,20000),
+      replyTruncated:text.length>20000,assistantId:snapshot.lastAssistantId || null,
+      assistantCount:snapshot.assistantCount,userCount,
+      ...(userCount!==snapshot.userCount?{mirrorIgnored:true,rawUserCount:snapshot.userCount}:{}),
+      lastUserText:snapshot.lastUserText};
   }
 
   function conversationSnapshot() {
@@ -1056,24 +1222,31 @@
     };
   }
 
-  // ChatGPT's own transport failure is not an extension sendMessage error.
+  // ChatGPT's own transport/unknown failure is not an extension sendMessage error.
   // Read only native visible error surfaces, never arbitrary user/AI prose.
   function nativeTransportErrorVisible() {
     const guardian = globalThis.__cqLoadRecoveryGuardian;
     if (typeof guardian?.detectTransportError === "function") return guardian.detectTransportError();
-    const main = document.querySelector("main");
+    const main = document.querySelector('main, [role="main"]');
     if (!main) return false;
-    const transportTimeout = /消息(?:传输|发送|投递)超时|(?:message|response)\s+(?:transport|transmission|delivery)\s+(?:timed?\s*out|timeout)/i;
+    const nativeFailure = /消息(?:传输|发送|投递)超时|(?:message|response)\s+(?:transport|transmission|delivery)\s+(?:timed?\s*out|timeout)|\bunknown\s+error\b/i;
+    const nativeForeign = 'aside, nav, header, [role="navigation"], [role="dialog"], [aria-modal="true"], [role="menu"], ' +
+      '[data-message-author-role="user"], [data-turn="user"], [data-conversation-role="user"], ' +
+      '[data-content-search-unit-key$=":user"], [data-user-message-bubble], [data-testid="user-message"], ' +
+      '[data-markdown-text-style="assistant-message"], [data-testid*="writing-block"], ' +
+      '[data-testid*="artifact"], .markdown, pre, code, blockquote';
+    const lastTurn = turns().filter((element) => main.contains(element) && isVisible(element)).at(-1);
     const nativeElement = (element) => isVisible(element) && !root.contains(element) &&
-      !element.closest('[data-message-author-role="user"], [data-turn="user"], [data-user-message-bubble], [data-markdown-text-style="assistant-message"], .markdown');
+      !element.closest(nativeForeign) && (!lastTurn || lastTurn.contains(element) ||
+        Boolean(lastTurn.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING));
     const errorText = (element) => {
       const text = normalize(element.innerText || element.textContent);
-      return text.length <= 350 && transportTimeout.test(text);
+      return text.length <= 350 && nativeFailure.test(text);
     };
     for (const element of main.querySelectorAll(
       '[role="alert"], [data-testid*="error"], [data-state="error"]'
     )) {
-      if (nativeElement(element) && errorText(element)) return true;
+      if (nativeElement(element) && !element.querySelector(nativeForeign) && errorText(element)) return true;
     }
     // Some ChatGPT versions render the red error box without role="alert".
     // Its native Retry button and compact adjacent error text identify it.
@@ -1084,9 +1257,39 @@
       if (!/^(?:重试|再试一次|retry|try again)$/i.test(label)) continue;
       let ancestor = button.parentElement;
       for (let depth = 0; ancestor && ancestor !== main && depth < 5; depth++) {
+        if (!nativeElement(ancestor) || ancestor.querySelector(nativeForeign)) break;
         if (errorText(ancestor)) return true;
         if (normalize(ancestor.innerText || ancestor.textContent).length > 350) break;
         ancestor = ancestor.parentElement;
+      }
+    }
+    // Fallback when the independent guardian has not been injected yet:
+    // a red native message saying "消息传输超时。请重试。" can contain NO
+    // clickable Retry control and no alert role. Require exact notice text,
+    // a native danger style, and the latest-turn boundary; never treat an
+    // authored quote or an unrelated user's prompt as a transport failure.
+    const retrylessTimeout = /^消息(?:传输|发送|投递)超时(?:[。.!！\s]*请(?:稍后)?重试[。.!！\s]*)?$/i;
+    const dangerColor = (value) => {
+      const color = String(value || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/i);
+      return Boolean(color && Number(color[1]) >= 120 &&
+        Number(color[1]) > Number(color[2]) * 1.25 &&
+        Number(color[1]) > Number(color[3]) * 1.15);
+    };
+    for (const element of main.querySelectorAll("div, p, span")) {
+      if (element.childElementCount > 4) continue;
+      const text = normalize(element.textContent);
+      if (text.length > 100 || !retrylessTimeout.test(text) ||
+          !nativeElement(element) || element.closest('form, [contenteditable], [role="textbox"]') ||
+          element.querySelector(`${nativeForeign}, form, [contenteditable], [role="textbox"]`)) continue;
+      if ([...element.children].some(child => retrylessTimeout.test(normalize(child.textContent)) &&
+          nativeElement(child))) continue;
+      for (let node = element, depth = 0; node && node !== main && depth < 5;
+          node = node.parentElement, depth++) {
+        const classes = typeof node.className === "string" ? node.className : "";
+        const style = getComputedStyle(node);
+        if (/(?:text|border|bg)[-_](?:red|rose|danger|error)/i.test(classes) ||
+            [style.color,style.borderColor,style.borderTopColor,
+             style.borderLeftColor,style.backgroundColor].some(dangerColor)) return true;
       }
     }
     return false;
@@ -1150,6 +1353,84 @@
 
   function reloadConversationErrorPage() {
     location.reload();
+  }
+
+  function noteNativeImageMismatch(editor) {
+    if (nativeImageMismatch?.url === location.href &&
+        nativeImageMismatch.sessionKey === sessionKey &&
+        nativeImageMismatch.editor === editor) return;
+    nativeImageMismatch = {
+      url:location.href, sessionKey, editor,
+      captured:nativeComposerImages, since:clock(), reloadIssued:false,
+    };
+    requestQueueWake();
+  }
+
+  function clearNativeImageMismatch() {
+    if (!nativeImageMismatch) return;
+    nativeImageMismatch = null;
+    root.querySelector(".cq-native-image-recovery")?.remove();
+    if (notification?.startsWith("原生附件与原图不一致")) notification = "";
+  }
+
+  function nativeImageRecoverySafe() {
+    if (!state || !boundHere() || !nativeImageMismatch ||
+        nativeImageMismatch.url !== location.href ||
+        nativeImageMismatch.sessionKey !== sessionKey ||
+        state?.activeTaskId || state?.steeringTaskId ||
+        state?.tasks?.some((task) =>
+          ["dispatching","waiting","steering","steering_wait"].includes(task.status))) return false;
+    return loadErrorRefreshSafe();
+  }
+
+  function updateNativeImageRecoveryStatus(now = clock()) {
+    const notice = root.querySelector("[data-cq-native-image-recovery]");
+    if (!notice || !nativeImageMismatch) return;
+    if (!nativeImageRecoverySafe()) {
+      notice.textContent = "图片原图校验失败，消息没有入队。请先保存草稿并移除无法识别的附件；草稿、附件或回复未结束前不会刷新。";
+      return;
+    }
+    const remaining = Math.max(0, NATIVE_IMAGE_RECOVERY_INTERVAL_MS -
+      (now - nativeImageMismatch.since));
+    notice.textContent = remaining
+      ? `图片附件已清理，${Math.ceil(remaining / 1000)} 秒后安全自动刷新；不会重复发送。`
+      : "图片附件已清理，正在核对自动刷新条件…";
+  }
+
+  function maybeReloadNativeImageMismatch(now = clock()) {
+    const recovery = nativeImageMismatch;
+    if (!recovery) return false;
+    if (recovery.url !== location.href || recovery.sessionKey !== sessionKey) {
+      clearNativeImageMismatch();
+      return false;
+    }
+    const editor = getEditor();
+    // Only discard the stale reference set associated with this failed
+    // attempt. A newer attachment selection must remain untouched.
+    if (editor === recovery.editor && nativeComposerImages === recovery.captured &&
+        nativeComposerImages?.sawPreview && !nativeAttachmentCount(editor) &&
+        !nativeUploadBusy(editor)) nativeComposerImages = null;
+    updateNativeImageRecoveryStatus(now);
+    if (recovery.reloadIssued || now - recovery.since < NATIVE_IMAGE_RECOVERY_INTERVAL_MS ||
+        !nativeImageRecoverySafe()) return true;
+    const url = recovery.url;
+    const storageKey = NATIVE_IMAGE_RECOVERY_KEY + new URL(url).pathname;
+    try {
+      let previous = null;
+      try { previous = JSON.parse(sessionStorage.getItem(storageKey) || "null"); }
+      catch { /* Malformed cooldown data does not authorize a refresh. */ }
+      if (Number.isFinite(previous?.lastAt) && now - previous.lastAt <
+          NATIVE_IMAGE_RECOVERY_INTERVAL_MS) return true;
+      if (!nativeImageRecoverySafe() || location.href !== url ||
+          nativeImageMismatch !== recovery) return true;
+      // Persist before navigation to avoid a refresh loop after MV3 restart.
+      sessionStorage.setItem(storageKey, JSON.stringify({lastAt:now}));
+    } catch { return true; }
+    if (!nativeImageRecoverySafe() || nativeImageMismatch !== recovery ||
+        location.href !== url) return true;
+    recovery.reloadIssued = true;
+    reloadConversationErrorPage();
+    return true;
   }
 
   function loadErrorRefreshSafe(recovery = null) {
@@ -2222,6 +2503,7 @@
   function updateCountdowns() {
     if (!state || !root.isConnected) return;
     updateDraftWaiting();
+    updateNativeImageRecoveryStatus();
     if (!boundHere()) return;
     updateHandoffProgress();
     const now = clock();
@@ -2402,7 +2684,9 @@
 
   function renderTasks() {
     const visible = filteredTasks();
-    if (!state.tasks.length) return '<p class="cq-empty">队列为空 · 在 ChatGPT 输入框按 Enter，将文字或图片加入队列</p>';
+    if (!state.tasks.length) return nativeFirstEnterAllowed()
+      ? '<p class="cq-empty">新对话首条按 Enter 直接发送 · 后续按 Enter 入队</p>'
+      : '<p class="cq-empty">队列为空 · 在 ChatGPT 输入框按 Enter，将文字或图片加入队列</p>';
     if (!visible.length) return `<div class="cq-filter-empty">
       <p>没有符合条件的队列任务</p>
       <button type="button" data-action="reset-task-filter">清除筛选条件</button>
@@ -3140,8 +3424,7 @@
     if (handoff.phase === "failed" && actionFeedback?.startsWith("已启动接力")) {
       actionFeedback = null;
     }
-    const projectChat = /^\/g\/g-p-[a-zA-Z0-9-]+\/c\/[a-zA-Z0-9-]+\/?$/
-      .test(new URL(location.href).pathname);
+    const projectChat = Boolean(pageChatKey(location.href) && handoffScopeId(location.href));
     const canHandoffNow = projectChat && !state.handoffSourceKey && !handoffRunning;
     const canSetHandoff = projectChat && !state.handoffSourceKey &&
       ["idle","completed","queued"].includes(handoff.phase);
@@ -3152,7 +3435,7 @@
       queued:"交接命令已入队 · 等待前面的任务完成",
       due:"已到期 · 等待当前任务结束", summarizing:"正在生成交接总结",
       opening:"总结已保存 · 准备进入新对话",
-      navigating:"正在进入原生项目的新对话", bootstrapping:"等待新对话确认接收",
+      navigating:"正在进入新对话", bootstrapping:"等待新对话确认接收",
       failed:"交接失败 · 旧队列已保留", completed:"已接力到新对话",
     };
     const backgroundWork = pending > 0 || (handoffRunning && handoff.phase !== "failed") || handoff.enabled ||
@@ -3210,6 +3493,9 @@
             <span class="cq-handoff-progress-text">${escapeHtml(handoffProgressText())}</span>
             <button type="button" data-action="open-handoff-debug">查看接力日志</button>
           </div>` : ""}
+        ${nativeImageMismatch?.url === location.href ? `<div class="cq-notice cq-native-image-recovery" role="status">
+          <span data-cq-native-image-recovery>图片校验失败，等待安全恢复检查…</span>
+        </div>` : ""}
         ${queueExpanded ? `
           ${needsReview || notification ? `<div class="cq-notice" role="status">
             <span>${needsReview
@@ -3254,6 +3540,9 @@
           ${queueComposerOpen ? `<div class="cq-scheduler cq-queue-create">
             <div class="cq-section-title">新建图文队列任务 <span>图片保存在本地，轮到任务时随消息发送</span></div>
             <textarea id="cq-queue-draft" rows="2" placeholder="输入任务内容，也可以只添加图片…">${escapeHtml(queueDraft)}</textarea>
+            <label class="cq-repeat-hint"><input type="checkbox" id="cq-auto-team-enabled"
+              ${autoTeamEnabled ? "checked" : ""}> 长任务智能协作（建议开启）</label>
+            <p class="cq-repeat-hint">仅影响通过插件加入队列的复杂任务。保存时会在任务正文附上可见的协作建议；普通原生发送、简单任务和已有团队消息不改动。模型仍会判断是否有必要拆分。</p>
             ${imagePicker("queue", [], queueImages)}
             <p class="cq-draft-hint" data-draft-hint="queue" ${hasQueueDraft() ? "" : "hidden"}>
               草稿只在当前页面暂存，切换面板会保留；手动刷新或关闭标签页会丢失。
@@ -3266,12 +3555,13 @@
           ${favoritesOpen ? renderFavorites() : ""}
           ${handoffOpen ? `<section class="cq-scheduler cq-handoff-page" aria-label="接力设置">
             <div class="cq-settings-heading">
-              <div class="cq-section-title">接力设置 <span>同一原生项目 · 随队列延续到新对话</span></div>
+              <div class="cq-section-title">接力设置 <span>${handoffScopeId() === "personal" ?
+                "普通聊天 · 延续到新对话" : "同一原生项目 · 延续到新对话"}</span></div>
               <button type="button" data-action="toggle-handoff" aria-label="关闭接力设置">完成</button>
             </div>
             ${!projectChat || state.handoffSourceKey ? `<p class="cq-repeat-hint">${state.handoffSourceKey
               ? "正在接收交接内容，请等待当前接力完成。"
-              : "请在 ChatGPT 原生项目内的已有对话中使用交接。"}</p>` : ""}
+              : "请先在一个已建立的 ChatGPT 对话中使用交接。"}</p>` : ""}
             <div class="cq-handoff-panel">
               <div class="cq-section-title">自动交接</div>
               <div class="cq-schedule-controls">
@@ -3302,7 +3592,7 @@
             </div>
             <div class="cq-handoff-panel">
               <div class="cq-section-title">手动交接</div>
-              <p class="cq-repeat-hint">点击后加入当前队列末尾，轮到它时生成总结并在同项目的新对话继续。</p>
+              <p class="cq-repeat-hint">点击后加入当前队列末尾，轮到它时生成总结并在${handoffScopeId() === "personal" ? "普通" : "同项目"}新对话继续。</p>
               <div class="cq-schedule-controls">
                 <button type="button" class="cq-save" data-action="handoff-now"
                   ${canHandoffNow && !pendingUiActions.has("handoff-now") ? "" : "disabled"}
@@ -3423,6 +3713,14 @@
               </div>
               </div>
               <div class="cq-settings-page" id="cq-settings-page-general" role="tabpanel" aria-labelledby="cq-settings-tab-general" ${settingsPage === "general" ? "" : "hidden"}>
+              <div class="cq-defaults-settings">
+                <div class="cq-section-title">长任务多对话协作</div>
+                <label class="cq-switch" for="cq-auto-team-enabled-global">
+                  <input type="checkbox" id="cq-auto-team-enabled-global" ${autoTeamEnabled ? "checked" : ""}>
+                  自动判断复杂任务并附上协作建议
+                </label>
+                <p class="cq-repeat-hint">作用于插件的普通 Enter / 图文任务入队；AI 仍须确认插件在线和任务值得并行。直接通过原生发送、定时规则、团队内部消息不加提示。</p>
+              </div>
               <div class="cq-defaults-settings">
                 <div class="cq-section-title">全局队列设置 <span>所有对话共用</span></div>
               <div class="cq-schedule-controls">
@@ -4066,7 +4364,7 @@
       const savedRevision = queueDraftRevision;
       const savedSession = sessionKey;
       const savedUrl = location.href;
-      const submittedText = queueDraft;
+      const submittedText = prepareQueueTeamTask(queueDraft, savedUrl);
       const submittedImages = [...queueImages];
       const requestId = queueSubmissionId;
       const previousLabel = button.textContent;
@@ -4562,6 +4860,14 @@
   root.addEventListener("focusout", (event) => finishPanelIme(event.target));
 
   root.addEventListener("change", (event) => {
+    if (["cq-auto-team-enabled","cq-auto-team-enabled-global"].includes(event.target.id)) {
+      autoTeamEnabled = event.target.checked;
+      queueSubmissionId = null;
+      queueDraftRevision++;
+      try { localStorage.setItem(AUTO_TEAM_STORAGE_KEY, autoTeamEnabled ? "1" : "0"); }
+      catch { /* Retain this tab's preference without blocking the queue. */ }
+      return;
+    }
     if (event.target.id === "cq-completion-sound") {
       const enabled = event.target.checked;
       const previous = completionSoundEnabled;
@@ -5030,21 +5336,30 @@
               uncertain:Boolean(!confirmed && (task?.status==="error" ||
                 state?.haltReason==="steer_unconfirmed"))};
           }
-          return {ok:true,observed:Boolean(boundHere() && pageChatKey(location.href) &&
-            snapshot.userCount===1 &&
-            normalize(snapshot.lastUserText)===normalize(message.text) &&
-            state?.recentSubmissions?.some(entry=>entry.id===message.id))};
+          const confirmationDiagnostic = {
+            boundHere:boundHere(),chatRoute:Boolean(pageChatKey(location.href)),
+            userCount:remoteFirstUserCount(snapshot,message.text),domUserCount:snapshot.userCount,
+            userMatches:normalize(snapshot.lastUserText)===normalize(message.text),
+            recentSubmission:Boolean(state?.recentSubmissions?.some(entry=>entry.id===message.id)),
+            ...(message.captureDiagnostics===true?{userNodeShapes:remoteUserNodeShapes(snapshot)}:{}),
+          };
+          return {ok:true,observed:Boolean(confirmationDiagnostic.boundHere &&
+            confirmationDiagnostic.chatRoute && confirmationDiagnostic.userCount===1 &&
+            confirmationDiagnostic.userMatches && confirmationDiagnostic.recentSubmission),
+            ...(message.captureDiagnostics===true?{confirmationDiagnostic}:{})};
         }
         if (!state || !boundHere()) throw new Error("队列尚未绑定当前页面");
         if (typeof message.text!=="string" || !message.text.trim() ||
             message.text.length>12000) throw new Error("远程提示词无效");
-        if (message.action==="new_chat" && !isProjectOverview() ||
+        if (message.action==="new_chat" && !isHandoffLanding() ||
             message.action==="continue" && !pageChatKey(location.href)) {
           throw new Error("远程任务指定的对话类型不符");
         }
         if (message.mode==="queue") {
           const result=await rpc("ADD_TASK",{
             text:message.text,requestId:message.id,remoteJobId:message.id,
+            remoteCaptureResult:message.captureResult===true,
+            remoteNewChat:message.action==="new_chat",
           });
           const task=result.state?.tasks?.find(item=>item.remoteJobId===message.id);
           if (!task && !result.state?.recentSubmissions?.some(item=>item.id===message.id))
@@ -5315,6 +5630,7 @@
     if (button === controls().send) {
       // A deliberate native Send takes ownership of its attached files.
       nativeComposerImages = null;
+      clearNativeImageMismatch();
       return;
     }
     if (/remove|delete|移除|删除/i.test([
@@ -5323,6 +5639,25 @@
       nativeComposerImages.sawPreview = true;
     }
   }, true);
+
+  function recoverNativeFilesFromComposer(editor, previews) {
+    const form = editor?.closest("form");
+    const cards = nativeAttachmentPreviews(editor);
+    // Only a single native file input and individually named native chips
+    // can prove which original Files belong to this composer. A thumbnail
+    // alone (or a file picker in a portal) cannot establish that relation.
+    if (!form || cards.length !== previews ||
+        !cards.every((card) => card.matches('[data-testid="file-chip"]'))) return null;
+    const candidates = [...form.querySelectorAll('input[type="file"]')]
+      .filter((input) => !root.contains(input) && input.files?.length === previews);
+    if (candidates.length !== 1) return null;
+    const files = [...candidates[0].files];
+    if (!files.length || files.some((file, index) =>
+        !(file instanceof File) || !file.name ||
+        !normalize(cards[index].textContent).includes(file.name))) return null;
+    nativeComposerImages = {editor,sessionKey,files,sawPreview:true};
+    return files;
+  }
 
   function nativeUploadSnapshot(editor) {
     const previews = nativeAttachmentCount(editor);
@@ -5336,8 +5671,15 @@
     }
     if (!captured || captured.editor !== editor || captured.sessionKey !== sessionKey ||
         captured.files.length !== previews) {
+      const recovered = recoverNativeFilesFromComposer(editor, previews);
+      if (recovered) {
+        clearNativeImageMismatch();
+        return recovered;
+      }
+      noteNativeImageMismatch(editor);
       throw new Error("原生附件与原图不一致；请清空附件再通过「图文」添加，避免漏图");
     }
+    clearNativeImageMismatch();
     return [...captured.files];
   }
 
@@ -5637,11 +5979,13 @@
     }
     const sameDraft = nativeSubmission?.editor === editor &&
       nativeSubmission.sessionKey === originalKey && nativeSubmission.text === text &&
+      nativeSubmission.queuedText === prepareQueueTeamTask(text, originalUrl) &&
       nativeSubmission.files.length === files.length &&
       files.every((file, index) => file === nativeSubmission.files[index]);
     if (!sameDraft) {
       nativeSubmission = {
         editor, sessionKey: originalKey, text,
+        queuedText: prepareQueueTeamTask(text, originalUrl),
         files: [...files], requestId: crypto.randomUUID(),
       };
     }
@@ -5649,7 +5993,8 @@
     // Save atomically before touching the editor. A failed persistence call
     // must never lose the original message or the full image bytes.
     const requestId = nativeSubmission.requestId;
-    await rpc("ENQUEUE", { text, images, priority, requestId }, originalScope);
+    await rpc("ENQUEUE", { text:nativeSubmission.queuedText, images, priority, requestId }, originalScope);
+    clearNativeImageMismatch();
     // The queue was persisted for the original chat. If the user navigated or
     // changed the composer while the RPC ran, leave their new draft/attachments
     // exactly as they are; clearing them would be irreversible data loss.
@@ -6091,12 +6436,15 @@
 
   // Intercept before ChatGPT's editor and form listeners, regardless of
   // whether the native Send arrow is present or the queue is empty.
-  // Only Ctrl/Cmd+Enter may invoke native Send; plain Enter always enqueues.
+  // On the first turn of a fresh, empty chat, plain Enter remains ChatGPT's
+  // native Send. After that, plain Enter enqueues; Ctrl/Cmd+Enter sends now.
   window.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.altKey || event.isComposing || event.keyCode === 229) return;
     const editor = getEditor();
     if (!editor || (event.target !== editor && !editor.contains(event.target))) return;
     if (root.contains(event.target) || suggestionPopupOpen(editor)) return;
+
+    if (!event.ctrlKey && !event.metaKey && nativeFirstEnterAllowed()) return;
 
     // Cancel the native send synchronously, before any async storage calls.
     event.preventDefault();
@@ -6369,11 +6717,12 @@
   async function navigateForHandoff(voiceReady, snapshot) {
     const handoff = state?.handoff;
     if (handoff?.phase !== "opening" || handoff.cancelRequested || !boundHere()) return false;
-    // The expected destination is produced by the background from the
-    // current project's URL, never from untrusted AI-generated summary text.
+    // The expected destination comes from the worker's scoped chat URL,
+    // never from AI-generated summary text or an unrelated project.
     const url = new URL(handoff.projectUrl || "",location.href);
-    if (url.origin !== location.origin ||
-        !/^\/g\/g-p-[a-zA-Z0-9-]+\/project$/.test(url.pathname)) return false;
+    if (url.origin !== location.origin || !isHandoffLanding(url.href) ||
+        !handoffScopeId(location.href) ||
+        handoffScopeId(location.href) !== handoffScopeId(url.href)) return false;
     if (!(voiceReady || handoffComposerReady(snapshot)) ||
         composerActionInProgress || workInProgress ||
         hasComposerAttachments(getEditor())) return false;
@@ -6387,6 +6736,7 @@
   }
 
   async function heartbeat() {
+    if (maybeReloadNativeImageMismatch()) return;
     if (maybeReloadConversationLoadError()) return;
     if (extensionContextGone) return;
     // Track the native square Stop button even for chats without a queue.
@@ -6486,7 +6836,7 @@
           handoffDebugWaitReason(snapshot,voiceReady,active,null,nativeTransportError));
       }
 
-      // A red ChatGPT transport-timeout banner can coexist with a visible
+      // A native ChatGPT transport/unknown-error banner can coexist with a visible
       // Voice button. It is NOT a completed assistant response. Quarantine
       // only an already-clicked task after the banner persists; never click
       // native Retry or replay an uncertain tool/message operation.
@@ -6495,7 +6845,7 @@
         if (clock() - nativeErrorFirstSeenAt >= NATIVE_ERROR_STABLE_MS) {
           await rpc("FAIL", {
             id: active.id, userCount: snapshot.userCount,
-            error: "ChatGPT 网页提示传输超时或连接中断，本轮结果无法确认；已跳过，不会自动重发。",
+            error: "ChatGPT 网页提示传输超时、连接中断或未知错误（Unknown error），本轮结果无法确认；已跳过，不会自动重发。",
           });
           render();
         }
@@ -6570,8 +6920,24 @@
           (handoffEvidence.newerAssistant && handoffEvidence.summary &&
             handoffEvidence.replyStableMs >= 2500);
         if ((handoffEvidence.ready || waveformComplete) && summaryReady) {
+          let remoteResult = null;
+          if (active.remoteCaptureResult===true) {
+            remoteResult = remoteReplyEvidence(active,snapshot);
+            if (!remoteResult) {
+              if (remoteCompletionWait?.taskId !== active.id)
+                remoteCompletionWait = {taskId:active.id, since:clock()};
+              if (clock() - remoteCompletionWait.since < 15000) {
+                requestQueueWake(500);
+                return;
+              }
+              remoteResult = {completionStatus:"result_unavailable",
+                resultDiagnostic:remoteReplyDiagnostic(active,snapshot)};
+            }
+            remoteCompletionWait = null;
+          }
           await rpc("FINISHED", {
             id: active.id,
+            ...(remoteResult ? {remoteResult} : {}),
             viewed: isTabViewed(),
             voiceReady,
             voiceStableMs: voiceReady ? clock() - voiceReadySince : 0,
