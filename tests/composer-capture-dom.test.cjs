@@ -247,7 +247,7 @@ setTimeout(async()=>{
   native.textContent="保留的输入草稿";
   const staleEnter=new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true});
   native.dispatchEvent(staleEnter);
-  result.staleContextSafe=staleEnter.defaultPrevented &&
+  result.staleContextSafe=!staleEnter.defaultPrevented &&
     native.textContent==="保留的输入草稿" &&
     requests.filter(type=>type==="ENQUEUE").length===queuedBefore;
  }catch(error){result.error=error.stack||String(error);}

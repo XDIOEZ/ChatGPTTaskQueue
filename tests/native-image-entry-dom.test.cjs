@@ -11,7 +11,7 @@ const browser = process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
   : "/usr/bin/google-chrome");
 
-test("原生输入框选图后的 Enter / 入队可持久化图文，无法读取的附件拒绝误入队", {
+test("原生输入框选图后仅点击入队按钮持久化图文，无法读取的附件拒绝误入队", {
   skip: !fs.existsSync(browser) && "Chrome is not installed",
 }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cq-native-image-"));
@@ -143,9 +143,14 @@ function choose(files) {
   upload.files = list.files;
   upload.dispatchEvent(new Event("change",{bubbles:true}));
 }
-const press = () => !editor.dispatchEvent(new KeyboardEvent("keydown",{
-  key:"Enter",bubbles:true,cancelable:true,
-}));
+// Manual image queueing now exclusively uses the extension's visible UI
+// button; pressing Enter must remain ChatGPT's native direct-send path.
+const press = () => {
+  const button=document.querySelector('[data-action="queue-composer"]');
+  if(!button)throw new Error("missing native composer queue button");
+  button.click();
+  return true;
+};
 const wait = (ms) => new Promise(resolve => setTimeout(resolve,ms));
 const waitUntil = async (predicate, timeoutMs = 4500) => {
   const deadline = Date.now() + timeoutMs;

@@ -58,9 +58,11 @@ function orphan(name){
   remove.textContent="×";remove.onclick=()=>chip.remove();
   chip.append(remove);form.append(chip);return chip;
 }
-function press(){
-  return !editor.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",
-    bubbles:true,cancelable:true}));
+function clickQueueButton(){
+  const button=document.querySelector('[data-action="queue-composer"]');
+  if(!button)throw new Error("missing native composer queue button");
+  button.click();
+  return true;
 }
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 </script>
@@ -70,7 +72,7 @@ setTimeout(async()=>{
   try{
     editor.value="需要保护的截图草稿";
     const chip=orphan("unknown.png");
-    flags.mismatchIntercepted=press();
+    flags.mismatchIntercepted=clickQueueButton();
     await wait(120);
     const probe=window.__imageRefreshProbe;
     flags.unmatchedIssueCreated=probe.hasIssue() && enqueued.length===0 &&
@@ -107,7 +109,7 @@ setTimeout(async()=>{
     const recovered=orphan("recover.png");
     editor.value="严格对应的图片";
     const before=enqueued.length;
-    flags.nativeInputIntercepted=press();
+    flags.nativeInputIntercepted=clickQueueButton();
     await wait(250);
     flags.nativeInputRecovered=enqueued.length===before+1 &&
       enqueued.at(-1).images.length===1 &&

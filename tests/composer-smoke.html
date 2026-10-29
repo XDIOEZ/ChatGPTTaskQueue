@@ -147,16 +147,15 @@
       const form = document.getElementById('composer-form').getBoundingClientRect();
       const visuallyAbove = bar.bottom <= form.top + 1 && Math.abs(bar.left - form.left) <= 2;
       const noManualStartPause = !document.querySelector('#cq-extension-root [data-action="start"], #cq-extension-root [data-action="pause"]');
-      // The native Send arrow is present, but plain Enter must NEVER reach
-      // the site's native handler, even when the extension queue is empty.
-      input.value = '空队列也应该入队';
+      // Plain Enter must stay with ChatGPT's native editor even when the
+      // extension queue is empty or a previous task exists.
+      input.value = '空队列原生直接发送';
       const nativeKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
-      const preventedEmptyEnter = !input.dispatchEvent(nativeKey);
+      const nativeEmptyEnter = input.dispatchEvent(nativeKey);
       await new Promise((resolve) => setTimeout(resolve, 200));
-      const emptyEnterQueued = fake.state.tasks.length === 1 &&
-        fake.state.tasks[0].text === '空队列也应该入队' &&
-        input.value === '' && fake.sent.length === 0;
-      fake.state.tasks = []; // Simulate the queued task having completed.
+      const emptyEnterSent = fake.state.tasks.length === 0 &&
+        input.value === '' && fake.sent.length === 1 &&
+        fake.sent[0] === '空队列原生直接发送';
 
       input.value = '空队列使用 Ctrl+Enter 发送';
       const nativeCtrl = new KeyboardEvent('keydown', {
@@ -164,8 +163,8 @@
       });
       const preventedNativeCtrl = !input.dispatchEvent(nativeCtrl);
       await new Promise((resolve) => setTimeout(resolve, 650));
-      const nativeSent = fake.sent.length === 1 &&
-        fake.sent[0] === '空队列使用 Ctrl+Enter 发送';
+      const nativeSent = fake.sent.length === 2 &&
+        fake.sent[1] === '空队列使用 Ctrl+Enter 发送';
       const nativeQueueEmpty = fake.state.tasks.length === 0;
 
       input.value = '第一条手动入队';
@@ -174,19 +173,21 @@
       const seeded = fake.state.tasks.length === 1 && fake.state.tasks[0].text === '第一条手动入队';
       const seededCleared = input.value === '';
 
-      input.value = '第二条排队任务';
+      input.value = '队列非空的 Enter 仍原生发送';
       const queuedKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
-      const preventedQueue = !input.dispatchEvent(queuedKey);
+      const nativeWithQueue = input.dispatchEvent(queuedKey);
       await new Promise((resolve) => setTimeout(resolve, 200));
       const cleared = input.value === '';
-      const queued = fake.state.tasks.length === 2 && fake.state.tasks[1].text === '第二条排队任务';
-      const queueDidNotNativeSend = fake.sent.length === 1;
+      const queueUnchanged = fake.state.tasks.length === 1 &&
+        fake.state.tasks[0].text === '第一条手动入队';
+      const queueDidNativeSend = fake.sent.length === 3 &&
+        fake.sent[2] === '队列非空的 Enter 仍原生发送';
 
       input.value = '直接发送';
       const immediateKey = new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true });
       const preventedImmediate = !input.dispatchEvent(immediateKey);
       await new Promise((resolve) => setTimeout(resolve, 650));
-      const immediate = fake.sent.length === 2 && fake.sent[1] === '直接发送';
+      const immediate = fake.sent.length === 4 && fake.sent[3] === '直接发送';
 
       input.value = '换行而非排队';
       const newlineKey = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true,
@@ -209,7 +210,7 @@
       const unsupportedPreserved = input.value === '' &&
         fake.state.tasks.some((task) =>
           task.text === '不能中途引导' && task.status === 'pending') &&
-        fake.sent.length === 2;
+        fake.sent.length === 4;
       stopButton.remove();
       sendButton.style.display = '';
 
@@ -257,7 +258,7 @@
       window.confirm = () => true;
       document.querySelector('[data-action="skip-failed"]').click();
       await new Promise((resolve) => setTimeout(resolve, 200));
-      const recoveredWithoutResend = fake.sent.length === 2 && !fake.state.halted &&
+      const recoveredWithoutResend = fake.sent.length === 4 && !fake.state.halted &&
         fake.state.tasks.every((task) => task.id !== 'failed-once');
 
       // When an old failure has no error row, provide a neutral recovery action
@@ -277,7 +278,7 @@
       input.value = '用户正在写一条新消息';
       await new Promise((resolve) => setTimeout(resolve, 1100));
       const draftNoticeShown = document.querySelector('#cq-extension-root .cq-compose-wait')?.hidden === false;
-      const draftPreserved = input.value === '用户正在写一条新消息' && fake.sent.length === 2;
+      const draftPreserved = input.value === '用户正在写一条新消息' && fake.sent.length === 4;
       input.value = '';
       await new Promise((resolve) => setTimeout(resolve, 1100));
       const draftNoticeCleared = document.querySelector('#cq-extension-root .cq-compose-wait')?.hidden === true;
@@ -290,8 +291,8 @@
       const manualStopIsQuiet = document.querySelector('#cq-extension-root .cq-notice') === null &&
         document.querySelector('#cq-extension-root .cq-toolbar').textContent.includes('用户已暂停');
 
-      // With NO queue, native Enter still becomes queue mode if ChatGPT is
-      // currently generating a response. The previous implementation sent it.
+      // Even while generating, plain Enter must remain native rather than
+      // silently enqueue a task in the extension.
       fake.state.halted = false;
       fake.state.haltReason = null;
       fake.state.error = '';
@@ -302,32 +303,32 @@
       generatingStop.setAttribute('aria-label', 'Stop generating');
       generatingStop.textContent = '停止生成';
       document.getElementById('composer-form').append(generatingStop);
-      input.value = '正在回答时下一条应该排队';
+      input.value = '正在回答时 Enter 仍原生';
       const generatingEnter = new KeyboardEvent('keydown', {
         key: 'Enter', bubbles: true, cancelable: true,
       });
-      const blockedNativeDuringGeneration = !input.dispatchEvent(generatingEnter);
+      const nativeDuringGeneration = input.dispatchEvent(generatingEnter);
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const queuedDuringGeneration = fake.state.tasks.length === 1 &&
-        fake.state.tasks[0].text === '正在回答时下一条应该排队' && fake.sent.length === 2;
+      const noQueueDuringGeneration = fake.state.tasks.length === 0 &&
+        fake.sent.length === 5 && fake.sent[4] === '正在回答时 Enter 仍原生';
       generatingStop.remove();
 
-      // A tool can remain running while ChatGPT temporarily hides its native
-      // Stop button. Enter must still enqueue from the tool-waiting state.
+      // A tool can hide Stop; the plugin still never captures plain Enter.
       fake.state.tasks = [];
       const toolPlaceholder = document.createElement('div');
       toolPlaceholder.setAttribute('data-message-author-role', 'assistant');
       toolPlaceholder.innerHTML = '<div data-message-content>Waiting for a tool result.</div>';
       document.getElementById('conversation').append(toolPlaceholder);
-      input.value = '工具执行中也要排队';
+      input.value = '工具执行中按回车仍原生';
       const toolEnter = new KeyboardEvent('keydown', {
         key: 'Enter', bubbles: true, cancelable: true,
       });
-      const blockedWhileToolRuns = !input.dispatchEvent(toolEnter);
+      const nativeWhileToolRuns = input.dispatchEvent(toolEnter);
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const queuedWhileToolRuns = fake.state.tasks.length === 1 &&
-        fake.state.tasks[0].text === '工具执行中也要排队' && fake.sent.length === 2;
+      const noQueueWhileToolRuns = fake.state.tasks.length === 0 &&
+        fake.sent.length === 6 && fake.sent[5] === '工具执行中按回车仍原生';
       toolPlaceholder.remove();
+      const steerSendBaseline = fake.sent.length;
 
       let steerButtonVisible = true;
       let steerSentOnce = true;
@@ -352,7 +353,8 @@
       steerButtonVisible = Boolean(document.querySelector('[data-action="steer-task"][data-id="send-ahead"]'));
       document.querySelector('[data-action="steer-task"][data-id="send-ahead"]').click();
       await new Promise((resolve) => setTimeout(resolve, 500));
-      steerSentOnce = fake.sent.length === 3 && fake.sent[2] === '需要提前引导的第二条';
+      steerSentOnce = fake.sent.length === steerSendBaseline+1 &&
+        fake.sent.at(-1) === '需要提前引导的第二条';
       steerRemovedFromQueue = fake.state.tasks.length === 1 &&
         fake.state.tasks[0].id === 'ordinary-first' && fake.state.steeringTaskId === null;
       steerNoDuplicate = !fake.state.tasks.some((item) => item.id === 'send-ahead');
@@ -375,7 +377,8 @@
       await new Promise((resolve) => setTimeout(resolve, 3700));
       unsupportedSteerRestored = fake.state.tasks.length === 2 &&
         fake.state.tasks[1].status === 'pending' && fake.state.steeringTaskId === null;
-      unsupportedSteerClean = input.value === '' && fake.sent.length === 3;
+      unsupportedSteerClean = input.value === '' &&
+        fake.sent.length === steerSendBaseline+1;
       sendButton.style.display = '';
       unsupportedStop.remove();
 
@@ -383,34 +386,35 @@
       document.querySelector('[data-action="steer-task"][data-id="unsupported-steer"]').click();
       await new Promise((resolve) => setTimeout(resolve, 140));
       steerPreservesDraft = input.value === '用户的草稿不能被引导覆盖' &&
-        fake.state.tasks[1].status === 'pending' && fake.sent.length === 3;
+        fake.state.tasks[1].status === 'pending' &&
+        fake.sent.length === steerSendBaseline+1;
       }
 
       const ok = onTop && visuallyAbove && noManualStartPause &&
-        preventedEmptyEnter && emptyEnterQueued && preventedNativeCtrl &&
+        nativeEmptyEnter && emptyEnterSent && preventedNativeCtrl &&
         nativeSent && nativeQueueEmpty && seeded && seededCleared &&
-        preventedQueue && queued && cleared && queueDidNotNativeSend && preventedImmediate && immediate &&
+        nativeWithQueue && queueUnchanged && cleared && queueDidNativeSend && preventedImmediate && immediate &&
         didNotBlockNewline && unsupportedPreserved && repeatDefaultInfinite &&
         repeatSingleSaved && repeatSingleVisible && editKeepsValue && repeatFiniteSaved && repeatFiniteVisible &&
         noRedBanner && neutralNoticeOnce && oldErrorTextHidden && recoveryVisible && recoveredWithoutResend &&
         oneClickRecovery && recoveredEmptyError && draftNoticeShown && draftPreserved &&
         draftNoticeCleared && manualStopIsQuiet &&
-        blockedNativeDuringGeneration && queuedDuringGeneration &&
-        blockedWhileToolRuns && queuedWhileToolRuns && steerButtonVisible &&
+        nativeDuringGeneration && noQueueDuringGeneration &&
+        nativeWhileToolRuns && noQueueWhileToolRuns && steerButtonVisible &&
         steerSentOnce && steerRemovedFromQueue && steerNoDuplicate &&
         unsupportedSteerRestored && unsupportedSteerClean && steerPreservesDraft;
       document.getElementById('smoke-result').textContent = ok ? 'SMOKE_PASS' : 'SMOKE_FAIL';
       document.body.dataset.smoke = JSON.stringify({ ok, onTop, visuallyAbove, noManualStartPause,
-        preventedEmptyEnter, emptyEnterQueued, preventedNativeCtrl, nativeSent, nativeQueueEmpty,
-        seeded, seededCleared, preventedQueue, queued, cleared, queueDidNotNativeSend,
+        nativeEmptyEnter, emptyEnterSent, preventedNativeCtrl, nativeSent, nativeQueueEmpty,
+        seeded, seededCleared, nativeWithQueue, queueUnchanged, cleared, queueDidNativeSend,
         preventedImmediate, immediate, didNotBlockNewline, unsupportedPreserved,
         repeatDefaultInfinite, repeatSingleSaved, repeatSingleVisible, editKeepsValue,
         repeatFiniteSaved, repeatFiniteVisible,
         noRedBanner, neutralNoticeOnce, oldErrorTextHidden, recoveryVisible, recoveredWithoutResend,
         oneClickRecovery, recoveredEmptyError, draftNoticeShown, draftPreserved,
         draftNoticeCleared, manualStopIsQuiet,
-        blockedNativeDuringGeneration, queuedDuringGeneration,
-        blockedWhileToolRuns, queuedWhileToolRuns, steerButtonVisible,
+        nativeDuringGeneration, noQueueDuringGeneration,
+        nativeWhileToolRuns, noQueueWhileToolRuns, steerButtonVisible,
         steerSentOnce, steerRemovedFromQueue, steerNoDuplicate,
         unsupportedSteerRestored, unsupportedSteerClean, steerPreservesDraft,
         debugSteerSent: fake.sent, debugSteerTasks: fake.state.tasks.map((task) => ({

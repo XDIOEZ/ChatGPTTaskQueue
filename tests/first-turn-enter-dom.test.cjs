@@ -11,7 +11,7 @@ const browser = process.env.CQ_BROWSER_BIN || (process.platform === "win32"
   ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
   : "/usr/bin/google-chrome");
 
-test("真实 Chrome：普通/项目新对话首条 Enter 原生发送，之后入队；旧聊天空白加载不能误判", {
+test("真实 Chrome：普通/项目/旧聊天每次 Enter 都原生发送，无论队列是否存在", {
   skip: !fs.existsSync(browser) && "Chrome is not installed",
 }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cq-first-turn-enter-"));
@@ -83,54 +83,56 @@ setTimeout(async () => {
   try {
     result.personalFirstNative = !press("普通新对话开场") &&
       sent.length === 1 && sent[0] === "普通新对话开场" && state.tasks.length === 0;
-    result.personalSecondEnqueued = press("普通对话第二条");
+    result.personalSecondNative = !press("普通对话第二条");
     await wait(160);
-    result.personalQueueSaved = state.tasks.length === 1 &&
-      state.tasks[0].text === "普通对话第二条" && sent.length === 1;
+    result.personalQueueNotTouched = state.tasks.length === 0 &&
+      sent.length === 2 && sent[1] === "普通对话第二条";
 
     window.__cqTestRoute = "https://chatgpt.com/g/g-p-abc/project";
     state.url = window.__cqTestRoute;
     state.tasks.length = 0;
     conversation.replaceChildren();
     result.projectFirstNative = !press("项目新对话开场") &&
-      sent.length === 2 && sent[1] === "项目新对话开场" && state.tasks.length === 0;
-    result.projectSecondEnqueued = press("项目对话第二条");
+      sent.length === 3 && sent[2] === "项目新对话开场" && state.tasks.length === 0;
+    result.projectSecondNative = !press("项目对话第二条");
     await wait(160);
-    result.projectQueueSaved = state.tasks.length === 1 &&
-      state.tasks[0].text === "项目对话第二条" && sent.length === 2;
+    result.projectQueueNotTouched = state.tasks.length === 0 &&
+      sent.length === 4 && sent[3] === "项目对话第二条";
 
     // A /c/ route may temporarily render zero turns while messages hydrate.
     window.__cqTestRoute = "https://chatgpt.com/c/existing-chat";
     state.url = window.__cqTestRoute;
     state.tasks.length = 0;
     conversation.replaceChildren();
-    result.existingChatIntercepted = press("旧聊天正在加载");
+    result.existingChatNative = !press("旧聊天正在加载");
     await wait(160);
-    result.existingChatQueued = state.tasks.length === 1 &&
-      state.tasks[0].text === "旧聊天正在加载" && sent.length === 2;
+    result.existingChatNoQueue = state.tasks.length === 0 &&
+      sent.length === 5 && sent[4] === "旧聊天正在加载";
 
     // Do not bypass draft-owned queue work, or an automatic handoff intro.
     window.__cqTestRoute = "https://chatgpt.com/";
     state.url = window.__cqTestRoute;
     state.tasks.length = 0;
     state.tasks.push({id:"existing",text:"已安排的任务",status:"pending"});
-    result.pendingDraftIntercepted = press("等待已有入队任务");
+    result.pendingDraftNative = !press("等待已有入队任务");
     await wait(160);
-    result.pendingDraftQueued = state.tasks.length === 2 && sent.length === 2;
+    result.pendingDraftQueueUnchanged = state.tasks.length === 1 &&
+      sent.length === 6 && sent[5] === "等待已有入队任务";
 
     state.tasks.length = 0;
     state.handoffSourceKey = "chat:origin";
-    result.handoffIntercepted = press("已有接力来源");
+    result.handoffNative = !press("已有接力来源");
     await wait(160);
-    result.handoffNotNative = state.tasks.length === 1 && sent.length === 2;
+    result.handoffNoQueue = state.tasks.length === 0 &&
+      sent.length === 7 && sent[6] === "已有接力来源";
   } catch (error) {
     result.error = error.stack || String(error);
   }
-  result.ok = ["personalFirstNative","personalSecondEnqueued","personalQueueSaved",
-    "projectFirstNative","projectSecondEnqueued","projectQueueSaved",
-    "existingChatIntercepted","existingChatQueued",
-    "pendingDraftIntercepted","pendingDraftQueued",
-    "handoffIntercepted","handoffNotNative"].every(key => result[key] === true);
+  result.ok = ["personalFirstNative","personalSecondNative","personalQueueNotTouched",
+    "projectFirstNative","projectSecondNative","projectQueueNotTouched",
+    "existingChatNative","existingChatNoQueue",
+    "pendingDraftNative","pendingDraftQueueUnchanged",
+    "handoffNative","handoffNoQueue"].every(key => result[key] === true);
   document.body.dataset.test = JSON.stringify(result);
 },300);
 </script></body></html>`);

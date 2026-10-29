@@ -466,17 +466,6 @@
     return Boolean(sessionKey?.startsWith("draft:") && !pageChatKey(location.href));
   }
 
-  function nativeFirstEnterAllowed() {
-    // On a genuinely empty new-chat landing, let ChatGPT handle Enter itself.
-    // An established chat whose messages are still loading is NOT a new chat.
-    if (!state || !boundHere() || !temporaryNewChat() || !isHandoffLanding() ||
-        state.halted || state.handoffSourceKey || state.activeTaskId ||
-        state.steeringTaskId || state.tasks?.length || state.schedules?.length ||
-        workInProgress || composerActionInProgress) return false;
-    const snapshot = conversationSnapshot();
-    return !snapshot.userCount && !snapshot.assistantCount && !snapshot.busy;
-  }
-
   function queueCount() {
     return state?.tasks.filter((task) =>
       ["pending", "dispatching", "waiting", "steering", "steering_wait"].includes(task.status)).length || 0;
@@ -2684,9 +2673,7 @@
 
   function renderTasks() {
     const visible = filteredTasks();
-    if (!state.tasks.length) return nativeFirstEnterAllowed()
-      ? '<p class="cq-empty">新对话首条按 Enter 直接发送 · 后续按 Enter 入队</p>'
-      : '<p class="cq-empty">队列为空 · 在 ChatGPT 输入框按 Enter，将文字或图片加入队列</p>';
+    if (!state.tasks.length) return '<p class="cq-empty">队列为空 · 点击底部「入队」添加文字或图片；Enter / Ctrl+Enter 直接发送</p>';
     if (!visible.length) return `<div class="cq-filter-empty">
       <p>没有符合条件的队列任务</p>
       <button type="button" data-action="reset-task-filter">清除筛选条件</button>
@@ -3719,7 +3706,7 @@
                   <input type="checkbox" id="cq-auto-team-enabled-global" ${autoTeamEnabled ? "checked" : ""}>
                   自动判断复杂任务并附上协作建议
                 </label>
-                <p class="cq-repeat-hint">作用于插件的普通 Enter / 图文任务入队；AI 仍须确认插件在线和任务值得并行。直接通过原生发送、定时规则、团队内部消息不加提示。</p>
+                <p class="cq-repeat-hint">作用于点击插件「入队」按钮和图文任务编辑器加入的复杂任务；AI 仍须确认插件在线和任务值得并行。Enter / Ctrl+Enter 直接发送、定时规则和团队内部消息不加提示。</p>
               </div>
               <div class="cq-defaults-settings">
                 <div class="cq-section-title">全局队列设置 <span>所有对话共用</span></div>
@@ -3818,7 +3805,7 @@
         <div class="cq-footer-toolbar">
           <div class="cq-bottom-actions">
             <button type="button" class="cq-tool cq-add-queue" data-action="queue-composer"
-              aria-label="将原生输入框内容入队" title="将原生输入框里的文字和图片一起加入当前对话队列">${icon("plus")}<span>入队</span></button>
+              aria-label="点击将原生输入框内容入队" title="只有点击此按钮才将原生输入框的文字和图片加入队列；Enter / Ctrl+Enter 直接发送">${icon("plus")}<span>入队</span></button>
             <button type="button" class="cq-tool ${queueIsPaused ? "cq-tool-active" : ""}" data-action="toggle-queue-paused"
               aria-label="${queueIsPaused ? "继续自动发送" : "暂停自动发送"}"
               title="${needsReview ? "当前有发送异常需先核对；此开关不能解除安全暂停" :
@@ -5287,11 +5274,8 @@
       void rpc("SAVE_QUEUE_HEIGHT", { height }).then(render).catch(showError);
       return;
     }
-    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && event.target.id === "cq-schedule-draft") {
-      event.preventDefault();
-      const button = root.querySelector('[data-action="save-schedule"]');
-      if (button) void onAction(button).catch(showError);
-    }
+    // Do not bind Enter / Ctrl+Enter to queue or schedule creation. Those
+    // actions must be committed through their corresponding UI buttons.
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -6434,17 +6418,16 @@
     }
   }, true);
 
-  // Intercept before ChatGPT's editor and form listeners, regardless of
-  // whether the native Send arrow is present or the queue is empty.
-  // On the first turn of a fresh, empty chat, plain Enter remains ChatGPT's
-  // native Send. After that, plain Enter enqueues; Ctrl/Cmd+Enter sends now.
+  // Plain Enter always belongs to ChatGPT's native composer (including new
+  // chats, existing chats, IME and slash pickers). Only Ctrl/Cmd+Enter needs
+  // extension handling for an explicit immediate send. Manual queueing is
+  // exclusively triggered by the visible queue UI buttons.
   window.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" || event.shiftKey || event.altKey || event.isComposing || event.keyCode === 229) return;
+    if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey) ||
+        event.shiftKey || event.altKey || event.isComposing || event.keyCode === 229) return;
     const editor = getEditor();
     if (!editor || (event.target !== editor && !editor.contains(event.target))) return;
     if (root.contains(event.target) || suggestionPopupOpen(editor)) return;
-
-    if (!event.ctrlKey && !event.metaKey && nativeFirstEnterAllowed()) return;
 
     // Cancel the native send synchronously, before any async storage calls.
     event.preventDefault();
@@ -6457,7 +6440,6 @@
       return;
     }
     const text = editorText(editor);
-    const steer = event.ctrlKey || event.metaKey;
     if (!text?.trim() && !hasComposerAttachments(editor)) {
       return;
     }
@@ -6477,17 +6459,15 @@
       if (location.href !== inputPage.url || sendPageEpoch !== inputPage.epoch || getEditor() !== editor) return;
       // Running replies use the same steering path as the row button:
       // direct Send first, Stop/send/continue only when direct Send is absent.
-      if (steer && (state?.activeTaskId || state?.steeringTaskId ||
-          conversationSnapshot().busy)) return steerQueuedTask(null, {editor, text});
-      if (steer) return steerNativePrompt(editor, text);
-      return queueNativePrompt(editor, text);
+      if (state?.activeTaskId || state?.steeringTaskId ||
+          conversationSnapshot().busy) return steerQueuedTask(null, {editor, text});
+      return steerNativePrompt(editor, text);
     };
     void run()
       .catch(showError)
       .finally(() => {
         composerActionInProgress = false;
-        // Enqueue rendered while locked; refresh row actions after unlocking
-        // so the pending instruction's steering button is immediately usable.
+        // Re-enable UI actions after the direct-send operation finishes.
         render();
         requestQueueWake();
       });
